@@ -1,0 +1,66 @@
+# Small hand-written evaluation set (spec section 21). Each case seeds a
+# fresh, isolated database with `memories` (+ `distractors`), asks `query`,
+# and checks either that the answer abstains, or that it's grounded and
+# contains all of `expect_contains` (case-insensitive substring match).
+
+- name: exact_lookup
+  category: exact
+  memories:
+    - "I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
+  distractors:
+    - "Went grocery shopping and bought tomatoes, pasta, and olive oil."
+  query: "What did Anna recommend?"
+  expect: grounded
+  expect_contains: ["tactile sensing"]
+
+- name: paraphrase_japan_cuisine
+  category: paraphrased
+  memories:
+    - "My trip to Japan last year was amazing, especially the food in Osaka and the quiet temples in Kyoto."
+  distractors:
+    - "Finished reading a sci-fi novel called Project Hail Mary, loved the ending."
+  query: "How was the cuisine on that trip abroad?"
+  expect: grounded
+  expect_contains: ["osaka"]
+
+- name: indirect_eth_person
+  category: indirect
+  memories:
+    - "I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
+  distractors:
+    - "Went grocery shopping and bought tomatoes, pasta, and olive oil."
+  query: "Who was that person from ETH who recommended a robotics paper?"
+  expect: grounded
+  expect_contains: ["anna"]
+
+- name: multiconcept_anna_tactile_paper
+  category: multi_concept
+  memories:
+    - "I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
+  distractors:
+    - "Finished reading a sci-fi novel called Project Hail Mary, loved the ending."
+  query: "What paper did Anna recommend about tactile sensing?"
+  expect: grounded
+  expect_contains: ["anna"]
+
+- name: distractor_heavy_paris
+  category: distractor
+  memories:
+    - "Paris trip notes about the Eiffel Tower and the Louvre."
+  distractors:
+    - "Note about gardening: replanted the tomatoes."
+    - "Note about car maintenance: changed the oil."
+    - "Note about a work meeting about quarterly planning."
+    - "Note about a dentist appointment next month."
+    - "Note about laundry day."
+  query: "What did I see on the Paris trip?"
+  expect: grounded
+  expect_contains: ["eiffel"]
+
+- name: no_answer_missing_memory
+  category: no_answer
+  memories: []
+  distractors:
+    - "Bought a new pair of running shoes."
+  query: "What is my favorite pizza topping?"
+  expect: abstain
