@@ -1,5 +1,5 @@
-# Hand-written evaluation set (spec section 21/22). Each case creates one
-# or more fresh captures (+ distractors), optionally answers one
+# Hand-written evaluation set (spec section 21/22/24). Each case creates
+# one or more fresh captures (+ distractors), optionally answers one
 # clarification, asks `query`, and checks either that the answer
 # abstains, or that it's grounded and contains all of `expect_contains`
 # (case-insensitive substring match). `expect_units` optionally checks
@@ -26,6 +26,16 @@
   expect: grounded
   expect_contains: ["osaka"]
 
+- name: paraphrase_work_location
+  category: paraphrased
+  memories:
+    - "I started a new job at Acme Corp as a data analyst."
+  distractors:
+    - "Watched a documentary about deep sea creatures."
+  query: "What's my current employer?"
+  expect: grounded
+  expect_contains: ["acme"]
+
 - name: indirect_eth_person
   category: indirect
   memories:
@@ -36,6 +46,16 @@
   expect: grounded
   expect_contains: ["anna"]
 
+- name: indirect_pet_name
+  category: indirect
+  memories:
+    - "I adopted a cat named Whiskers last week."
+  distractors:
+    - "Note about a work meeting about quarterly planning."
+  query: "What's my pet's name?"
+  expect: grounded
+  expect_contains: ["whiskers"]
+
 - name: multiconcept_anna_tactile_paper
   category: multi_concept
   memories:
@@ -45,6 +65,16 @@
   query: "What paper did Anna recommend about tactile sensing?"
   expect: grounded
   expect_contains: ["anna"]
+
+- name: multiconcept_combo
+  category: multi_concept
+  memories:
+    - "Sarah, who works at Acme, recommended a book called Deep Work."
+  distractors:
+    - "Note about laundry day."
+  query: "What book did the person from Acme recommend?"
+  expect: grounded
+  expect_contains: ["deep work"]
 
 - name: distractor_heavy_paris
   category: distractor
@@ -60,12 +90,58 @@
   expect: grounded
   expect_contains: ["eiffel"]
 
+- name: distractor_similar_dates
+  category: distractor
+  memories:
+    - "Doctor appointment on June 3rd."
+  distractors:
+    - "Dentist appointment on June 10th."
+    - "Car service scheduled for June 17th."
+    - "Haircut booked for June 24th."
+  query: "When is my doctor appointment?"
+  expect: grounded
+  expect_contains: ["june 3"]
+
+- name: ambiguous_two_rome_trips
+  category: ambiguous
+  memories:
+    - "My trip to Rome in 2024 was great, the pasta was amazing."
+    - "My trip to Rome in 2025 was great, the gelato was amazing."
+  query: "What did I eat on my trip to Rome?"
+  expect: grounded
+  expect_contains: ["rome"]
+
+- name: ambiguous_same_name_different_context
+  category: ambiguous
+  memories:
+    - "Anna, my sister, called about dinner plans this weekend."
+    - "Anna, my colleague, sent over the quarterly report."
+  query: "What did my colleague Anna send me?"
+  expect: grounded
+  expect_contains: ["report"]
+
 - name: no_answer_missing_memory
   category: no_answer
   memories: []
   distractors:
     - "Bought a new pair of running shoes."
   query: "What is my favorite pizza topping?"
+  expect: abstain
+
+- name: no_answer_unrelated_world_knowledge
+  category: no_answer
+  memories: []
+  distractors:
+    - "Bought a new pair of running shoes."
+  query: "What is the capital of France?"
+  expect: abstain
+
+- name: no_answer_similar_but_wrong
+  category: no_answer
+  memories: []
+  distractors:
+    - "I met Bob at the gym this morning."
+  query: "What is my gym membership number?"
   expect: abstain
 
 - name: segmentation_compound_facts
@@ -86,6 +162,24 @@
   expect: grounded
   expect_contains: ["anna"]
 
+- name: segmentation_three_unrelated_facts
+  category: segmentation
+  memories:
+    - "My bike lock code is 8264. I need to call the dentist tomorrow. My favorite color is teal."
+  expect_units: [2, 4]
+  query: "What is my bike lock code?"
+  expect: grounded
+  expect_contains: ["8264"]
+
+- name: segmentation_two_facts_simple
+  category: segmentation
+  memories:
+    - "I adopted a cat named Whiskers. I also started a new job at Acme Corp."
+  expect_units: [1, 3]
+  query: "Where do I work now?"
+  expect: grounded
+  expect_contains: ["acme"]
+
 - name: clarification_alias_invented_term
   category: clarification_alias
   memories:
@@ -94,6 +188,35 @@
   query: "What is the combination for my locker at the gym?"
   expect: grounded
   expect_contains: ["42"]
+
+- name: clarification_alias_second_term
+  category: clarification_alias
+  memories:
+    - "My Flimvex PIN for the office door is 1357."
+  clarification_answer: "The office door is in Building C."
+  query: "What building is the office door in?"
+  expect: grounded
+  expect_contains: ["building c"]
+
+- name: alias_definition_direct
+  category: alias_definition
+  memories:
+    - "I call my manager Boss. Boss's real name is Sarah Chen."
+  distractors:
+    - "Note about a dentist appointment next month."
+  query: "What is Boss's real name?"
+  expect: grounded
+  expect_contains: ["sarah"]
+
+- name: alias_definition_reverse
+  category: alias_definition
+  memories:
+    - "I call my manager Boss. Boss's real name is Sarah Chen."
+  distractors:
+    - "Note about a dentist appointment next month."
+  query: "Who is Sarah Chen?"
+  expect: grounded
+  expect_contains: ["boss", "manager"]
 
 - name: user_specific_terminology
   category: user_terminology
@@ -115,6 +238,45 @@
   expect: grounded
   expect_contains: ["tactile sensing advances"]
 
+- name: relation_gave_gift
+  category: relation
+  memories:
+    - "Tom gave me a book for my birthday called Dune."
+  distractors:
+    - "Note about car maintenance."
+  query: "What book did Tom give me?"
+  expect: grounded
+  expect_contains: ["dune"]
+
+- name: relation_reverse_query
+  category: relation
+  memories:
+    - "Tom gave me a book for my birthday called Dune."
+  distractors:
+    - "Note about car maintenance."
+  query: "Who gave me a book?"
+  expect: grounded
+  expect_contains: ["tom"]
+
+- name: entity_mediated_anna_tells
+  category: entity_mediated
+  memories:
+    - "Anna told me the team meeting moved to Friday."
+  distractors:
+    - "Note about laundry day."
+  query: "What did Anna tell me?"
+  expect: grounded
+  expect_contains: ["friday"]
+
+- name: entity_mediated_multiple_people
+  category: entity_mediated
+  memories:
+    - "Bob mentioned the printer is broken."
+    - "Anna mentioned the wifi password changed."
+  query: "What did Anna mention?"
+  expect: grounded
+  expect_contains: ["wifi"]
+
 - name: cross_memory_separate_captures
   category: cross_memory
   memories:
@@ -125,3 +287,12 @@
   query: "What did Anna recommend?"
   expect: grounded
   expect_contains: ["tactile sensing"]
+
+- name: cross_memory_two_hops
+  category: cross_memory
+  memories:
+    - "I bought a new bike."
+    - "The bike I bought is a red Trek."
+  query: "What color is my new bike?"
+  expect: grounded
+  expect_contains: ["red"]

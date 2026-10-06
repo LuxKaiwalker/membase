@@ -23,7 +23,7 @@ from app.retrieval.agent import run_agent  # noqa: E402
 
 async def run_case(db, llm, case: dict) -> tuple[bool, str, str]:
     """Returns (ok, detail, segmentation_note)."""
-    db.execute(sql_text("TRUNCATE captures, memory_units, attachments"))
+    db.execute(sql_text("TRUNCATE captures, memory_units, attachments, attachment_chunks"))
     db.commit()
 
     own_units = []
@@ -72,7 +72,7 @@ async def main() -> int:
             print(f"    segmentation: {seg_note}")
         passed += int(ok)
 
-    db.execute(sql_text("TRUNCATE captures, memory_units, attachments"))
+    db.execute(sql_text("TRUNCATE captures, memory_units, attachments, attachment_chunks"))
     db.commit()
     db.close()
 
