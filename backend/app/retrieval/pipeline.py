@@ -6,20 +6,23 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.llm.base import LLMError, LLMProvider
-from app.models import Memory
+from app.models import MemoryUnit
 
 logger = logging.getLogger(__name__)
 
 CANDIDATE_LIMIT = 20
 TOP_K_FOR_ANSWER = 5
-# Minimum vector cosine similarity to consider a memory relevant at all.
+MAX_CONTEXT_PER_PRIMARY = 2
+MAX_CONTEXT_TOTAL = 6
+
+# Minimum vector cosine similarity to consider a unit relevant at all.
 # Empirically, nomic-embed-text puts *unrelated* short English sentences
-# around 0.42-0.65 cosine similarity -- there is no principled zero point,
-# so this is a hand-picked value from a handful of manual trials, not a
-# tuned threshold. See docs/TODO.md: retrieval threshold calibration.
+# around 0.4-0.65 cosine similarity -- there is no principled zero point,
+# so this is a hand-picked value from manual trials, not a tuned
+# threshold. See docs/TODO.md: retrieval threshold calibration.
 VECTOR_SIM_THRESHOLD = 0.55
 
-_ABSTENTION_MESSAGE = "I don't have a stored memory about this."
+ABSTENTION_MESSAGE = "I don't have a stored memory about this."
 
 _ANSWER_SCHEMA = {
     "type": "object",
@@ -38,12 +41,18 @@ _ANSWER_SYSTEM = (
     "provided below, which comes from the user's own stored memories. Never "
     "use outside/pretrained knowledge about people, places, or facts not "
     "present in the evidence. Give the most complete answer the evidence "
-    "supports, even if it only partially answers the question -- e.g. if "
-    "asked for a paper's title but only its topic and who recommended it is "
-    "known, say that. Set grounded to false ONLY if the evidence is about "
-    "something else entirely and has nothing relevant to the question; "
-    "otherwise answer with what the evidence does say and set grounded to "
-    "true. Do not guess or fabricate anything not present in the evidence."
+    "supports, even if it only partially answers the question. 'Related "
+    "context' evidence is from the same original note as a 'primary' "
+    "memory; USE it to resolve pronouns, names, or vague references in the "
+    "primary evidence (e.g. if primary evidence says 'she recommended X' "
+    "and related context names a person, answer with that person's name, "
+    "not the pronoun). Prefer primary evidence for which fact to report, "
+    "but resolve what it's referring to using the related context. Set "
+    "grounded to false ONLY if the evidence is about something else "
+    "entirely and has nothing relevant to "
+    "the question; otherwise answer with what the evidence does say and set "
+    "grounded to true. Do not guess or fabricate anything not present in "
+    "the evidence."
 )
 
 
@@ -56,8 +65,8 @@ def _vector_candidates(db: Session, query_vector: list[float], limit: int) -> di
         text(
             """
             SELECT id, 1 - (embedding <=> (:qv)::vector) AS score
-            FROM memories
-            WHERE embedding IS NOT NULL
+            FROM memory_units
+            WHERE embedding IS NOT NULL AND status = 'ready'
             ORDER BY embedding <=> (:qv)::vector
             LIMIT :limit
             """
@@ -72,8 +81,8 @@ def _fts_candidates(db: Session, query: str, limit: int) -> dict[uuid.UUID, floa
         text(
             """
             SELECT id, ts_rank(fts, websearch_to_tsquery('english', :q)) AS score
-            FROM memories
-            WHERE fts @@ websearch_to_tsquery('english', :q)
+            FROM memory_units
+            WHERE fts @@ websearch_to_tsquery('english', :q) AND status = 'ready'
             ORDER BY score DESC
             LIMIT :limit
             """
@@ -84,8 +93,8 @@ def _fts_candidates(db: Session, query: str, limit: int) -> dict[uuid.UUID, floa
 
 
 @dataclass
-class ScoredMemory:
-    memory: Memory
+class ScoredUnit:
+    unit: MemoryUnit
     vector_score: float | None
     fts_score: float | None
     fused_score: float
@@ -101,20 +110,20 @@ def _fuse(
         f = fts_scores.get(mid)
         norm_f = (f / max_fts) if f is not None else 0.0
         norm_v = v if v is not None else 0.0
-        # Vector weighted higher: it's what lets paraphrased/indirect cues
-        # (the whole point of this project, see docs/ARCHITECTURE.md) match
-        # at all. FTS mainly breaks ties and rewards literal overlap.
+        # Vector weighted higher: it's what lets paraphrased/indirect/alias
+        # cues match at all. FTS mainly breaks ties and rewards literal
+        # overlap. No separate reranker model for the MVP (docs/DECISIONS.md).
         fused[mid] = (v, f, 0.65 * norm_v + 0.35 * norm_f)
     return fused
 
 
-async def retrieve(
+async def hybrid_search(
     db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER
-) -> list[ScoredMemory]:
-    """Hybrid retrieval: vector + full-text, fused by a simple weighted-score
-    rerank (no separate cross-encoder reranker model in the MVP -- see
-    docs/DECISIONS.md). Returns only candidates that clear a basic
-    relevance bar, most relevant first.
+) -> list[ScoredUnit]:
+    """One retrieval round: vector + full-text over MemoryUnit, fused by a
+    weighted-score rerank, filtered to a basic relevance bar. Used both as
+    the agent's SEARCH action and directly for repeated/reformulated
+    queries within one agent run.
     """
     query = query.strip()
     if not query:
@@ -139,64 +148,78 @@ async def retrieve(
         return []
 
     ranked_ids = sorted(relevant_ids, key=lambda mid: fused[mid][2], reverse=True)[:limit]
-
-    memories = {m.id: m for m in db.query(Memory).filter(Memory.id.in_(ranked_ids)).all()}
+    units = {u.id: u for u in db.query(MemoryUnit).filter(MemoryUnit.id.in_(ranked_ids)).all()}
     return [
-        ScoredMemory(
-            memory=memories[mid],
-            vector_score=fused[mid][0],
-            fts_score=fused[mid][1],
-            fused_score=fused[mid][2],
-        )
+        ScoredUnit(unit=units[mid], vector_score=fused[mid][0], fts_score=fused[mid][1], fused_score=fused[mid][2])
         for mid in ranked_ids
-        if mid in memories
+        if mid in units
     ]
 
 
-def _format_evidence(scored: list[ScoredMemory]) -> str:
-    blocks = []
-    for i, s in enumerate(scored, start=1):
-        m = s.memory
-        derived = m.derived or {}
-        lines = [f"[Memory {i}] (created {m.created_at.date().isoformat()})", f"Caption: {m.caption}"]
-        if derived.get("summary"):
-            lines.append(f"Summary: {derived['summary']}")
-        if derived.get("people"):
-            lines.append(f"People: {', '.join(derived['people'])}")
-        if derived.get("location"):
-            lines.append(f"Location: {derived['location']}")
-        if derived.get("event_date"):
-            lines.append(f"Event date: {derived['event_date']}")
-        for a in m.attachments:
-            if a.extracted_text:
-                lines.append(f"Attachment '{a.original_filename}' excerpt: {a.extracted_text[:500]}")
-        blocks.append("\n".join(lines))
+def sibling_context(db: Session, primary: list[ScoredUnit]) -> list[MemoryUnit]:
+    """Bounded expansion to sibling units from the same capture (spec
+    section 20): extra context for interpreting a primary result, never a
+    substitute for it, and never merged into one giant blob.
+    """
+    primary_ids = {s.unit.id for s in primary}
+    capture_ids = {s.unit.capture_id for s in primary}
+    if not capture_ids:
+        return []
+
+    siblings = (
+        db.query(MemoryUnit)
+        .filter(MemoryUnit.capture_id.in_(capture_ids), MemoryUnit.status == "ready")
+        .filter(~MemoryUnit.id.in_(primary_ids))
+        .all()
+    )
+
+    per_capture_count: dict[uuid.UUID, int] = {}
+    context: list[MemoryUnit] = []
+    for unit in siblings:
+        count = per_capture_count.get(unit.capture_id, 0)
+        if count >= MAX_CONTEXT_PER_PRIMARY or len(context) >= MAX_CONTEXT_TOTAL:
+            continue
+        per_capture_count[unit.capture_id] = count + 1
+        context.append(unit)
+    return context
+
+
+def _format_unit(unit: MemoryUnit, label: str) -> str:
+    lines = [f"[{label}] (created {unit.created_at.date().isoformat()})", f"Content: {unit.authoritative_content}"]
+    semantic = unit.semantic or {}
+    if semantic.get("meaning"):
+        lines.append(f"Meaning: {semantic['meaning']}")
+    if semantic.get("aliases"):
+        lines.append(f"Also known as: {', '.join(semantic['aliases'])}")
+    if semantic.get("definitions"):
+        lines.append("Definitions: " + "; ".join(f"{d['term']} = {d['definition']}" for d in semantic["definitions"]))
+    for a in unit.capture.attachments:
+        if a.extracted_text:
+            lines.append(f"Attachment '{a.original_filename}' excerpt: {a.extracted_text[:500]}")
+    return "\n".join(lines)
+
+
+def format_evidence(primary: list[ScoredUnit], context: list[MemoryUnit]) -> str:
+    blocks = [_format_unit(s.unit, f"Primary evidence {i}") for i, s in enumerate(primary, start=1)]
+    blocks += [_format_unit(u, "Related context (same note)") for u in context]
     return "\n\n".join(blocks)
 
 
-@dataclass
-class RecallResult:
-    answer: str
-    abstained: bool
-    sources: list[ScoredMemory]
-
-
-async def answer(db: Session, llm: LLMProvider, query: str) -> RecallResult:
-    scored = await retrieve(db, llm, query)
-    if not scored:
-        return RecallResult(answer=_ABSTENTION_MESSAGE, abstained=True, sources=[])
-
-    evidence = _format_evidence(scored)
+async def generate_answer(
+    llm: LLMProvider, query: str, primary: list[ScoredUnit], context: list[MemoryUnit]
+) -> tuple[str, bool]:
+    """Returns (answer_text, grounded). Caller is responsible for
+    substituting the fixed abstention message when grounded is False --
+    this function never does that itself, so the hard override lives in
+    exactly one place (app/retrieval/agent.py)."""
+    evidence = format_evidence(primary, context)
     prompt = f"Question: {query}\n\nEvidence from stored memories:\n{evidence}"
     try:
         result = await llm.generate_structured(prompt, schema=_ANSWER_SCHEMA, system=_ANSWER_SYSTEM)
     except LLMError:
-        logger.warning("Answer generation failed; abstaining rather than guessing")
-        return RecallResult(answer=_ABSTENTION_MESSAGE, abstained=True, sources=scored)
+        logger.warning("Answer generation failed; treating as ungrounded")
+        return "", False
 
     grounded = bool(result.get("grounded"))
-    text_answer = result.get("answer") if isinstance(result.get("answer"), str) else ""
-    if not grounded or not text_answer.strip():
-        return RecallResult(answer=_ABSTENTION_MESSAGE, abstained=True, sources=[])
-
-    return RecallResult(answer=text_answer.strip(), abstained=False, sources=scored)
+    answer_text = result.get("answer") if isinstance(result.get("answer"), str) else ""
+    return answer_text.strip(), grounded and bool(answer_text.strip())
