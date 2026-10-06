@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}membase — Remember{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Store a memory</h1>
+  <form id="create-form">
+    <label for="caption">Caption</label>
+    <textarea id="caption" name="caption" rows="4"
+      placeholder="e.g. I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
+      required></textarea>
+
+    <label for="files">Attachments (optional)</label>
+    <input id="files" name="files" type="file" multiple />
+
+    <button type="submit">Save memory</button>
+  </form>
+
+  <div id="status" class="status hidden"></div>
+
+  <div id="clarification" class="card hidden">
+    <h2>One question</h2>
+    <p id="clarification-question"></p>
+    <form id="clarification-form">
+      <input id="clarification-answer" type="text" placeholder="Your answer" required />
+      <button type="submit">Submit answer</button>
+    </form>
+  </div>
+
+  <div id="result" class="card hidden">
+    <h2>Memory saved</h2>
+    <p class="muted">Derived information (automatically extracted; the original caption above is never changed by it):</p>
+    <pre id="derived"></pre>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+<script>membase.initCreatePage();</script>
+{% endblock %}

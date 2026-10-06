@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}membase — Recall{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>What do you want to remember?</h1>
+  <form id="recall-form">
+    <input id="query" type="text" placeholder="e.g. Who recommended that robotics paper?" required />
+    <button type="submit">Recall</button>
+  </form>
+
+  <div id="status" class="status hidden"></div>
+
+  <div id="result" class="card hidden">
+    <h2>Answer</h2>
+    <p id="answer" class="answer"></p>
+
+    <div id="sources-wrap">
+      <h3>Supporting memories</h3>
+      <p class="muted">This is the actual stored data the answer above was grounded in -- not generated text.</p>
+      <ul id="sources"></ul>
+    </div>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+<script>membase.initRecallPage();</script>
+{% endblock %}

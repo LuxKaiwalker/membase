@@ -1,0 +1,116 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1b1b1f;
+  --bg: #fafafa;
+  --muted: #6b6b76;
+  --accent: #3b5bdb;
+  --border: #ddd;
+  --card-bg: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #eaeaf0;
+    --bg: #15151a;
+    --muted: #9a9aa6;
+    --accent: #7c93f0;
+    --border: #33333b;
+    --card-bg: #1d1d23;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand { font-weight: 700; }
+
+nav a {
+  color: var(--muted);
+  text-decoration: none;
+  margin-right: 1rem;
+}
+
+nav a:hover { color: var(--accent); }
+
+main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+.panel h1 { font-size: 1.4rem; margin-bottom: 1rem; }
+
+form { display: flex; flex-direction: column; gap: 0.5rem; }
+
+label { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; }
+
+textarea, input[type="text"], input[type="file"] {
+  font: inherit;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--fg);
+}
+
+button {
+  margin-top: 0.75rem;
+  padding: 0.6rem 1rem;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+button:hover { opacity: 0.9; }
+
+.status { margin-top: 1rem; color: var(--muted); }
+.status.error { color: #d6336c; }
+.hidden { display: none; }
+
+.card {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card-bg);
+}
+
+.card h2 { margin-top: 0; font-size: 1.1rem; }
+.muted { color: var(--muted); font-size: 0.85rem; }
+
+pre#derived {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85rem;
+  background: var(--bg);
+  padding: 0.75rem;
+  border-radius: 6px;
+}
+
+.answer { font-size: 1.05rem; }
+.answer.abstained { color: var(--muted); font-style: italic; }
+
+#sources { list-style: none; padding: 0; }
+#sources li {
+  padding: 0.6rem 0;
+  border-top: 1px solid var(--border);
+}
+#sources li .caption { font-size: 0.9rem; }
