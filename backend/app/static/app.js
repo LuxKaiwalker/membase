@@ -13,6 +13,12 @@ const membase = (() => {
     el.classList.remove("hidden");
   }
 
+  function escapeHtml(str) {
+    const div = document.createElement("div");
+    div.textContent = str ?? "";
+    return div.innerHTML;
+  }
+
   async function postJSON(url, body) {
     const resp = await fetch(url, {
       method: "POST",
@@ -26,8 +32,13 @@ const membase = (() => {
     return data;
   }
 
-  function renderDerived(derivedEl, memory) {
-    derivedEl.textContent = JSON.stringify(memory.derived, null, 2);
+  function renderUnits(derivedEl, units) {
+    const lines = units.map((u) => ({
+      content: u.authoritative_content,
+      meaning: u.semantic && u.semantic.meaning,
+      aliases: u.semantic && u.semantic.aliases,
+    }));
+    derivedEl.textContent = JSON.stringify(lines, null, 2);
   }
 
   function initCreatePage() {
@@ -38,14 +49,29 @@ const membase = (() => {
     const clarificationForm = document.getElementById("clarification-form");
     const clarificationAnswer = document.getElementById("clarification-answer");
     const resultCard = document.getElementById("result");
+    const resultHeading = document.getElementById("result-heading");
     const derivedEl = document.getElementById("derived");
 
-    let currentMemoryId = null;
+    // Capture may split into several units; each may independently have
+    // a pending clarification. Ask them one at a time rather than all at
+    // once (spec: don't turn this into an interrogation).
+    let pendingQueue = [];
+    let allUnits = [];
 
-    function showResult(memory) {
+    function showResult() {
       hide(clarificationCard);
-      renderDerived(derivedEl, memory);
+      resultHeading.textContent = allUnits.length > 1 ? `Saved ${allUnits.length} memories.` : "Saved.";
+      renderUnits(derivedEl, allUnits);
       show(resultCard);
+    }
+
+    function askNextClarification() {
+      if (pendingQueue.length === 0) {
+        showResult();
+        return;
+      }
+      clarificationQuestion.textContent = pendingQueue[0].question;
+      show(clarificationCard);
     }
 
     form.addEventListener("submit", async (ev) => {
@@ -56,20 +82,18 @@ const membase = (() => {
 
       const formData = new FormData(form);
       try {
-        const resp = await fetch("/api/memories", { method: "POST", body: formData });
-        const memory = await resp.json();
-        if (!resp.ok) throw new Error(memory.detail || "Failed to save memory");
+        const resp = await fetch("/api/captures", { method: "POST", body: formData });
+        const capture = await resp.json();
+        if (!resp.ok) throw new Error(capture.detail || "Failed to save");
 
-        currentMemoryId = memory.id;
         hide(statusEl);
         form.reset();
 
-        if (memory.pending_clarification) {
-          clarificationQuestion.textContent = memory.pending_clarification.question;
-          show(clarificationCard);
-        } else {
-          showResult(memory);
-        }
+        allUnits = capture.units;
+        pendingQueue = capture.units
+          .filter((u) => u.pending_clarification)
+          .map((u) => ({ unitId: u.id, question: u.pending_clarification.question }));
+        askNextClarification();
       } catch (err) {
         showStatus(statusEl, err.message, true);
       }
@@ -77,12 +101,15 @@ const membase = (() => {
 
     clarificationForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
+      const current = pendingQueue[0];
       try {
-        const memory = await postJSON(`/api/memories/${currentMemoryId}/clarify`, {
+        const updatedUnit = await postJSON(`/api/memory-units/${current.unitId}/clarify`, {
           answer: clarificationAnswer.value,
         });
         clarificationAnswer.value = "";
-        showResult(memory);
+        allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
+        pendingQueue = pendingQueue.slice(1);
+        askNextClarification();
       } catch (err) {
         showStatus(statusEl, err.message, true);
       }
@@ -99,19 +126,13 @@ const membase = (() => {
     }
     for (const s of sources) {
       const li = document.createElement("li");
-      const summary = s.derived && s.derived.summary ? s.derived.summary : s.caption;
+      const summary = s.semantic && s.semantic.meaning ? s.semantic.meaning : s.content;
       const when = new Date(s.created_at).toLocaleDateString();
       li.innerHTML = `<strong>${escapeHtml(summary)}</strong><br>
         <span class="muted">Memory ${escapeHtml(s.id)} &middot; stored ${when}</span><br>
-        <span class="caption">&ldquo;${escapeHtml(s.caption)}&rdquo;</span>`;
+        <span class="caption">&ldquo;${escapeHtml(s.content)}&rdquo;</span>`;
       listEl.appendChild(li);
     }
-  }
-
-  function escapeHtml(str) {
-    const div = document.createElement("div");
-    div.textContent = str ?? "";
-    return div.innerHTML;
   }
 
   function initRecallPage() {
