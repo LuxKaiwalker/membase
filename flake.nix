@@ -64,7 +64,7 @@
           mkdir -p "$PGHOST_DIR" "$UPLOADS_DIR"
           echo "membase dev shell ready."
           echo "  scripts/dev-db.sh start   # init + start project-local postgres on port $PGPORT"
-          echo "  scripts/pull-models.sh    # pull the ollama embedding model"
+          echo "  scripts/model-doctor.sh   # check Ollama + pull/verify configured models"
         '';
       };
     };
