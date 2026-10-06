@@ -1,7 +1,10 @@
-# Small hand-written evaluation set (spec section 21). Each case seeds a
-# fresh, isolated database with `memories` (+ `distractors`), asks `query`,
-# and checks either that the answer abstains, or that it's grounded and
-# contains all of `expect_contains` (case-insensitive substring match).
+# Hand-written evaluation set (spec section 21/22). Each case creates one
+# or more fresh captures (+ distractors), optionally answers one
+# clarification, asks `query`, and checks either that the answer
+# abstains, or that it's grounded and contains all of `expect_contains`
+# (case-insensitive substring match). `expect_units` optionally checks
+# segmentation produced a unit count in [min, max] across this case's own
+# `memories` captures (not counting distractors).
 
 - name: exact_lookup
   category: exact
@@ -64,3 +67,61 @@
     - "Bought a new pair of running shoes."
   query: "What is my favorite pizza topping?"
   expect: abstain
+
+- name: segmentation_compound_facts
+  category: segmentation
+  memories:
+    - "My AHV number is 123456789. Anna is studying robotics. I need to renew my passport next March."
+  expect_units: [2, 4]
+  query: "What does Anna study?"
+  expect: grounded
+  expect_contains: ["robotics"]
+
+- name: segmentation_coherent_episode
+  category: segmentation
+  memories:
+    - "I met Anna at ETH after the robotics lecture and she recommended a tactile-sensing paper."
+  expect_units: [1, 2]
+  query: "Who recommended a tactile-sensing paper?"
+  expect: grounded
+  expect_contains: ["anna"]
+
+- name: clarification_alias_invented_term
+  category: clarification_alias
+  memories:
+    - "My Zorblex code is 42."
+  clarification_answer: "It's my gym locker combination."
+  query: "What is the combination for my locker at the gym?"
+  expect: grounded
+  expect_contains: ["42"]
+
+- name: user_specific_terminology
+  category: user_terminology
+  memories:
+    - "I call this new project Nightingale."
+  distractors:
+    - "Note about a dentist appointment next month."
+  query: "What did I call the project?"
+  expect: grounded
+  expect_contains: ["nightingale"]
+
+- name: relation_recommendation
+  category: relation
+  memories:
+    - "Anna recommended a paper called Tactile Sensing Advances."
+  distractors:
+    - "Note about laundry day."
+  query: "What did Anna recommend?"
+  expect: grounded
+  expect_contains: ["tactile sensing advances"]
+
+- name: cross_memory_separate_captures
+  category: cross_memory
+  memories:
+    - "Anna studies robotics at ETH."
+    - "Anna recommended a paper about tactile sensing."
+  distractors:
+    - "Note about a work meeting about quarterly planning."
+  query: "What did Anna recommend?"
+  expect: grounded
+  expect_contains: ["tactile sensing"]
