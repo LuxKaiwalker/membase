@@ -39,6 +39,7 @@ class ProcessedFile:
     size_bytes: int
     extracted_text: str | None
     extraction_status: str  # "ok" | "unsupported" | "failed"
+    pages: list[str] | None = None  # per-page text for PDFs; None for everything else
 
 
 def _detect_kind(data: bytes, filename: str) -> tuple[str, str]:
@@ -53,9 +54,9 @@ def _detect_kind(data: bytes, filename: str) -> tuple[str, str]:
     return mime, kind
 
 
-def _extract_pdf_text(data: bytes) -> str:
+def _extract_pdf_pages(data: bytes) -> list[str]:
     reader = PdfReader(io.BytesIO(data))
-    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    return [(page.extract_text() or "").strip() for page in reader.pages]
 
 
 def _validate_image(data: bytes) -> None:
@@ -95,10 +96,12 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
     dest_path.write_bytes(data)
 
     extracted_text: str | None = None
+    pages: list[str] | None = None
     extraction_status = "unsupported"
     if kind == "pdf":
         try:
-            extracted_text = _extract_pdf_text(data)
+            pages = _extract_pdf_pages(data)
+            extracted_text = "\n".join(pages).strip()
             extraction_status = "ok" if extracted_text else "unsupported"
         except Exception:
             logger.exception("PDF text extraction failed for %s", filename)
@@ -120,4 +123,5 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
         size_bytes=len(data),
         extracted_text=extracted_text,
         extraction_status=extraction_status,
+        pages=pages,
     )

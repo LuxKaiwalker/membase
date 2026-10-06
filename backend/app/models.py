@@ -121,3 +121,45 @@ class Attachment(Base):
     )
 
     capture: Mapped[Capture] = relationship(back_populates="attachments")
+    chunks: Mapped[list["AttachmentChunk"]] = relationship(
+        back_populates="attachment", cascade="all, delete-orphan", order_by="AttachmentChunk.chunk_index"
+    )
+
+
+class AttachmentChunk(Base):
+    """A deterministically-chunked piece of an attachment's extracted
+    text (spec section 27), independently full-text and vector indexed
+    so a large document contributes more than just a short excerpt to
+    retrieval. `capture_id` is denormalized from the parent attachment
+    purely so retrieval can query chunks without a join. The original
+    attachment (and its full extracted_text) remains authoritative;
+    chunks are recomputable from it.
+    """
+
+    __tablename__ = "attachment_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    attachment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("attachments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    capture_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("captures.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    fts = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', coalesce(text, ''))", persisted=True),
+        nullable=True,
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_dim: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    attachment: Mapped[Attachment] = relationship(back_populates="chunks")
