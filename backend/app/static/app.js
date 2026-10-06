@@ -48,20 +48,24 @@ const membase = (() => {
     const clarificationQuestion = document.getElementById("clarification-question");
     const clarificationForm = document.getElementById("clarification-form");
     const clarificationAnswer = document.getElementById("clarification-answer");
+    const clarificationDiscard = document.getElementById("clarification-discard");
     const resultCard = document.getElementById("result");
     const resultHeading = document.getElementById("result-heading");
     const derivedEl = document.getElementById("derived");
 
     // Capture may split into several units; each may independently have
     // a pending clarification. Ask them one at a time rather than all at
-    // once (spec: don't turn this into an interrogation).
+    // once (spec: don't turn this into an interrogation). A unit awaiting
+    // clarification is NOT yet searchable -- "Saved" only ever counts
+    // units that reached "ready".
     let pendingQueue = [];
     let allUnits = [];
 
     function showResult() {
       hide(clarificationCard);
-      resultHeading.textContent = allUnits.length > 1 ? `Saved ${allUnits.length} memories.` : "Saved.";
-      renderUnits(derivedEl, allUnits);
+      const ready = allUnits.filter((u) => u.status === "ready");
+      resultHeading.textContent = ready.length > 1 ? `Saved ${ready.length} memories.` : ready.length === 1 ? "Saved." : "Nothing saved.";
+      renderUnits(derivedEl, ready);
       show(resultCard);
     }
 
@@ -107,6 +111,20 @@ const membase = (() => {
           answer: clarificationAnswer.value,
         });
         clarificationAnswer.value = "";
+        allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
+        pendingQueue = pendingQueue.slice(1);
+        askNextClarification();
+      } catch (err) {
+        showStatus(statusEl, err.message, true);
+      }
+    });
+
+    clarificationDiscard.addEventListener("click", async () => {
+      const current = pendingQueue[0];
+      try {
+        const updatedUnit = await fetch(`/api/memory-units/${current.unitId}/discard`, { method: "POST" }).then((r) =>
+          r.json()
+        );
         allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
         pendingQueue = pendingQueue.slice(1);
         askNextClarification();
