@@ -5,92 +5,143 @@ here — not every implementation detail.
 
 ---
 
+**Decision:** A single user submission ("capture") may decompose into
+multiple independently-retrievable memory units, or stay as one; the LLM
+decides this per-capture via `app/ingestion/segmentation.py`, with a hard
+verbatim-content check as a safety net.
+
+**Reason:** The project's core value proposition is recovering information
+via indirect/associative cues. A single giant embedding for "my AHV number
+is X, Anna studies robotics, and I need to renew my passport" would blur
+three unrelated retrieval targets into one noisy vector. But forcing every
+sentence into its own atomic fact would shred coherent episodes (destroying
+the context that makes "who recommended that paper" answerable). Neither
+extreme works; the split has to be semantic, not mechanical.
+
+**Alternatives considered:** Always one memory per submission (the original
+MVP's model) -- simple, but conflates unrelated facts into one search unit
+and was the most-cited architectural gap in review. Always split by
+sentence -- destroys context for coherent episodes (see the "she
+recommended" pronoun-resolution bug found during eval, fixed in the
+answer-generation prompt rather than by abandoning segmentation).
+
+---
+
+**Decision:** Segmentation only accepts a proposed unit if its content is
+a verbatim (whitespace/case-normalized) substring of the original text;
+if any proposed unit fails this check, the whole capture falls back to
+one unit.
+
+**Reason:** This is the one thing standing between "the LLM organizes the
+user's own words" and "the LLM silently rewrites what the user said and
+we call it authoritative." A paraphrased "unit" would promote model
+wording to the same authority level as user input, which the hierarchy in
+docs/ARCHITECTURE.md explicitly rules out.
+
+**Alternatives considered:** Character-offset span tracking into the
+original text instead of a copied string -- more precise, but meaningfully
+more implementation complexity (every downstream consumer needs to resolve
+spans) for an MVP where whole-text fallback is an acceptable safety net.
+
+---
+
+**Decision:** Clarification answers are folded back into the unit's
+semantic representation (aliases, definitions, meaning) by *re-running
+enrichment with the answer as context*, not by just appending the Q&A as
+inert text.
+
+**Reason:** This is the actual mechanism that makes "AHV number" and
+"Swiss insurance number" cross-retrievable after a clarification -- the
+alias has to end up in `retrieval_text` (and therefore in the embedding
+and the full-text index), not just sit in a `clarifications` log that
+nothing searches.
+
+**Alternatives considered:** Appending clarification text to
+`searchable_text` only (what the original MVP did) -- works for literal
+keyword overlap but not for semantic/paraphrased retrieval of the
+clarified concept, since the embedding never changes to reflect it.
+
+---
+
+**Decision:** Clarification enriches a unit but does not gate its
+availability for recall -- a unit is `status="ready"` (searchable)
+immediately after its first enrichment pass, whether or not a
+`pending_clarification` is still open.
+
+**Reason:** Durability and simplicity: gating would require a staging
+state machine (draft -> awaiting_clarification -> ready) and a decision
+about what happens if the user never answers. Immediate availability
+means the authoritative content is never at risk of being "stuck"
+unsearchable, and most memories need no clarification at all (by design
+-- see the enrichment prompt's bias toward not asking).
+
+**Alternatives considered:** Gating recall on clarification completion.
+This is a legitimate, debatable product decision rather than a purely
+technical one -- flagged explicitly in docs/TODO.md as something to
+revisit with real usage feedback, since the spec's own ingestion diagram
+suggests gating was the intended default.
+
+---
+
+**Decision:** `qwen2.5:14b-instruct-q4_K_M` is used for every
+generation/structured-output call (segmentation, enrichment, agent
+evaluation, answer generation) -- not `qwen2.5:7b-instruct`, and not a mix
+of the two.
+
+**Reason:** Tested both directly (see CLAUDE.md / git history for the
+transcripts). 7b reliably over-segmented coherent episodes against
+explicit few-shot instruction to the contrary, and never once recognized
+an invented/unfamiliar term as worth a clarification question -- it
+always fabricated a confident-sounding definition instead, which is
+exactly the failure mode the clarification mechanism exists to prevent.
+14b handled both correctly. Separately: this GPU has 11GB VRAM; 14b-q4
+(~9GB) + nomic-embed-text (~0.3GB) coexist without eviction, but adding a
+7b model (~4.7GB) into the same rotation would exceed available VRAM and
+cause a measured ~7-14s reload stall every time Ollama swaps between them
+-- so using a second generation model isn't just unnecessary, it's a
+measured latency regression.
+
+**Alternatives considered:** 7b for cheap/fast paths (segmentation) and
+14b only for the agent -- rejected once the VRAM-swap cost was measured;
+the quality gain from always using 14b outweighs that cost, which turned
+out to be ~0 once nothing else is competing for VRAM.
+
+---
+
 **Decision:** PostgreSQL + pgvector + built-in full-text search, one
 database, no separate vector store.
 
-**Reason:** Keeps the MVP architecture simple and colocates structured
+**Reason:** Keeps the architecture simple and colocates structured
 metadata, full-text search, and vector search in one place with one
 transaction model.
-
-**Alternatives considered:** Qdrant/Weaviate/Chroma + Postgres for
-metadata (two systems to run and keep consistent, no concrete benefit at
-this scale); SQLite + a vector extension (weaker full-text/concurrency
-story, and pgvector's HNSW index is more mature).
 
 ---
 
 **Decision:** Dependencies come entirely from `nixpkgs.python313Packages`
-via the flake's `python3.withPackages`; there is no `requirements.txt` /
-`venv` / `pip install` anywhere in this repo.
+via the flake's `python3.withPackages`; no `requirements.txt`/`venv`/`pip`.
 
-**Reason:** Binary wheels from PyPI routinely fail to run on NixOS
-(missing dynamic linker paths/shared libs). Every dependency this project
-needs happens to already be packaged in nixpkgs, so there's no reason to
-take on that failure mode at all. See CLAUDE.md footgun #2.
-
-**Alternatives considered:** `uv`/`pip` inside the nix devShell with
-`nix-ld` as a fallback for binary wheels -- more moving parts, deferred
-unless a future dependency genuinely isn't in nixpkgs.
+**Reason:** Binary wheels from PyPI routinely fail on NixOS (missing
+dynamic linker paths/shared libs). Everything this project needs happens
+to already be packaged in nixpkgs.
 
 ---
 
 **Decision:** One FastAPI process serves both the JSON API and
 server-rendered (Jinja2) HTML; browser-side JS only calls the JSON API.
 
-**Reason:** Satisfies "separate frontend from memory service" (spec
-section 16) without standing up a second process/build toolchain for an
-MVP. The browser has zero business logic -- it's a thin client over HTTP,
-same as a future mobile client would be.
-
-**Alternatives considered:** A separate Vite/React SPA -- more moving
-parts (build step, CORS, two dev servers) for no MVP-stage benefit.
+**Reason:** Satisfies "separate frontend from memory service" without a
+second process/build toolchain for an MVP.
 
 ---
 
-**Decision:** Embeddings are computed from `caption + derived summary +
-topics` only, never from raw attachment text; raw attachment text instead
-feeds the full-text index via `searchable_text`.
+**Decision:** No separate reranker model/service; the hybrid fused score
+(0.65 × vector + 0.35 × normalized full-text rank) is the MVP's
+"reranking" step, and the agent's bounded reformulation loop is the
+MVP's "retrieval-oriented reasoning," not a general tool-calling agent
+framework.
 
-**Reason:** Keeps embedding input short and semantically dense (embedding
-models degrade on long/noisy input), while still making attachment
-content searchable through the lexical channel.
-
-**Alternatives considered:** Chunking attachments into multiple embedded
-passages, like a typical RAG pipeline. Explicitly out of scope -- the
-spec frames this project as *not* a RAG chatbot, and per-chunk retrieval
-adds real complexity (chunk boundaries, per-chunk provenance) for a
-document-heavy use case the MVP doesn't target.
-
----
-
-**Decision:** A memory is persisted immediately on creation, even if the
-LLM flags a clarification question; the clarification only enriches
-`derived` afterward, it never gates initial persistence.
-
-**Reason:** The spec's own ingestion diagram shows clarification before
-"commit," but gating persistence on an answered question would mean the
-authoritative caption could be lost if the user never answers, which
-conflicts with the durability requirement ("memory persists after
-restart") and the instruction to not interrogate the user unnecessarily.
-
-**Alternatives considered:** A draft/staging state machine for
-not-yet-committed memories. More correct to the letter of the spec
-diagram, but meaningfully more state to design and test for an MVP whose
-clarification feature is explicitly supposed to be simple. Flagged as an
-open question in docs/TODO.md since it's a product call, not purely an
-engineering one.
-
----
-
-**Decision:** No separate reranker model/service. The hybrid fused score
-(0.65 × normalized vector similarity + 0.35 × normalized full-text rank)
-doubles as the "reranking" step the spec's pipeline diagram calls for.
-
-**Reason:** A cross-encoder reranker is a real model to host, run, and
-evaluate; score fusion over two already-computed signals is most of the
-practical benefit for an MVP's data volumes (dozens-hundreds of memories,
-not millions).
-
-**Alternatives considered:** A local cross-encoder via Ollama/another
-runtime. Deferred -- see docs/TODO.md; worth revisiting if eval results
-show the fused score materially misordering results at larger scale.
+**Reason:** A cross-encoder reranker and a general agent framework are
+each real additional systems to host and evaluate; for an MVP at
+dozens-to-hundreds-of-memories scale, a deterministic bounded loop with
+narrow structured LLM decisions gets most of the benefit at a fraction of
+the complexity and failure surface.

@@ -9,17 +9,30 @@ becomes obvious from the code or from `docs/`.
 
 ## Environment facts
 
-- NixOS 26.05, flakes enabled, x86_64-linux, 16 cores / 32GB RAM, NVIDIA GPU present.
+- NixOS 26.05, flakes enabled, x86_64-linux, 16 cores / 32GB RAM, NVIDIA
+  GPU with 11GB VRAM.
 - Ollama runs as a **system service** (`systemctl status ollama`), already
-  listening on `127.0.0.1:11434`. Models already present: `qwen2.5:7b-instruct`
-  (default generation model), `qwen2.5-coder:1.5b`, `qwen2.5:14b-instruct-q4_K_M`.
-  Embedding model `nomic-embed-text` (768 dims) was pulled via
-  `scripts/pull-models.sh` for this project.
+  listening on `127.0.0.1:11434`.
+- The app uses exactly two models, both via Ollama, chosen after testing
+  (not the spec's suggested default) -- see docs/DECISIONS.md:
+  - `qwen2.5:14b-instruct-q4_K_M` for *every* generation/structured-output
+    call (segmentation, semantic enrichment, agent decisions, answers).
+    `qwen2.5:7b-instruct` visibly under-performed on segmentation and
+    clarification judgment in manual testing (over-split coherent
+    episodes; never recognized an unfamiliar term as worth asking about).
+  - `nomic-embed-text` (768 dims) for embeddings.
+  - **Don't mix in a third generation model.** This GPU has 11GB VRAM;
+    14b-q4 (~9GB) + nomic-embed (~0.3GB) coexist without being swapped out
+    of VRAM between calls. Adding a second *generation* model (e.g. also
+    using 7b somewhere) means Ollama evicts/reloads between calls,
+    costing ~7-14s *per call* -- confirmed empirically, see git history
+    for the measurement. `scripts/model-doctor.sh` checks the two models
+    actually configured are present and working; it does not pull extras.
 - No docker/podman available. No system-wide Postgres. Everything the app
   needs beyond Ollama is provided by `flake.nix`.
 - All Python dependencies come from `nixpkgs.python313Packages` via
   `python3.withPackages` in `flake.nix` — there is no `requirements.txt`,
-  `venv`, or `pip install` in this repo. See footgun #2 below for why.
+  `venv`, or `pip install` in this repo.
 
 ## Dev workflow
 
@@ -30,8 +43,8 @@ your cwd is `backend/` instead of root when you run it.
 
 ```
 nix develop                 # enters the shell, prints next steps
+scripts/model-doctor.sh     # Ollama reachable? models present? generation/embed actually work?
 scripts/dev-db.sh start     # init/start project-local Postgres (port 5544)
-scripts/pull-models.sh      # idempotent: ensures nomic-embed-text is pulled
 (cd backend && alembic upgrade head)   # first run / after a schema change
 scripts/run-dev.sh          # uvicorn --reload, --app-dir resolved from $MEMBASE_ROOT
 pytest -q                   # fast fakes + real-LLM integration tests
@@ -47,35 +60,47 @@ elsewhere.
 
 1. **Flakes only see git-tracked files.** `nix develop`/`nix flake check` on
    an untracked `flake.nix` fails with "Path ... is not tracked by Git".
-   Just-staged (not committed) is enough. Keep this in mind after creating
-   any new file the flake references.
-2. **pip-installed binary wheels generally don't run on NixOS** (no
-   `/lib64/ld-linux`, libs not on the loader's search path) — classic trap
-   for anything with compiled extensions (psycopg2, pillow, pydantic-core,
-   etc.). Avoided entirely here by sourcing every Python dependency from
-   nixpkgs instead of PyPI. If a future dependency isn't packaged in
-   nixpkgs, don't reach for `pip install` inside the nix env — that's a
-   decision to flag, not to silently work around (options: nixpkgs
-   overlay/override, `nix-ld`, or vendoring).
+   Just-staged (not committed) is enough.
+2. **pip-installed binary wheels generally don't run on NixOS.** Avoided
+   entirely by sourcing every Python dependency from nixpkgs instead of
+   PyPI.
 3. **`initdb` needs a locale archive that NixOS doesn't provide by
-   default** — fails/warns without one. Fixed by using `--locale=C.UTF-8`
-   in `scripts/dev-db.sh` and exporting `LOCALE_ARCHIVE` to
-   `pkgs.glibcLocales` in the flake's `shellHook`.
+   default.** Fixed via `--locale=C.UTF-8` in `scripts/dev-db.sh` plus
+   `LOCALE_ARCHIVE` exported in the flake's `shellHook`.
 4. **No assumption of a system Postgres service.** This project runs its
-   own project-local instance (`scripts/dev-db.sh`) with `PGDATA` and the
-   unix socket dir both under `.data/` (gitignored), on port 5544 — isolated
-   from anything else on the machine, no root/systemd needed.
-5. **Don't start a second Ollama.** One is already running system-wide on
-   `:11434`. `ollama serve` again would fail to bind the port. The app just
-   talks to the existing instance via `OLLAMA_HOST`.
-6. **The nix store is read-only.** All writable app state (Postgres data,
-   uploaded files) lives under `.data/` in the repo, never under a store
-   path.
-7. The web server binds `127.0.0.1` only, never `0.0.0.0` — required by the
-   project's privacy goals, and avoids surprises if the NixOS firewall
-   config ever changes.
+   own project-local instance (`scripts/dev-db.sh`), isolated under `.data/`.
+5. **Don't start a second Ollama;** one already runs system-wide. Don't
+   mix generation models either -- see "Environment facts" above, this
+   one isn't NixOS-specific but bit us the same way (unexpected 7-14s
+   stalls from model eviction/reload).
+6. **The nix store is read-only.** All writable app state lives under
+   `.data/` in the repo, never under a store path.
+7. **`MEMBASE_ROOT` must be resolved via `git rev-parse --show-toplevel`,
+   not `$PWD`.** `$PWD` is captured once at shell-entry; if `nix develop`
+   is run from a subdirectory (e.g. `backend/`), everything derived from
+   a `$PWD`-based root (Postgres data dir, uploads dir, `--app-dir`)
+   silently points at the wrong place for the rest of that shell's life,
+   including after a later `cd` to the right place. Hit this for real;
+   see git history. `git rev-parse --show-toplevel` is correct regardless
+   of invocation directory.
+8. The web server binds `127.0.0.1` only, never `0.0.0.0`.
 
-Design decisions, architecture, and open questions all now live in
-`docs/` and aren't duplicated here — start with `docs/REPORT.md` for the
-current state, `docs/ARCHITECTURE.md` for how it fits together, and
-`docs/DECISIONS.md` / `docs/TODO.md` for why/what's unresolved.
+## Key architecture terms (see docs/ARCHITECTURE.md for the full picture)
+
+- **Capture**: one user submission (`captures` table), authoritative
+  `raw_text`, never rewritten.
+- **MemoryUnit**: one independently-retrievable piece of memory
+  (`memory_units` table), `capture_id` is the "origin group". A capture
+  may produce one unit (coherent episode) or several (unrelated facts) --
+  the LLM decides, see `app/ingestion/segmentation.py`.
+- **Authority hierarchy**: `authoritative_content` (user-typed) >
+  `clarifications` (user-answered, append-only) > `semantic` (LLM-derived,
+  regenerable) > `retrieval_text`/`searchable_text`/`embedding` (fully
+  derived indexes).
+- **Clarification is semantic enrichment, not conversation**: an answer
+  gets folded into the unit's semantic representation (aliases,
+  definitions) and triggers re-embedding, not just appended to a chat log.
+- **Agent** (`app/retrieval/agent.py`): bounded deterministic state
+  machine (search -> evaluate -> reformulate, max 3 rounds), not a
+  general tool-calling framework. Grounding is enforced in exactly one
+  place in that file.

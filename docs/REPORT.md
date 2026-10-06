@@ -1,145 +1,151 @@
-# Final engineering report
+# Engineering report: memory-unit architecture phase
 
-Status: working MVP. The full loop (store -> optionally clarify -> later
-ask an indirect question -> get a grounded answer with sources -> restart
-without losing data) was verified end-to-end against the real local LLM,
-not just unit-tested. Not production-ready -- see "Architectural risks."
+This supersedes the previous report. Status: the core architectural
+correction (capture/memory-unit decomposition, clarification-as-semantic-
+enrichment, bounded retrieval agent) is implemented and verified against
+the real local LLM, including the spec's acceptance tests. Not
+production-ready -- see "Known limitations" and "Architectural risks."
 
-## Implemented
+## What changed from the previous MVP
 
-- Web UI (Jinja2 + vanilla JS) for memory creation (with clarification
-  flow) and recall, talking only to a JSON API.
-- `POST /memories`, `GET /memories/{id}`, `POST /memories/{id}/clarify`,
-  `POST /memories/{id}/attachments`, `POST /recall`.
-- File attachments: PDF/TXT/MD with text extraction, images
-  stored+validated (no captioning). Real content sniffed from bytes;
-  wrong/dangerous types rejected at upload.
-- Automatic metadata extraction (people/location/topics/event_date/
-  summary) via local LLM structured output, with a simple one-question
-  clarification mechanism that enriches but never blocks persistence.
-- Embeddings (nomic-embed-text, 768d) + Postgres full-text search,
-  fused by a weighted-score rerank.
-- Grounded answer generation that deterministically abstains
-  ("I don't have a stored memory about this.") when evidence doesn't
-  support an answer, with full provenance (which memories were used).
-- `LLMProvider` abstraction with one implementation (Ollama); ingestion
-  and retrieval degrade gracefully (never crash) when the LLM is down,
-  times out, or returns malformed output.
-- Alembic-migrated Postgres schema distinguishing authoritative data
-  (caption, files) from derived data (metadata, embeddings, search index).
-- 19 pytest tests (fast fakes for storage/failure-mode logic + real-LLM
-  integration tests for retrieval/grounding quality) and a 6-case manual
-  eval set covering exact/paraphrased/indirect/multi-concept/distractor/
-  no-answer -- all passing as of this report.
-- `flake.nix` devShell (Python entirely from nixpkgs, no pip; project-local
-  Postgres+pgvector) and `CLAUDE.md` documenting the NixOS-specific
-  footguns hit while building this.
+The previous MVP stored one `Memory` row per submission with a flat
+`derived` metadata blob and a single clarification question. This phase
+replaced that with:
 
-## Partially implemented
+- **`Capture` + `MemoryUnit`**, decoupling "what the user submitted" from
+  "what's independently retrievable," with an LLM-driven, verbatim-
+  validated segmentation step deciding the split per capture.
+- **A real semantic representation per unit** (`semantic` jsonb: meaning,
+  aliases, entities, topics, definitions, relations) instead of a flat
+  people/location/topics dict, plus a deterministically-assembled
+  `retrieval_text` that's what actually gets embedded and full-text
+  indexed -- aliases and definitions are retrieval cues now, not just
+  display metadata.
+- **Clarification as semantic enrichment**: an answer re-triggers the
+  full enrichment pass (not just an appended text blob), so a clarified
+  term's aliases become genuinely embedded/indexed, not just present in
+  one past answer.
+- **A bounded retrieval agent** (`app/retrieval/agent.py`) replacing a
+  single-shot hybrid search: up to 3 rounds of search, with an LLM
+  deciding whether to reformulate the query using likely synonyms/aliases.
+- **A two-phase-commit ingestion pipeline** with an explicit `status`
+  (`draft`/`ready`/`failed`) so a bug in derived processing can never
+  silently lose or corrupt the user's original input.
+- **Sibling/context expansion**: a primary hit's answer can draw on
+  other units from the same capture for context (e.g. resolving a
+  pronoun), bounded and clearly distinguished from primary evidence.
 
-- **Clarification quality**: works, but the 7B generation model
-  occasionally asks a spurious or mistargeted question (see docs/TODO.md).
-  Low severity since it's purely additive.
-- **Attachments added after creation** (`POST /memories/{id}/attachments`)
-  extend the full-text index but don't re-embed or re-run metadata
-  extraction -- a scope cut, not a bug (see docs/DECISIONS.md).
-- **Metadata extraction** is reasonably reliable for people/topics/
-  event_date but inconsistent for `location` in manual testing (sometimes
-  left blank when the text clearly names one). Doesn't block retrieval
-  since full-text/embedding search index the raw caption regardless.
+## Local LLM setup
 
-## Not implemented (deferred, per spec section 3)
+- Ollama: system service, already running at `127.0.0.1:11434`.
+- Generation model: `qwen2.5:14b-instruct-q4_K_M`, used for *every*
+  generation/structured-output call (segmentation, enrichment, agent
+  evaluation, answers). Chosen over the originally-suggested
+  `qwen2.5:7b-instruct` after direct testing showed 7b reliably
+  mis-segmenting coherent episodes and never asking a clarification
+  question even for genuinely invented terms (always fabricated a
+  confident-sounding definition instead). Using one model everywhere
+  also avoids a measured ~7-14s Ollama model-swap stall that occurs if a
+  second generation model is mixed in on this GPU's 11GB VRAM budget.
+- Embedding model: `nomic-embed-text`, 768 dims, unchanged.
+- Setup/diagnostic: `scripts/model-doctor.sh` -- checks reachability,
+  pulls missing models, verifies generation and embedding calls actually
+  work, and flags an embedding-dimension mismatch against the schema.
+  Safe to rerun.
 
-Multi-turn conversational memory, autonomous background agents, knowledge
-graphs, memory consolidation/forgetting, multi-agent systems, advanced
-temporal reasoning, image understanding (captioning/OCR), cloud
-deployment, mobile apps, multi-user auth, a reranker model, an
-embedding-model backfill/reindex tool, per-chunk attachment retrieval.
+## Evaluation
 
-## Known limitations
+`eval/cases.yaml`: 12 hand-written cases against the real model, covering
+exact, paraphrased, indirect, multi-concept, distractor, no-answer
+(carried over from the previous phase) plus new categories this phase
+specifically targets: segmentation (compound-facts vs. coherent-episode),
+clarification-driven alias retrieval (using an invented term, "Zorblex
+code," specifically so the model cannot fall back on world knowledge),
+user-specific terminology, relation retrieval, and cross-memory retrieval
+across separate captures. **12/12 passing** as of this report
+(`scripts/run-eval.sh`).
 
-- **Retrieval threshold is unvalidated.** `VECTOR_SIM_THRESHOLD = 0.55`
-  came from a handful of manual trials against one embedding model
-  (nomic-embed-text), not a tuned value against a real eval set at scale.
-- **No re-embedding path.** A memory whose embedding failed at creation
-  time (LLM was down), or that predates a `MEMBASE_EMBED_MODEL` change,
-  stays full-text-searchable but not vector-searchable until someone
-  writes a backfill job.
-- **Small-model grounding is imperfect.** The 7B model occasionally gives
-  an over-literal "the evidence doesn't say X" (slightly too conservative,
-  since tuned) or an overly verbose hedge; the prompt was iterated against
-  manual cases but not against a large held-out set.
-- **No image/vision model wired in** -- images are stored and validated
-  but contribute nothing to search.
-- **UI click-tested via API+rendered-HTML inspection, not a live browser
-  session** -- no browser automation tool was available in the build
-  environment. The JS logic is simple DOM/fetch code traced by hand
-  against the verified API contract.
-- **Single-user, localhost-only, no auth** -- appropriate for the MVP's
-  privacy goals, not for any shared/networked deployment.
+One real failure was found and fixed during this work, not just assumed
+away: the coherent-episode segmentation case initially split "I met Anna
+at ETH... and she recommended a paper" into two verbatim-valid halves,
+and the answer came back as "she" instead of "Anna" -- the sibling
+context *was* retrieved and included in the evidence, but the
+answer-generation prompt didn't instruct the model to actually use it to
+resolve the pronoun. Fixed by strengthening that prompt; confirmed fixed
+by rerunning the eval case, not just by inspection.
+
+## Tests
+
+40 pytest tests, all passing: 35 fast (FakeLLMProvider, dispatches by
+schema shape into segmentation/enrichment/evaluate/answer canned
+responses) covering storage, segmentation (verbatim fallback, cap,
+compound vs. coherent end-to-end), clarification (question generation,
+answer persistence, re-enrichment, bounded rounds, alias retrieval via
+fakes), retrieval (exact/distractor/sibling-context), the agent (direct
+search, reformulation, iteration limit, malformed/unavailable LLM,
+no-answer), grounding override, and two-phase-commit failure/retry
+(via `monkeypatch` forcing an unexpected exception mid-enrichment). 5
+integration tests against the real Ollama service, including the
+spec's own acceptance-test shape (clarification -> alias -> retrieval,
+using the invented "Zorblex code" term specifically so the test can't
+pass via world knowledge) and the segmentation acceptance test
+(compound facts split, coherent episode doesn't).
+
+## Remaining limitations
+
+- Segmentation's verbatim-fallback check has no linguistic awareness of
+  pronoun/reference chains -- it only prevents paraphrasing, not
+  reference-breaking splits. Mitigated at the answer-generation layer
+  (see above), not eliminated at the source.
+- Clarification question triggering is still inconsistent for borderline
+  cases across different runs of the same input.
+- No image understanding; no attachment chunking for large documents; no
+  re-embedding/backfill tool for stale embeddings.
+- Retrieval threshold (0.55 cosine similarity cutoff) remains a
+  hand-picked value, not swept/tuned against a large eval set.
+- Agent worst-case latency (~7 search calls + up to 4 LLM structured
+  calls per recall) is unbounded-feeling even though iteration-bounded;
+  not measured under load.
+
+## Deferred work
+
+Multi-turn conversation, autonomous background agents, general
+knowledge-graph storage, memory consolidation/forgetting, multimodal
+understanding, multi-user auth, a trained/learned reranker, deletion UI,
+post-creation metadata correction UI. See docs/TODO.md for the complete,
+categorized list -- several of these (deletion, correction, re-embedding)
+are flagged as likely near-term work, not permanently out of scope.
 
 ## Open product questions
 
-See docs/TODO.md "Open product questions" for the full list:
-whether clarification should gate persistence, whether metadata should be
-user-editable, whether attachments should be independently searchable,
-whether memories should ever expire/be forgotten.
+Whether clarification should gate recall availability (current: it
+doesn't) is the most consequential one -- see docs/DECISIONS.md for the
+reasoning and docs/TODO.md for what would need to change to flip it.
 
 ## Architectural risks
 
-1. **Retrieval threshold calibration.** The single scalar cutoff on
-   cosine similarity is the most likely thing to need rework once real
-   usage data exists -- it was picked from ~10 manual query/memory pairs.
-   A relative/adaptive threshold (margin below the top score, or a
-   learned calibration) is the likely fix; needs a bigger eval set first.
-2. **Single embedding model, no versioning migration path.** The schema
-   stores `embedding_model`/`embedding_dim` per row specifically so a
-   future model change is *detectable*, but there's no tool that acts on
-   that yet. Not urgent at MVP scale, but would bite the first time
-   someone actually changes `MEMBASE_EMBED_MODEL` with existing data.
-3. **Small local generation model's judgment calls** (what counts as
-   "grounded," when to ask a clarification question) are the least
-   predictable part of the system and the hardest to regression-test
-   without a much larger eval set. The current eval set (6 cases) is
-   enough to catch gross regressions, not subtle ones.
+1. **Retrieval threshold calibration** remains the single scalar most
+   likely to need rework with more usage data -- unchanged risk from the
+   previous phase, now compounded by the fact that `retrieval_text` (the
+   embedding input) is richer/longer than before, which may shift the
+   unrelated-pair similarity baseline that the 0.55 cutoff was picked
+   against.
+2. **Segmentation quality is now load-bearing** in a way it wasn't
+   before: a bad split can break reference resolution (see the fix
+   above) or merge things that shouldn't be merged. The verbatim check
+   is a safety net against fabrication, not a quality guarantee.
+3. **Single generation model dependency**: the whole pipeline's
+   judgment quality (segmentation, clarification triggering, grounding)
+   rests on one 14B local model's instruction-following. No fallback or
+   ensemble; a future smaller/faster model swap would need the same kind
+   of manual A/B testing documented in docs/DECISIONS.md, not just a
+   config change.
 
-## Suggested next steps
+## Recommended next experiment
 
-1. **Build a larger eval set and use it to calibrate the retrieval
-   threshold.**
-   - *Problem:* the 0.55 cutoff is a guess from a handful of trials.
-   - *Current state:* 6 eval cases, all passing, but not enough to tune
-     a numeric threshold responsibly.
-   - *Why it matters:* this threshold directly controls the
-     recall/precision tradeoff for the project's core value proposition
-     (indirect/associative retrieval).
-   - *Possible approaches:* expand eval/cases.yaml to 30-50 cases
-     covering more paraphrase distance; sweep the threshold against it;
-     consider a relative-margin rule instead of an absolute cutoff.
-   - *Recommended next investigation:* start by writing 10 more
-     paraphrased/indirect cases from real-ish personal memories and
-     seeing where the current threshold already fails.
-
-2. **Decide whether clarification should gate persistence.**
-   - *Problem:* current behavior (persist immediately, enrich later) is
-     a deliberate scope call, but diverges from the spec's own diagram.
-   - *Current state:* implemented as "enrich-after" (docs/DECISIONS.md).
-   - *Why it matters:* affects the UI's perceived flow and whether
-     "pending" memories should be visually distinguished.
-   - *Possible approaches:* keep as-is; or add a lightweight `status`
-     field (`complete`/`awaiting_clarification`) surfaced in the UI
-     without actually blocking persistence.
-   - *Recommended next investigation:* user feedback on whether the
-     current (silent, non-blocking) clarification flow feels right.
-
-3. **A re-embedding/backfill tool.**
-   - *Problem:* no path to fix memories with missing/stale embeddings.
-   - *Current state:* detectable (`embedding_model`/`embedding_dim`
-     columns) but not actionable.
-   - *Why it matters:* becomes necessary the first time the embedding
-     model changes or Ollama was down during a batch of memory creation.
-   - *Possible approaches:* a `scripts/reembed.py` that finds rows where
-     `embedding IS NULL OR embedding_model != current_model` and re-runs
-     just the embedding step.
-   - *Recommended next investigation:* low effort, could be done
-     immediately after step 1; not urgent before then.
+Expand `eval/cases.yaml` to ~30-50 cases specifically targeting
+segmentation/reference-resolution edge cases (the exact failure mode
+found and fixed this phase) and use it to decide whether the verbatim-
+fallback mechanism needs a second, explicit check for dangling pronouns/
+references, rather than relying on the answer-generation prompt to paper
+over it after the fact.
