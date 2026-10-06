@@ -21,13 +21,23 @@ full design and `docs/REPORT.md` for what's implemented vs. not.
 
 ## Running it
 
+Run these from the repo root (`cd ~/membase` or wherever you cloned it) --
+`scripts/*.sh` are paths relative to the root, not to `backend/`:
+
 ```sh
 nix develop                 # enters the dev shell; prints next steps
 scripts/pull-models.sh      # pulls the embedding model (nomic-embed-text)
 scripts/dev-db.sh start     # inits/starts a project-local Postgres
 (cd backend && alembic upgrade head)   # first time only / after schema changes
-uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8000
+scripts/run-dev.sh          # starts uvicorn with --reload
 ```
+
+`scripts/run-dev.sh` works from any cwd inside the `nix develop` shell (it
+resolves `--app-dir` from `$MEMBASE_ROOT`); a bare
+`uvicorn app.main:app --app-dir backend` only resolves correctly if your
+cwd happens to be the repo root, and silently breaks with
+`ModuleNotFoundError: No module named 'app'` if you run it from inside
+`backend/` instead -- use the script.
 
 Open http://127.0.0.1:8000/ to store a memory, and
 http://127.0.0.1:8000/recall to query it. The server binds to localhost

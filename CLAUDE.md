@@ -23,12 +23,17 @@ becomes obvious from the code or from `docs/`.
 
 ## Dev workflow
 
+All of this runs from the **repo root** -- `scripts/*.sh` are root-relative
+paths, and `scripts/run-dev.sh` specifically exists because a bare
+`uvicorn ... --app-dir backend` silently breaks (`ModuleNotFoundError`) if
+your cwd is `backend/` instead of root when you run it.
+
 ```
 nix develop                 # enters the shell, prints next steps
 scripts/dev-db.sh start     # init/start project-local Postgres (port 5544)
 scripts/pull-models.sh      # idempotent: ensures nomic-embed-text is pulled
 (cd backend && alembic upgrade head)   # first run / after a schema change
-uvicorn app.main:app --reload --app-dir backend --host 127.0.0.1 --port 8000
+scripts/run-dev.sh          # uvicorn --reload, --app-dir resolved from $MEMBASE_ROOT
 pytest -q                   # fast fakes + real-LLM integration tests
 scripts/run-eval.sh         # hand-written eval set, isolated DB (membase_eval)
 scripts/dev-db.sh stop
