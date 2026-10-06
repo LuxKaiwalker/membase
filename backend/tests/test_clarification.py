@@ -27,9 +27,9 @@ async def test_clarification_question_generated_and_surfaced(db):
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
     assert unit.pending_clarification == {"question": "What is a Zorblex code?", "field": "Zorblex code", "round": 0}
-    # Not gated in this architecture: the unit is already ready/searchable
-    # even with an open question (see docs/DECISIONS.md).
-    assert unit.status == "ready"
+    # Gated: a unit with an open clarification question is durably saved
+    # but not yet searchable (see docs/DECISIONS.md).
+    assert unit.status == "awaiting_clarification"
 
 
 @pytest.mark.asyncio
@@ -161,3 +161,37 @@ async def test_retrieval_succeeds_via_clarification_derived_alias(db):
 
     scored = await hybrid_search(db, llm, "gym locker combination")
     assert scored and scored[0].unit.id == unit.id
+
+
+@pytest.mark.asyncio
+async def test_unit_awaiting_clarification_is_not_searchable(db):
+    """The gate itself: before the question is answered, the unit must
+    not surface in recall at all -- not even via an exact keyword match
+    on its own authoritative_content."""
+    from app.ingestion.pipeline import create_capture
+
+    llm = FakeLLMProvider(
+        enrichment_response={
+            "meaning": "",
+            "aliases": [],
+            "people": [],
+            "organizations": [],
+            "locations": [],
+            "topics": [],
+            "definitions": [],
+            "relations": [],
+            "event_date": "",
+            "clarification_question": "What is a Zorblex code?",
+            "clarification_field": "Zorblex code",
+        }
+    )
+    capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
+    unit = capture.units[0]
+    assert unit.status == "awaiting_clarification"
+
+    scored = await hybrid_search(db, llm, "Zorblex code")
+    assert scored == [], "an unanswered unit must not be searchable"
+
+    fetched = db.get(type(unit), unit.id)
+    assert fetched is not None
+    assert fetched.authoritative_content == "My Zorblex code is 42."

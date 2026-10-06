@@ -59,7 +59,11 @@ async def test_acceptance_clarification_alias_retrieval(db, real_llm):
     capture = await create_capture(db, real_llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
     if unit.pending_clarification:
+        assert unit.status == "awaiting_clarification", "unit with an open question must be gated, not ready"
+        before = await run_agent(db, real_llm, "What is the combination for my locker at the gym?")
+        assert before.abstained is True, "a gated unit must not be found by recall before it's answered"
         unit = await resolve_clarification(db, real_llm, unit, "It's my gym locker combination.")
+        assert unit.status == "ready"
 
     result = await run_agent(db, real_llm, "What is the combination for my locker at the gym?")
     assert result.abstained is False
