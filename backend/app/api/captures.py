@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.ingestion.pipeline import IngestionError, add_attachment, create_capture
+from app.ingestion.pipeline import IngestionError, add_attachment, create_capture, delete_capture
 from app.llm import get_llm_provider
 from app.llm.base import LLMProvider
 from app.models import Capture
@@ -39,15 +39,22 @@ async def get(capture_id: uuid.UUID, db: Session = Depends(get_db)):
     return _get_capture_or_404(db, capture_id)
 
 
+@router.delete("/{capture_id}", status_code=204)
+async def delete(capture_id: uuid.UUID, db: Session = Depends(get_db)):
+    capture = _get_capture_or_404(db, capture_id)
+    delete_capture(db, capture)
+
+
 @router.post("/{capture_id}/attachments", response_model=CaptureOut)
 async def add_attachment_endpoint(
     capture_id: uuid.UUID,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
 ):
     capture = _get_capture_or_404(db, capture_id)
     data = await file.read()
     try:
-        return await add_attachment(db, capture, file.filename or "upload", data)
+        return await add_attachment(db, llm, capture, file.filename or "upload", data)
     except IngestionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
