@@ -1,51 +1,54 @@
 import pytest
 
-from app.ingestion.pipeline import IngestionError, create_memory
-from app.models import Memory
+from app.ingestion.pipeline import IngestionError, create_capture
+from app.models import Capture
 
 
 @pytest.mark.asyncio
-async def test_create_memory_persists(db, fake_llm):
-    memory = await create_memory(db, fake_llm, caption="Test memory", uploads=[])
-    assert memory.id is not None
+async def test_create_capture_persists(db, fake_llm):
+    capture = await create_capture(db, fake_llm, text="Test memory", uploads=[])
+    assert capture.id is not None
+    assert len(capture.units) == 1
+    assert capture.units[0].authoritative_content == "Test memory"
 
     # Look it up fresh by id rather than relying on the in-memory object --
     # the closest a unit test gets to "survives a restart" without actually
     # restarting the process.
-    fetched = db.get(Memory, memory.id)
+    fetched = db.get(Capture, capture.id)
     assert fetched is not None
-    assert fetched.caption == "Test memory"
+    assert fetched.raw_text == "Test memory"
+    assert fetched.units[0].status == "ready"
 
 
 @pytest.mark.asyncio
-async def test_create_memory_rejects_empty_caption(db, fake_llm):
+async def test_create_capture_rejects_empty_text(db, fake_llm):
     with pytest.raises(IngestionError):
-        await create_memory(db, fake_llm, caption="   ", uploads=[])
+        await create_capture(db, fake_llm, text="   ", uploads=[])
 
 
 @pytest.mark.asyncio
-async def test_attachment_persists(db, fake_llm):
-    memory = await create_memory(
-        db, fake_llm, caption="Has an attachment", uploads=[("notes.txt", b"hello world")]
+async def test_attachment_persists_on_capture(db, fake_llm):
+    capture = await create_capture(
+        db, fake_llm, text="Has an attachment", uploads=[("notes.txt", b"hello world")]
     )
-    assert len(memory.attachments) == 1
-    assert memory.attachments[0].extraction_status == "ok"
-    assert memory.attachments[0].extracted_text == "hello world"
-    assert "hello world" in memory.searchable_text
+    assert len(capture.attachments) == 1
+    assert capture.attachments[0].extraction_status == "ok"
+    assert capture.attachments[0].extracted_text == "hello world"
+    assert "hello world" in capture.units[0].searchable_text
 
 
 @pytest.mark.asyncio
-async def test_create_memory_rejects_unsupported_file(db, fake_llm):
+async def test_create_capture_rejects_unsupported_file(db, fake_llm):
     with pytest.raises(IngestionError):
-        await create_memory(
+        await create_capture(
             db,
             fake_llm,
-            caption="bad file",
+            text="bad file",
             uploads=[("virus.exe", b"MZ\x90\x00\x03\x00\x00\x00")],
         )
 
 
 @pytest.mark.asyncio
-async def test_create_memory_rejects_empty_file(db, fake_llm):
+async def test_create_capture_rejects_empty_file(db, fake_llm):
     with pytest.raises(IngestionError):
-        await create_memory(db, fake_llm, caption="empty file", uploads=[("empty.txt", b"")])
+        await create_capture(db, fake_llm, text="empty file", uploads=[("empty.txt", b"")])
