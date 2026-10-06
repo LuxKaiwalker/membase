@@ -48,7 +48,9 @@ scripts/dev-db.sh start     # init/start project-local Postgres (port 5544)
 (cd backend && alembic upgrade head)   # first run / after a schema change
 scripts/run-dev.sh          # uvicorn --reload, --app-dir resolved from $MEMBASE_ROOT
 pytest -q                   # fast fakes + real-LLM integration tests
-scripts/run-eval.sh         # hand-written eval set, isolated DB (membase_eval)
+scripts/run-eval.sh         # 30-case hand-written eval set, isolated DB (membase_eval)
+scripts/sweep-threshold.sh  # retrieval-threshold calibration experiment, same isolated DB
+python3 scripts/reembed.py --dry-run   # report stale/missing embeddings; drop --dry-run to fix
 scripts/dev-db.sh stop
 ```
 
@@ -97,10 +99,23 @@ elsewhere.
   `clarifications` (user-answered, append-only) > `semantic` (LLM-derived,
   regenerable) > `retrieval_text`/`searchable_text`/`embedding` (fully
   derived indexes).
+- **Status gate**: `draft` -> `awaiting_clarification` (open question;
+  NOT searchable -- excluded from `hybrid_search()` by the `status='ready'`
+  SQL filter) -> `ready` (searchable) -> `failed` (unexpected exception
+  during derived processing, authoritative content untouched, retryable)
+  / `discarded` (explicit user cancel of an awaiting unit).
 - **Clarification is semantic enrichment, not conversation**: an answer
   gets folded into the unit's semantic representation (aliases,
   definitions) and triggers re-embedding, not just appended to a chat log.
+  Same mechanism powers user-initiated correction
+  (`POST /memory-units/{id}/correct`), which doesn't consume the bounded
+  system-clarification round budget.
+- **AttachmentChunk**: large documents are chunked (page-based for PDFs,
+  fixed-window for txt/md) and each chunk independently full-text + vector
+  indexed, so a fact buried in a long document is findable rather than
+  only ever showing up as "first 500 chars of the attachment."
 - **Agent** (`app/retrieval/agent.py`): bounded deterministic state
   machine (search -> evaluate -> reformulate, max 3 rounds), not a
-  general tool-calling framework. Grounding is enforced in exactly one
+  general tool-calling framework. Searches both memory units and
+  attachment chunks every round. Grounding is enforced in exactly one
   place in that file.

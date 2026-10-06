@@ -7,8 +7,8 @@ Browser (Jinja2-rendered HTML + vanilla JS)
         |  fetch() -- JSON over HTTP, same origin
         v
 FastAPI app (backend/app)
-  ├── api/captures.py   -- POST /api/captures, GET .../{id}, .../attachments
-  ├── api/units.py      -- GET/clarify/retry on /api/memory-units/{id}
+  ├── api/captures.py   -- POST/GET/DELETE /api/captures/{id}, .../attachments
+  ├── api/units.py      -- GET/clarify/correct/discard/retry on /api/memory-units/{id}
   ├── api/recall.py     -- POST /api/recall
   ├── web/routes.py     -- GET /, GET /recall (serves the HTML shell)
   ├── ingestion/        -- segmentation, enrichment, pipeline orchestration
@@ -103,19 +103,27 @@ persists even if derived processing fails" (spec section 25): the
 authoritative text is committed *before* any LLM call in the derived
 stage runs, in a separate transaction.
 
-If `enrich()` surfaced a `clarification_question`, it's attached to the
-unit as `pending_clarification` and returned to the caller. Answering it
-(`POST /memory-units/{id}/clarify`) appends the verbatim Q&A to
-`clarifications`, then re-runs the *entire* derived stage (enrichment,
-retrieval_text, searchable_text, embedding) with the new clarification as
-additional context -- this is what makes a clarified term's aliases
-actually searchable afterward, not just present in a one-off answer. The
-unit does **not** wait in an unsearchable state for this to happen (see
-docs/DECISIONS.md: clarification enriches, it doesn't gate).
+If `enrich()` surfaced a `clarification_question`, the unit's status
+becomes `"awaiting_clarification"` instead of `"ready"` -- **gated**: it
+is durably saved (survives a restart) but invisible to recall until
+answered, because `hybrid_search()` only ever considers
+`status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`)
+appends the verbatim Q&A to `clarifications`, then re-runs the *entire*
+derived stage (enrichment, retrieval_text, searchable_text, embedding)
+with the new clarification as additional context -- this is what makes a
+clarified term's aliases actually searchable afterward, not just present
+in a one-off answer -- and flips status to `"ready"` once no further
+question is open. The user may also explicitly cancel an awaiting unit
+(`POST .../discard`, status becomes `"discarded"`) rather than answer it.
 
 Clarification is bounded to `MAX_CLARIFICATION_ROUNDS = 1` per unit
 (`app/ingestion/pipeline.py`) -- after that, further clarification
-questions the model proposes are discarded rather than surfaced.
+questions the model proposes are discarded rather than surfaced. A
+user-initiated correction (`POST /memory-units/{id}/correct`, spec
+section 30 -- free-text, re-runs the same enrichment mechanism) does
+*not* consume this budget: the bound exists to stop the system from
+interrogating the user, not to limit how often the user can proactively
+fix something.
 
 ## Segmentation
 
@@ -146,13 +154,17 @@ app/retrieval/agent.py: run_agent()  -- bounded deterministic state machine
 (spec section 29; NOT a general tool-calling framework)
 
   for up to MAX_AGENT_ITERATIONS=3 rounds:
-      SEARCH: hybrid_search() for each query in play this round
-        - vector search (pgvector, cosine, HNSW) over each unit's
-          retrieval_text embedding -- catches paraphrase/alias cues
-        - full-text search (GIN) over searchable_text -- catches literal
-          keyword overlap (including literal alias/definition text)
-        - fuse: 0.65*vector + 0.35*fts, keep candidates clearing a basic
-          relevance bar
+      SEARCH: for each query in play this round, BOTH:
+        - hybrid_search() over memory_units (status='ready' only):
+          vector (pgvector, cosine, HNSW) over retrieval_text embeddings
+          -- catches paraphrase/alias cues -- fused with full-text (GIN)
+          over searchable_text -- catches literal keyword overlap
+        - hybrid_search_chunks() over attachment_chunks: same fusion,
+          surfaces a specific excerpt from a large attached document
+          rather than the whole file
+        fuse weights: 0.65*vector + 0.35*fts, keep candidates clearing a
+        basic relevance bar (VECTOR_SIM_THRESHOLD, see docs/DECISIONS.md
+        for the calibration experiment behind the current value)
       (on the last round, skip straight to answering with what's found)
       EVALUATE: ask the LLM {sufficient: bool, reformulated_queries: [..]}
         given the question and best snippets so far -- it may propose up
@@ -161,14 +173,16 @@ app/retrieval/agent.py: run_agent()  -- bounded deterministic state machine
         never as answer content (spec section 17)
       if sufficient or no new queries proposed: stop
 
-  if nothing found at all: ABSTAIN immediately, no LLM call needed
+  if nothing found at all (neither units nor chunks): ABSTAIN immediately,
+  no LLM call needed
   else:
       expand with sibling_context(): up to 2 extra units per primary hit
       from the same capture_id, bounded to 6 total -- context to help
       interpret a primary hit (e.g. resolve a pronoun), never a
       substitute for it, never merged into one giant blob (spec section 20)
-      ANSWER: generate_answer() -- LLM answers using primary + context
-      evidence, must mark grounded=true/false
+      ANSWER: generate_answer() -- LLM answers using primary units +
+      sibling context + attachment-chunk evidence, must mark
+      grounded=true/false
       if not grounded: ABSTAIN (fixed message, empty sources) -- this
       override lives in exactly one place, run_agent(), regardless of
       what text the model wrote
@@ -176,7 +190,7 @@ app/retrieval/agent.py: run_agent()  -- bounded deterministic state machine
 
 ## Failure model
 
-Three independent layers of tolerance, from most to least routine:
+Four independent layers of tolerance, from most to least routine:
 
 1. **LLM down/timeout/malformed output** during enrichment, embedding, or
    answer generation: caught by `LLMError` handling at the point of the
@@ -188,14 +202,17 @@ Three independent layers of tolerance, from most to least routine:
    `authoritative_content` (committed in an earlier, separate
    transaction) is untouched. `POST /memory-units/{id}/retry` re-runs
    just the derived stage.
-3. **Invalid input** (empty text, unsupported file type): raised as
+3. **An open clarification question**: `status="awaiting_clarification"`
+   -- not a failure at all, but deliberately excluded from recall until
+   resolved (see "clarification" above).
+4. **Invalid input** (empty text, unsupported file type): raised as
    `IngestionError` before anything is persisted, mapped to HTTP 400.
 
 A unit is only ever searchable (`status="ready"`) after its derived
-stage actually ran to completion -- a unit stuck in `"draft"` (crash
-before phase 1 commit's units finished enriching) or `"failed"` never
-appears in `hybrid_search()` results (both are filtered out by the
-`status = 'ready'` clause in the SQL).
+stage ran to completion with no open question -- `"draft"` (crash before
+phase 1 finished), `"awaiting_clarification"`, `"failed"`, and
+`"discarded"` (user-cancelled) all never appear in `hybrid_search()`
+results, filtered out by its `status = 'ready'` SQL clause.
 
 ## Memory unit schema
 
@@ -206,8 +223,12 @@ captures
 memory_units
   id, capture_id (fk, cascade delete)
   authoritative_content          text        -- user-originated
-  clarifications                 jsonb       -- [{question, answer, round, created_at}]
-  status                         text        -- draft | ready | failed
+  clarifications                 jsonb       -- [{question, answer, round,
+                                                 created_at, source?}];
+                                                 source="user_correction"
+                                                 for a correct_unit() entry
+  status                         text        -- draft | awaiting_clarification
+                                                 | ready | failed | discarded
   pending_clarification          jsonb null  -- {question, field, round}
   clarification_round            int
   semantic                       jsonb       -- meaning, aliases, people,
@@ -227,7 +248,26 @@ attachments
   id, capture_id (fk, cascade delete)
   original_filename, stored_path, content_type, size_bytes
   extracted_text null, extraction_status, created_at
+
+attachment_chunks
+  id, attachment_id (fk, cascade delete), capture_id (fk, denormalized)
+  chunk_index, page_number null              -- real page for PDFs, else null
+  text                            text        -- one deterministic chunk
+                                                 (app/ingestion/chunking.py:
+                                                 per-page for PDFs, fixed
+                                                 character window + overlap
+                                                 otherwise)
+  fts                              tsvector    -- GENERATED, GIN index
+  embedding                        vector(768) null, HNSW/cosine index
+  embedding_model, embedding_dim   text, int null
+  created_at
 ```
+
+Deleting a capture (`DELETE /api/captures/{id}`) cascades through
+`memory_units`, `attachments`, and `attachment_chunks` at the DB level,
+and also removes the capture's upload directory from disk -- the only
+way a memory ever goes away; there is no automatic/relevance-based
+deletion anywhere in this codebase.
 
 ## LLM integration
 

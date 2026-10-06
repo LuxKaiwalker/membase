@@ -63,23 +63,87 @@ clarified concept, since the embedding never changes to reflect it.
 
 ---
 
-**Decision:** Clarification enriches a unit but does not gate its
-availability for recall -- a unit is `status="ready"` (searchable)
-immediately after its first enrichment pass, whether or not a
-`pending_clarification` is still open.
+**Decision (superseded, see below):** An earlier iteration of this
+project let a unit become searchable immediately after its first
+enrichment pass regardless of any open clarification question, reasoning
+that gating would require a staging state machine and durability was the
+higher priority. **This was reversed**: a unit with a genuinely open
+question is now `status="awaiting_clarification"` and is excluded from
+`hybrid_search()` until answered or explicitly discarded -- durably
+saved the whole time (a crash or restart never loses it), just not
+recall-visible. Kept here rather than deleted because the reasoning for
+*why* gating matters is worth keeping: a memory whose interpretation is
+still genuinely unresolved (what does this term/identifier mean?) risks
+answering confidently from an incomplete understanding if it's
+searchable before that's settled -- durability and searchability turned
+out to be separable goals, not a package deal. Discarding an awaiting
+unit (`POST /memory-units/{id}/discard`) is a status flip, not a hard
+delete, since the user might reconsider; actual deletion
+(`DELETE /api/captures/{id}`) is a separate, explicit action.
 
-**Reason:** Durability and simplicity: gating would require a staging
-state machine (draft -> awaiting_clarification -> ready) and a decision
-about what happens if the user never answers. Immediate availability
-means the authoritative content is never at risk of being "stuck"
-unsearchable, and most memories need no clarification at all (by design
--- see the enrichment prompt's bias toward not asking).
+---
 
-**Alternatives considered:** Gating recall on clarification completion.
-This is a legitimate, debatable product decision rather than a purely
-technical one -- flagged explicitly in docs/TODO.md as something to
-revisit with real usage feedback, since the spec's own ingestion diagram
-suggests gating was the intended default.
+**Decision:** A user-initiated correction (`POST
+/memory-units/{id}/correct`, free-text) reuses the exact same
+"append to `clarifications`, re-run enrichment" mechanism as answering a
+system-asked clarification question, but does not consume
+`clarification_round`.
+
+**Reason:** No reason to build a second enrichment-update code path when
+the only real difference is *who* initiated it. Not counting it against
+the round budget matters because that budget exists specifically to stop
+the *system* from pestering the user with questions -- it has nothing to
+do with how often a user chooses to fix something themselves.
+
+---
+
+**Decision:** Attachments are chunked (page-based for PDFs, fixed
+character window + overlap otherwise) with each chunk independently
+full-text and vector indexed, rather than only ever contributing a single
+blind excerpt to a parent unit's evidence.
+
+**Reason:** A fact buried on page 40 of an attached PDF was previously
+only reachable if it happened to fall within the first ~500 characters
+blindly copied into evidence. Chunking + independent indexing means the
+*relevant* chunk gets found by the same hybrid search as everything else,
+and provenance can point at a specific attachment + page rather than
+"somewhere in this file."
+
+**Alternatives considered:** A full document-processing pipeline
+(semantic chunking, overlap tuning per content type, re-ranking chunks
+against the parent memory) -- explicitly out of scope per spec section
+27 ("do not build a sophisticated document-processing pipeline"); fixed-
+size chunking is the simplest thing that makes large-document content
+findable at all.
+
+---
+
+**Decision:** `VECTOR_SIM_THRESHOLD = 0.55`, kept at its prior
+hand-picked value, but now backed by `scripts/sweep-threshold.sh` run
+against the 30-case eval set rather than a handful of manual trials.
+
+**Reason:** The sweep (0.35 through 0.70 in steps of 0.05) showed
+recall@10 flat at 100% from 0.35 up through 0.55, then dropping (96% at
+0.60, 89% at 0.65, 78% at 0.70) as real matches stopped clearing the bar.
+0.55 is the highest threshold in the flat-100%-recall region, which this
+project's grounding philosophy (prefer abstention over a wrong answer,
+but *also* prefer not drowning the LLM's evidence block in irrelevant
+noise) treats as the right side to err on. Precision (own-case hits /
+total hits returned) rose monotonically with threshold across the whole
+sweep (13% at 0.35 up to 34% at 0.70), so there's a real recall/precision
+trade available above 0.55 -- 0.55 is specifically the point that doesn't
+give up any measured recall to get it.
+
+**Caveats:** 30 cases is enough to catch a threshold that's clearly too
+loose or too tight, not enough to distinguish 0.50 from 0.55 with
+confidence. The precision metric specifically undercounts: all 30 cases'
+data shares one database for the sweep (to avoid re-ingesting per
+threshold), so a query belonging to one case can match another case's
+*own* units (e.g. several cases mention "Anna") without being flagged as
+either a hit or a miss for either case, pulling precision down for
+reasons unrelated to the threshold itself. Recall is unaffected by this
+(it only checks whether a case's own units were found), which is why
+recall, not precision, drove the final choice.
 
 ---
 

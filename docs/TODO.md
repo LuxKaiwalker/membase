@@ -1,40 +1,43 @@
 # TODO / open questions
 
+## Resolved this phase (spec section 44 decisions)
+
+- **Clarification gates recall availability.** `status="awaiting_clarification"`
+  is excluded from search until answered or discarded. See docs/DECISIONS.md.
+- **Derived metadata is not directly editable**; corrections go through
+  `POST /memory-units/{id}/correct` (natural-language, re-runs enrichment),
+  not a metadata editor.
+- **Attachments are semantically searchable through derived chunks**
+  (`attachment_chunks`) linked to the parent capture; chunks are not
+  independent top-level memories.
+- **No automatic deletion/expiry.** Explicit user deletion
+  (`DELETE /api/captures/{id}`) is supported and removes files too.
+- **Image understanding: deferred** (unchanged from the previous phase).
+- **Knowledge graph: deferred** -- `semantic.relations` stays a flat list
+  of subject/predicate/object triples, not a queryable graph.
+- **Multi-agent architecture: deferred** -- one bounded retrieval agent.
+
 ## Open product questions
 
-- **Should clarification gate recall availability, not just enrich
-  after the fact (current)?** See docs/DECISIONS.md. The spec's own
-  ingestion diagram suggests gating was the intended default; current
-  behavior prioritizes durability/simplicity instead. Revisit with real
-  usage feedback -- does a user expect a memory to be "incomplete" until
-  clarified, or is immediate availability the right default?
-- **Should memory semantic representation (`semantic` jsonb) be
-  user-editable?** Currently read-only/machine-generated. No UI/API for
-  correcting a wrong extracted alias/relation other than re-triggering
-  enrichment via a new clarification round (bounded to 1).
-- **Should attachments be independently searchable from their parent
-  capture's units?** Currently an attachment's extracted text only ever
-  surfaces as part of every sibling unit's full-text index.
-- **Should memories ever be automatically deleted/archived?** No
-  forgetting/expiry logic exists.
-- **Should there be a UI affordance for inspecting/deleting individual
-  memory units or whole captures?** Not built; only create+recall flows
-  exist in the web UI (API supports GET by id, nothing for delete).
+- **Should the retrieval threshold be relative/adaptive rather than a
+  fixed scalar?** The sweep in docs/DECISIONS.md picked 0.55 as the
+  highest value with 100% recall@10 on 30 cases, but a margin-below-top-
+  score rule might generalize better as the corpus grows. Needs a larger
+  eval set to tell the two apart.
+- **Should there be a UI affordance for browsing/deleting individual
+  captures**, not just creating and recalling? The API supports it
+  (`GET`/`DELETE /api/captures/{id}`); the web UI doesn't expose it yet.
+- **Should `MAX_CLARIFICATION_ROUNDS` ever be >1?** Bounded to 1
+  deliberately (spec: avoid interrogation); unclear if real usage ever
+  needs a second round, or whether `correct_unit()` (unbounded,
+  user-initiated) already covers that need well enough.
 
 ## Known technical gaps
 
-- **No backfill/reindex tool.** If `MEMBASE_EMBED_MODEL` changes, or a
-  unit's embedding failed at creation time, nothing automatically
-  re-embeds existing rows. `embedding_model`/`embedding_dim` are stored
-  per-row specifically so this is at least *detectable*.
-  `scripts/model-doctor.sh` checks the *configured* model's dimension
-  matches the schema, but doesn't touch existing data.
-- **Retrieval threshold (`VECTOR_SIM_THRESHOLD = 0.55` in
-  `app/retrieval/pipeline.py`) is a hand-picked value from a handful of
-  manual trials**, not a tuned one against a real eval set. The eval set
-  in `eval/cases.yaml` (12 cases) is large enough to catch gross
-  regressions, not to calibrate a numeric threshold responsibly -- that
-  would need ~30-50 cases and a deliberate sweep.
+- **Re-embedding is whole-row, not incremental.** `scripts/reembed.py`
+  re-embeds a unit/chunk entirely if its embedding is missing or
+  stale-model; it has no concept of "only the aliases changed, reuse the
+  rest," which is fine at this scale but wouldn't be at a much larger one.
 - **Segmentation's verbatim-fallback is a blunt instrument.** It protects
   against promoting paraphrased content to authoritative status, but a
   model that produces clean, correctly-punctuated verbatim sub-sentences
@@ -42,29 +45,26 @@
   "I met Anna... and she recommended a paper" split into two
   grammatically-clean verbatim halves) will pass the check and still
   lose the antecedent in the *primary* evidence block. Mitigated at the
-  answer-generation layer (the prompt now explicitly directs resolving
+  answer-generation layer (the prompt explicitly directs resolving
   pronouns using sibling "related context" evidence, confirmed fixing
   the one eval failure this caused), but segmentation itself has no
   linguistic awareness of reference chains.
 - **Clarification question targeting/triggering is inconsistent** across
-  model calls for borderline cases (sometimes asks about an
-  already-resolved detail, sometimes doesn't ask about a genuinely
-  invented term depending on exact phrasing). Bounded to 1 round per
-  unit, so the blast radius of a bad question is small, but it's not
-  fully reliable.
+  model calls for borderline cases. Bounded to 1 round per unit, so the
+  blast radius is small, but not fully reliable -- and now that it
+  gates recall, an unnecessary question has a bigger UX cost than before
+  (the memory is invisible to recall until answered or discarded).
 - **No image understanding.** Images are validated and stored but never
   captioned/OCR'd.
-- **No chunking for large attachments.** A long PDF is fully indexed for
-  full-text search but only a 2000-character excerpt feeds the
-  enrichment prompt and the answer-generation evidence block.
-- **Post-hoc attachments don't re-embed or re-run enrichment** for
-  sibling units -- only the full-text index is extended.
-- **Agent latency is unbounded-ish in the worst case.** 3 rounds × up to
-  2 reformulated queries each means up to ~7 search calls plus up to 3
-  evaluate calls plus 1 answer call per recall request in the worst
-  case. Observed in practice to resolve in 1 round for most queries
-  (see docs/REPORT.md eval results), but a pathological query could take
-  tens of seconds.
+- **Chunk size (1200 chars, 150 overlap) is a fixed, untuned default.**
+  Works for the eval set's short attached notes; untested against a
+  genuinely large (50+ page) PDF.
+- **Agent latency is unbounded-ish in the worst case.** 3 rounds, each
+  now searching both units and chunks for every query in play, means up
+  to ~14 search calls plus up to 3 evaluate calls plus 1 answer call per
+  recall request in the worst case. Observed in practice to resolve in
+  1 round for most queries (30/30 eval cases), but a pathological query
+  could take tens of seconds.
 - **No rate limiting / request size limits** beyond the per-file size
   cap. Not a concern for a single-user localhost MVP.
 - **UI was validated via rendered-HTML inspection and direct API calls,
