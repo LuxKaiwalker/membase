@@ -41,6 +41,10 @@ class ClarifyRequest(BaseModel):
     answer: str
 
 
+class CorrectRequest(BaseModel):
+    correction: str
+
+
 class RecallRequest(BaseModel):
     query: str
 
@@ -56,10 +60,22 @@ class SourceOut(BaseModel):
     fused_score: float
 
 
+class ChunkSourceOut(BaseModel):
+    id: uuid.UUID
+    capture_id: uuid.UUID
+    attachment_filename: str
+    page_number: int | None
+    excerpt: str
+    vector_score: float | None
+    fts_score: float | None
+    fused_score: float
+
+
 class RecallResponse(BaseModel):
     answer: str
     abstained: bool
     sources: list[SourceOut]
+    chunk_sources: list[ChunkSourceOut] = []
 
 
 class ErrorResponse(BaseModel):

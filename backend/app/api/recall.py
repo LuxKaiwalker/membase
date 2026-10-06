@@ -5,7 +5,7 @@ from app.db import get_db
 from app.llm import get_llm_provider
 from app.llm.base import LLMProvider
 from app.retrieval.agent import run_agent
-from app.schemas import RecallRequest, RecallResponse, SourceOut
+from app.schemas import ChunkSourceOut, RecallRequest, RecallResponse, SourceOut
 
 router = APIRouter(prefix="/api", tags=["recall"])
 
@@ -30,4 +30,19 @@ async def recall(
         )
         for s in result.sources
     ]
-    return RecallResponse(answer=result.answer, abstained=result.abstained, sources=sources)
+    chunk_sources = [
+        ChunkSourceOut(
+            id=c.chunk.id,
+            capture_id=c.chunk.capture_id,
+            attachment_filename=c.chunk.attachment.original_filename,
+            page_number=c.chunk.page_number,
+            excerpt=c.chunk.text[:500],
+            vector_score=c.vector_score,
+            fts_score=c.fts_score,
+            fused_score=c.fused_score,
+        )
+        for c in result.chunk_sources
+    ]
+    return RecallResponse(
+        answer=result.answer, abstained=result.abstained, sources=sources, chunk_sources=chunk_sources
+    )

@@ -1,6 +1,6 @@
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
@@ -8,9 +8,11 @@ from app.llm.base import LLMError, LLMProvider
 from app.retrieval.pipeline import (
     ABSTENTION_MESSAGE,
     TOP_K_FOR_ANSWER,
+    ScoredChunk,
     ScoredUnit,
     generate_answer,
     hybrid_search,
+    hybrid_search_chunks,
     sibling_context,
 )
 
@@ -54,6 +56,7 @@ class RecallResult:
     answer: str
     abstained: bool
     sources: list[ScoredUnit]
+    chunk_sources: list[ScoredChunk] = field(default_factory=list)
 
 
 async def _evaluate(llm: LLMProvider, query: str, ranked: list[ScoredUnit], tried: set[str]) -> dict:
@@ -90,8 +93,10 @@ async def run_agent(db: Session, llm: LLMProvider, query: str) -> RecallResult:
 
     tried: set[str] = set()
     best: dict[uuid.UUID, ScoredUnit] = {}
+    best_chunks: dict[uuid.UUID, ScoredChunk] = {}
     current_queries = [query]
     ranked: list[ScoredUnit] = []
+    ranked_chunks: list[ScoredChunk] = []
 
     for iteration in range(MAX_AGENT_ITERATIONS):
         for q in current_queries:
@@ -102,8 +107,13 @@ async def run_agent(db: Session, llm: LLMProvider, query: str) -> RecallResult:
                 existing = best.get(scored.unit.id)
                 if existing is None or scored.fused_score > existing.fused_score:
                     best[scored.unit.id] = scored
+            for scored_chunk in await hybrid_search_chunks(db, llm, q, limit=TOP_K_FOR_ANSWER):
+                existing_chunk = best_chunks.get(scored_chunk.chunk.id)
+                if existing_chunk is None or scored_chunk.fused_score > existing_chunk.fused_score:
+                    best_chunks[scored_chunk.chunk.id] = scored_chunk
 
         ranked = sorted(best.values(), key=lambda s: s.fused_score, reverse=True)[:TOP_K_FOR_ANSWER]
+        ranked_chunks = sorted(best_chunks.values(), key=lambda s: s.fused_score, reverse=True)[:TOP_K_FOR_ANSWER]
 
         if iteration == MAX_AGENT_ITERATIONS - 1:
             break
@@ -115,11 +125,11 @@ async def run_agent(db: Session, llm: LLMProvider, query: str) -> RecallResult:
             break
         current_queries = next_queries
 
-    if not ranked:
+    if not ranked and not ranked_chunks:
         return RecallResult(answer=ABSTENTION_MESSAGE, abstained=True, sources=[])
 
     context = sibling_context(db, ranked)
-    answer_text, grounded = await generate_answer(llm, query, ranked, context)
+    answer_text, grounded = await generate_answer(llm, query, ranked, context, ranked_chunks)
     if not grounded:
         return RecallResult(answer=ABSTENTION_MESSAGE, abstained=True, sources=[])
-    return RecallResult(answer=answer_text, abstained=False, sources=ranked)
+    return RecallResult(answer=answer_text, abstained=False, sources=ranked, chunk_sources=ranked_chunks)

@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.llm.base import LLMError, LLMProvider
-from app.models import MemoryUnit
+from app.models import AttachmentChunk, MemoryUnit
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +16,13 @@ MAX_CONTEXT_PER_PRIMARY = 2
 MAX_CONTEXT_TOTAL = 6
 
 # Minimum vector cosine similarity to consider a unit relevant at all.
-# Empirically, nomic-embed-text puts *unrelated* short English sentences
-# around 0.4-0.65 cosine similarity -- there is no principled zero point,
-# so this is a hand-picked value from manual trials, not a tuned
-# threshold. See docs/TODO.md: retrieval threshold calibration.
+# Calibrated via scripts/sweep-threshold.sh against the 30-case eval set:
+# recall@10 is 100% from 0.35 up through 0.55, then drops (96%@0.60,
+# 89%@0.65, 78%@0.70) as real matches start failing to clear the bar.
+# 0.55 is the highest threshold that still gets full recall, which also
+# has the best precision among those -- see docs/DECISIONS.md for the
+# full numbers and the eval set's caveats (30 cases, shared-corpus
+# cross-contamination in the precision metric specifically).
 VECTOR_SIM_THRESHOLD = 0.55
 
 ABSTENTION_MESSAGE = "I don't have a stored memory about this."
@@ -156,6 +159,84 @@ async def hybrid_search(
     ]
 
 
+def _chunk_vector_candidates(db: Session, query_vector: list[float], limit: int) -> dict[uuid.UUID, float]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, 1 - (embedding <=> (:qv)::vector) AS score
+            FROM attachment_chunks
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> (:qv)::vector
+            LIMIT :limit
+            """
+        ),
+        {"qv": _vector_literal(query_vector), "limit": limit},
+    ).all()
+    return {row.id: float(row.score) for row in rows}
+
+
+def _chunk_fts_candidates(db: Session, query: str, limit: int) -> dict[uuid.UUID, float]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, ts_rank(fts, websearch_to_tsquery('english', :q)) AS score
+            FROM attachment_chunks
+            WHERE fts @@ websearch_to_tsquery('english', :q)
+            ORDER BY score DESC
+            LIMIT :limit
+            """
+        ),
+        {"q": query, "limit": limit},
+    ).all()
+    return {row.id: float(row.score) for row in rows}
+
+
+@dataclass
+class ScoredChunk:
+    chunk: AttachmentChunk
+    vector_score: float | None
+    fts_score: float | None
+    fused_score: float
+
+
+async def hybrid_search_chunks(
+    db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER
+) -> list[ScoredChunk]:
+    """Same hybrid vector+fts fusion as hybrid_search(), over attachment
+    chunks instead of memory units (spec section 27: large-document
+    content should contribute more than one short blind excerpt).
+    """
+    query = query.strip()
+    if not query:
+        return []
+
+    vector_scores: dict[uuid.UUID, float] = {}
+    try:
+        [query_vector] = await llm.embed([query])
+        vector_scores = _chunk_vector_candidates(db, query_vector, CANDIDATE_LIMIT)
+    except LLMError:
+        logger.warning("Query embedding failed; chunk search falling back to full-text-only")
+
+    fts_scores = _chunk_fts_candidates(db, query, CANDIDATE_LIMIT)
+
+    fused = _fuse(vector_scores, fts_scores)
+    relevant_ids = [
+        cid
+        for cid, (v, f, _score) in fused.items()
+        if (v is not None and v >= VECTOR_SIM_THRESHOLD) or f is not None
+    ]
+    if not relevant_ids:
+        return []
+
+    ranked_ids = sorted(relevant_ids, key=lambda cid: fused[cid][2], reverse=True)[:limit]
+    chunks = {c.id: c for c in db.query(AttachmentChunk).filter(AttachmentChunk.id.in_(ranked_ids)).all()}
+    return [
+        ScoredChunk(chunk=chunks[cid], vector_score=fused[cid][0], fts_score=fused[cid][1], fused_score=fused[cid][2])
+        for cid in ranked_ids
+        if cid in chunks
+    ]
+
+
 def sibling_context(db: Session, primary: list[ScoredUnit]) -> list[MemoryUnit]:
     """Bounded expansion to sibling units from the same capture (spec
     section 20): extra context for interpreting a primary result, never a
@@ -193,26 +274,45 @@ def _format_unit(unit: MemoryUnit, label: str) -> str:
         lines.append(f"Also known as: {', '.join(semantic['aliases'])}")
     if semantic.get("definitions"):
         lines.append("Definitions: " + "; ".join(f"{d['term']} = {d['definition']}" for d in semantic["definitions"]))
-    for a in unit.capture.attachments:
-        if a.extracted_text:
-            lines.append(f"Attachment '{a.original_filename}' excerpt: {a.extracted_text[:500]}")
+    # Attachment content is surfaced via ranked [Attachment evidence]
+    # chunk blocks (see _format_chunk) rather than a blind excerpt here --
+    # chunking means the relevant part of a large document is actually
+    # findable instead of just whatever happens to be first.
     return "\n".join(lines)
 
 
-def format_evidence(primary: list[ScoredUnit], context: list[MemoryUnit]) -> str:
+def _format_chunk(scored: ScoredChunk) -> str:
+    chunk = scored.chunk
+    page = f", page {chunk.page_number}" if chunk.page_number else ""
+    lines = [f"[Attachment evidence] (file '{chunk.attachment.original_filename}'{page})", chunk.text[:800]]
+    sibling_units = [u for u in chunk.attachment.capture.units if u.status == "ready"]
+    if sibling_units:
+        names = "; ".join(u.authoritative_content for u in sibling_units[:2])
+        lines.append(f"From the same note as: {names}")
+    return "\n".join(lines)
+
+
+def format_evidence(
+    primary: list[ScoredUnit], context: list[MemoryUnit], chunks: list[ScoredChunk] | None = None
+) -> str:
     blocks = [_format_unit(s.unit, f"Primary evidence {i}") for i, s in enumerate(primary, start=1)]
     blocks += [_format_unit(u, "Related context (same note)") for u in context]
+    blocks += [_format_chunk(c) for c in (chunks or [])]
     return "\n\n".join(blocks)
 
 
 async def generate_answer(
-    llm: LLMProvider, query: str, primary: list[ScoredUnit], context: list[MemoryUnit]
+    llm: LLMProvider,
+    query: str,
+    primary: list[ScoredUnit],
+    context: list[MemoryUnit],
+    chunks: list[ScoredChunk] | None = None,
 ) -> tuple[str, bool]:
     """Returns (answer_text, grounded). Caller is responsible for
     substituting the fixed abstention message when grounded is False --
     this function never does that itself, so the hard override lives in
     exactly one place (app/retrieval/agent.py)."""
-    evidence = format_evidence(primary, context)
+    evidence = format_evidence(primary, context, chunks)
     prompt = f"Question: {query}\n\nEvidence from stored memories:\n{evidence}"
     try:
         result = await llm.generate_structured(prompt, schema=_ANSWER_SCHEMA, system=_ANSWER_SYSTEM)
