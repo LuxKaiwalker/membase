@@ -1,128 +1,103 @@
+import datetime as dt
 import logging
 
 from sqlalchemy.orm import Session
 
+from app.ingestion.enrichment import build_retrieval_text, enrich
 from app.ingestion.files import UnsupportedFileError, process_upload
-from app.ingestion.metadata import extract_metadata
+from app.ingestion.segmentation import segment_capture
 from app.llm.base import LLMError, LLMProvider
-from app.models import Attachment, Memory
+from app.models import Attachment, Capture, MemoryUnit
 
 logger = logging.getLogger(__name__)
+
+# 0 or 1 clarification question per unit. See docs/DECISIONS.md: bounded
+# deliberately low so the system never turns into an interrogation.
+MAX_CLARIFICATION_ROUNDS = 1
 
 
 class IngestionError(ValueError):
     """Input-validation failure -- caller should turn this into a 4xx."""
 
 
-def _embedding_input(caption: str, summary: str, topics: list[str]) -> str:
-    # Deliberately caption + derived summary/topics only, *not* raw
-    # attachment text: keeps embedding input short and semantically dense.
-    # Full attachment text still contributes to full-text search via
-    # searchable_text. See docs/DECISIONS.md.
-    parts = [caption]
-    if summary:
-        parts.append(summary)
-    if topics:
-        parts.append("Topics: " + ", ".join(topics))
-    return "\n".join(parts)
-
-
-def _derived_text(derived: dict) -> str:
-    # Folds extracted metadata into the full-text index too, so an indirect
-    # cue ("that person from ETH") matches even if "ETH" never appears
-    # verbatim in the caption -- it only needs to appear in extracted
-    # location/people/topics/summary.
-    bits = []
-    for key in ("people", "topics"):
-        values = derived.get(key)
-        if values:
-            bits.append(", ".join(values))
-    for key in ("location", "summary"):
-        value = derived.get(key)
-        if value:
-            bits.append(value)
-    return " / ".join(bits)
-
-
-def _build_searchable_text(
-    caption: str, attachment_text: str, clarification_text: str, derived: dict | None = None
-) -> str:
-    parts = [caption]
+def _build_searchable_text(authoritative_content: str, attachment_text: str, retrieval_text: str) -> str:
+    parts = [authoritative_content]
     if attachment_text:
         parts.append(attachment_text)
-    if clarification_text:
-        parts.append(clarification_text)
-    if derived:
-        derived_text = _derived_text(derived)
-        if derived_text:
-            parts.append(derived_text)
+    if retrieval_text:
+        parts.append(retrieval_text)
     return "\n\n".join(parts)
 
 
-async def _enrich(llm: LLMProvider, memory: Memory, attachment_text: str) -> None:
-    """Best-effort metadata + embedding enrichment. Never raises: a memory
-    must persist with just its authoritative caption even if the local LLM
-    is down (spec section 22, "LLM failure" requirements)."""
-    metadata = await extract_metadata(llm, memory.caption, attachment_text)
+def _attachment_text_for(capture: Capture) -> str:
+    return "\n\n".join(a.extracted_text for a in capture.attachments if a.extracted_text)
 
-    if metadata is None:
-        memory.derived = {"enrichment_status": "unavailable"}
-        summary, topics = "", []
-    else:
-        derived = {
-            "people": metadata["people"],
-            "location": metadata["location"],
-            "topics": metadata["topics"],
-            "event_date": metadata["event_date"],
-            "summary": metadata["summary"],
-            "enrichment_status": "ok",
-        }
-        memory.derived = derived
-        summary, topics = metadata["summary"], metadata["topics"]
-        if metadata["clarification_question"]:
-            memory.pending_clarification = {
-                "question": metadata["clarification_question"],
-                "field": metadata["clarification_field"] or "clarification",
-            }
 
-    memory.searchable_text = _build_searchable_text(
-        memory.caption, attachment_text, "", memory.derived
-    )
+async def _enrich_and_index(db: Session, llm: LLMProvider, unit: MemoryUnit, attachment_text: str) -> None:
+    """Run semantic enrichment, build retrieval_text/searchable_text, embed,
+    and set unit.status -- the "derived processing" half of the two-phase
+    commit described in app/ingestion/pipeline.py:create_capture.
 
+    Never raises outward: an *unexpected* exception here is caught and
+    recorded as status="failed" (retryable via retry_enrichment), rather
+    than propagating and losing the authoritative_content that was already
+    committed before this ran. LLM-specific failures (down/timeout/
+    malformed) are handled one level down in enrich()/embed() and don't
+    even reach this except clause -- they degrade status to "ready" with
+    reduced enrichment instead, same tolerance as before.
+    """
     try:
-        embedding = await llm.embed([_embedding_input(memory.caption, summary, topics)])
-        memory.embedding = embedding[0]
-        memory.embedding_model = llm.embedding_model_name
-        memory.embedding_dim = llm.embedding_dim
-    except LLMError:
-        logger.warning("Embedding failed during ingestion; memory kept, vector search unavailable for it")
+        allow_clarification = unit.clarification_round < MAX_CLARIFICATION_ROUNDS
+        semantic = await enrich(
+            llm, unit.authoritative_content, unit.clarifications, allow_clarification=allow_clarification
+        )
+        unit.semantic = semantic
+
+        if semantic.get("clarification_question") and allow_clarification:
+            unit.pending_clarification = {
+                "question": semantic["clarification_question"],
+                "field": semantic.get("clarification_field") or "clarification",
+                "round": unit.clarification_round,
+            }
+        else:
+            unit.pending_clarification = None
+
+        unit.retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
+        unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
+
+        try:
+            embedding = await llm.embed([unit.retrieval_text])
+            unit.embedding = embedding[0]
+            unit.embedding_model = llm.embedding_model_name
+            unit.embedding_dim = llm.embedding_dim
+        except LLMError:
+            logger.warning("Embedding failed for unit %s; leaving unindexed for vector search", unit.id)
+
+        unit.status = "ready"
+    except Exception:
+        logger.exception("Unexpected failure enriching unit %s", unit.id)
+        unit.status = "failed"
+    db.commit()
 
 
-async def create_memory(
-    db: Session,
-    llm: LLMProvider,
-    *,
-    caption: str,
-    uploads: list[tuple[str, bytes]],
-) -> Memory:
-    caption = caption.strip()
-    if not caption:
-        raise IngestionError("caption must not be empty")
+async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: list[tuple[str, bytes]]) -> Capture:
+    text = text.strip()
+    if not text:
+        raise IngestionError("text must not be empty")
 
-    memory = Memory(caption=caption, derived={}, searchable_text=caption)
-    db.add(memory)
-    db.flush()  # assigns memory.id without committing, so attachment FKs/paths are valid
+    capture = Capture(raw_text=text)
+    db.add(capture)
+    db.flush()
 
-    attachment_texts: list[str] = []
     for filename, data in uploads:
         try:
-            processed = process_upload(filename, data, memory.id)
+            processed = process_upload(filename, data, capture.id)
         except UnsupportedFileError as exc:
             db.rollback()
             raise IngestionError(str(exc)) from exc
         db.add(
             Attachment(
-                memory_id=memory.id,
+                capture_id=capture.id,
                 original_filename=filename,
                 stored_path=processed.stored_path,
                 content_type=processed.content_type,
@@ -131,78 +106,73 @@ async def create_memory(
                 extraction_status=processed.extraction_status,
             )
         )
-        if processed.extracted_text:
-            attachment_texts.append(processed.extracted_text)
+    db.commit()  # Phase 0: capture + attachments durably saved, no LLM call yet
 
-    await _enrich(llm, memory, "\n\n".join(attachment_texts))
+    proposed_units = await segment_capture(llm, text)
+    units = [
+        MemoryUnit(capture_id=capture.id, authoritative_content=u.content, status="draft")
+        for u in proposed_units
+    ]
+    db.add_all(units)
+    db.commit()  # Phase 1: every unit's authoritative_content durably saved
 
-    db.commit()
-    db.refresh(memory)
-    return memory
+    attachment_text = _attachment_text_for(capture)
+    for unit in units:
+        await _enrich_and_index(db, llm, unit, attachment_text)
+
+    db.refresh(capture)
+    return capture
 
 
-async def resolve_clarification(
-    db: Session, llm: LLMProvider, memory: Memory, answer: str
-) -> Memory:
+async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit, answer: str) -> MemoryUnit:
     answer = answer.strip()
     if not answer:
         raise IngestionError("clarification answer must not be empty")
+    if unit.pending_clarification is None:
+        raise IngestionError("unit has no pending clarification")
 
-    pending = memory.pending_clarification or {}
-    field = pending.get("field") or "clarification"
+    pending = unit.pending_clarification
+    clarifications = [*unit.clarifications, {
+        "question": pending["question"],
+        "answer": answer,
+        "round": unit.clarification_round,
+        "created_at": dt.datetime.now(dt.UTC).isoformat(),
+    }]
+    unit.clarifications = clarifications
+    unit.clarification_round += 1
+    unit.pending_clarification = None
 
-    derived = dict(memory.derived or {})
-    clarifications = dict(derived.get("clarification_answers") or {})
-    clarifications[field] = answer
-    derived["clarification_answers"] = clarifications
-    # A date clarification is common enough to special-case into event_date
-    # directly, so it's usable as a structured filter rather than only free text.
-    if "date" in field.lower():
-        derived["event_date"] = answer
-    memory.derived = derived
-    memory.pending_clarification = None
-
-    attachment_text = "\n\n".join(
-        a.extracted_text for a in memory.attachments if a.extracted_text
-    )
-    clarification_text = f"{pending.get('question', '')} {answer}".strip()
-    memory.searchable_text = _build_searchable_text(
-        memory.caption, attachment_text, clarification_text, derived
-    )
-
-    try:
-        embedding = await llm.embed(
-            [_embedding_input(memory.caption, derived.get("summary", ""), derived.get("topics", []))]
-        )
-        memory.embedding = embedding[0]
-        memory.embedding_model = llm.embedding_model_name
-        memory.embedding_dim = llm.embedding_dim
-    except LLMError:
-        logger.warning("Re-embedding after clarification failed; previous embedding left in place")
-
-    db.commit()
-    db.refresh(memory)
-    return memory
+    await _enrich_and_index(db, llm, unit, _attachment_text_for(unit.capture))
+    db.refresh(unit)
+    return unit
 
 
-async def add_attachment(db: Session, memory: Memory, filename: str, data: bytes) -> Memory:
-    """Attach a file to an already-persisted memory.
+async def retry_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit) -> MemoryUnit:
+    """Retry derived processing for a unit stuck in draft/failed (e.g. the
+    LLM was down during ingestion). authoritative_content/clarifications
+    are untouched; only the derived half re-runs."""
+    await _enrich_and_index(db, llm, unit, _attachment_text_for(unit.capture))
+    db.refresh(unit)
+    return unit
 
-    Scope decision (see docs/TODO.md): this only extends the full-text
-    index with the new attachment's extracted text. It does not re-run LLM
-    metadata extraction or re-embed -- doing so for every post-hoc
-    attachment add would mean an unbounded number of LLM calls over a
-    memory's lifetime for an MVP feature that's secondary to the core
-    create -> retrieve -> answer loop.
+
+async def add_attachment(db: Session, capture: Capture, filename: str, data: bytes) -> Capture:
+    """Attach a file to an already-persisted capture.
+
+    Scope decision (docs/TODO.md): extends every sibling unit's full-text
+    index with the new attachment's text, but does not re-run semantic
+    enrichment or re-embed those units -- doing so for every post-hoc
+    attachment would mean an unbounded number of LLM calls over a
+    capture's lifetime for an MVP feature secondary to the core loop.
     """
     try:
-        processed = process_upload(filename, data, memory.id)
+        processed = process_upload(filename, data, capture.id)
     except UnsupportedFileError as exc:
         raise IngestionError(str(exc)) from exc
 
     db.add(
         Attachment(
-            memory_id=memory.id,
+            capture_id=capture.id,
             original_filename=filename,
             stored_path=processed.stored_path,
             content_type=processed.content_type,
@@ -213,9 +183,10 @@ async def add_attachment(db: Session, memory: Memory, filename: str, data: bytes
     )
     db.flush()
 
-    attachment_text = "\n\n".join(a.extracted_text for a in memory.attachments if a.extracted_text)
-    memory.searchable_text = _build_searchable_text(memory.caption, attachment_text, "", memory.derived)
+    attachment_text = _attachment_text_for(capture)
+    for unit in capture.units:
+        unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
 
     db.commit()
-    db.refresh(memory)
-    return memory
+    db.refresh(capture)
+    return capture
