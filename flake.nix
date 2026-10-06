@@ -47,7 +47,11 @@
 
         # See CLAUDE.md "NixOS footguns" for why each of these exists.
         shellHook = ''
-          export MEMBASE_ROOT="$PWD"
+          # git rev-parse, not $PWD: resolves to the repo root even if
+          # `nix develop` is run from a subdirectory (e.g. backend/), and
+          # -- unlike $PWD -- stays correct even if MEMBASE_ROOT is read
+          # later in the shell's life after a `cd` elsewhere.
+          export MEMBASE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
           export PGDATA="$MEMBASE_ROOT/.data/postgres"
           export PGHOST_DIR="$MEMBASE_ROOT/.data/postgres-socket"
           export PGPORT=5544
