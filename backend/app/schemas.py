@@ -14,15 +14,27 @@ class AttachmentOut(BaseModel):
     extraction_status: str
 
 
-class MemoryOut(BaseModel):
+class MemoryUnitOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    caption: str
-    created_at: datetime
-    derived: dict
+    capture_id: uuid.UUID
+    authoritative_content: str
+    status: str
+    clarifications: list
     pending_clarification: dict | None
+    semantic: dict
+    created_at: datetime
+
+
+class CaptureOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    raw_text: str
+    created_at: datetime
     attachments: list[AttachmentOut]
+    units: list[MemoryUnitOut]
 
 
 class ClarifyRequest(BaseModel):
@@ -35,8 +47,9 @@ class RecallRequest(BaseModel):
 
 class SourceOut(BaseModel):
     id: uuid.UUID
-    caption: str
-    derived: dict
+    capture_id: uuid.UUID
+    content: str
+    semantic: dict
     created_at: datetime
     vector_score: float | None
     fts_score: float | None

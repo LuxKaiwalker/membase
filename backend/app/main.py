@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import memories, recall
+from app.api import captures, recall, units
 from app.llm.base import LLMError
 from app.web import routes as web_routes
 
@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="membase")
 
-app.include_router(memories.router)
+app.include_router(captures.router)
+app.include_router(units.router)
 app.include_router(recall.router)
 app.include_router(web_routes.router)
 
