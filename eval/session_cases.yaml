@@ -1,0 +1,82 @@
+# Iterative-recall evaluation cases (spec section 34/35): unlike
+# eval/cases.yaml (one query -> one answer), each case here is a script
+# of turns against a RecallSession -- a weak first query, then zero or
+# more simulated user replies -- checking the *sequence* of statuses the
+# session passes through, not just a final answer.
+#
+# `memories` seed fresh captures (truncated+ingested per case, same as
+# run_eval.py). `turns[0]` is always the initial query (starts the
+# session); subsequent turns are `message`s sent via continue_session.
+# Each turn may assert `expect_status` and/or `expect_contains` (checked
+# against final_answer, case-insensitive substring, only meaningful once
+# status is "success").
+
+- name: ambiguous_then_resolved_by_location
+  category: multi_round
+  memories:
+    - "Anna recommended a paper to me at ETH."
+    - "Markus recommended a paper to me in Paris."
+  turns:
+    - query: "Who recommended a paper to me?"
+      expect_status: needs_user_cue
+    - message: "It was at ETH."
+      expect_status: success
+      expect_contains: ["anna"]
+
+- name: ambiguous_then_resolved_by_correction
+  category: incorrect_recollection
+  memories:
+    - "Anna recommended a paper to me at ETH."
+    - "Markus recommended a paper to me in Paris."
+  turns:
+    - query: "Who recommended a paper to me?"
+      expect_status: needs_user_cue
+    - message: "No, it wasn't Markus."
+      expect_status: success
+      expect_contains: ["anna"]
+
+- name: irrelevant_cue_does_not_force_wrong_answer
+  category: bad_cue
+  memories:
+    - "Anna recommended a paper to me at ETH."
+    - "Markus recommended a paper to me in Paris."
+  turns:
+    - query: "Who recommended a paper to me?"
+      expect_status: needs_user_cue
+    - message: "Hmm, something about an elephant?"
+      # An irrelevant cue must not be treated as a hard filter or
+      # silently resolve to the wrong candidate -- the session should
+      # still be asking (possibly a different question), not guessing.
+      expect_status: needs_user_cue
+
+- name: no_evidence_at_all_abstains
+  category: no_answer
+  memories:
+    - "Bought groceries: tomatoes, pasta, olive oil."
+  turns:
+    - query: "What's the capital of a country I've never mentioned?"
+      expect_status: exhausted
+
+- name: exact_query_answers_immediately
+  category: exact
+  memories:
+    - "I adopted a cat named Whiskers last week."
+  turns:
+    - query: "What's my pet's name?"
+      expect_status: success
+      expect_contains: ["whiskers"]
+
+- name: original_query_not_lost_across_rounds
+  category: query_drift
+  memories:
+    - "Anna recommended a paper to me at ETH."
+    - "Markus recommended a paper to me in Paris."
+  turns:
+    - query: "Who recommended a paper to me after a lecture?"
+      expect_status: needs_user_cue
+    - message: "I'm really not sure, maybe check again?"
+      # No new discriminating info -- the session must keep using the
+      # ORIGINAL query (never silently replace it with a reformulation)
+      # and either ask again or still be working the same problem, not
+      # have drifted onto an unrelated search.
+      expect_original_query: "Who recommended a paper to me after a lecture?"
