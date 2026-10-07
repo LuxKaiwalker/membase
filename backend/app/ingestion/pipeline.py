@@ -1,15 +1,18 @@
 import datetime as dt
 import logging
 import shutil
+import uuid
 
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.db import get_sessionmaker
 from app.ingestion.chunking import chunk_attachment
 from app.ingestion.clarify import generate_questions
 from app.ingestion.enrichment import build_retrieval_text, enrich
 from app.ingestion.files import ProcessedFile, UnsupportedFileError, process_upload
 from app.ingestion.segmentation import segment_capture
+from app.llm import get_llm_provider
 from app.llm.base import LLMError, LLMProvider
 from app.models import Attachment, AttachmentChunk, Capture, MemoryUnit
 
@@ -170,7 +173,40 @@ async def _advance_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, attachm
             db.commit()
             return
 
-    await _run_full_enrichment(db, llm, unit, attachment_text)
+    # No clarification pending (or the round budget is exhausted): hand
+    # full enrichment off to run in the background rather than blocking
+    # this request -- see docs/DECISIONS.md. The API layer schedules
+    # finish_unit_processing() once it sees this status, so the HTTP
+    # response returns immediately and a second capture's clarification
+    # flow is never blocked by the first one's enrichment.
+    unit.status = "processing"
+    db.commit()
+
+
+async def finish_unit_processing(unit_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
+    """Runs full enrichment for a unit that reached status="processing"
+    -- the background-task entry point scheduled by the API layer (see
+    api/captures.py, api/units.py) once _advance_unit() sets that status,
+    so it always runs after the triggering HTTP request's own DB session
+    has already closed. Opens its own session instead of reusing anything
+    from the request. `llm` defaults to the production singleton; tests
+    pass a FakeLLMProvider explicitly so this never hits the real Ollama
+    service.
+    """
+    db = get_sessionmaker()()
+    try:
+        if llm is None:
+            llm = get_llm_provider()
+        unit = db.get(MemoryUnit, unit_id)
+        if unit is None or unit.status != "processing":
+            # Deleted, discarded, or already finished by a concurrent
+            # retry in the time between scheduling and running -- nothing
+            # to do.
+            return
+        attachment_text = _attachment_text_for(unit.capture)
+        await _run_full_enrichment(db, llm, unit, attachment_text)
+    finally:
+        db.close()
 
 
 async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: list[tuple[str, bytes]]) -> Capture:
