@@ -3,6 +3,12 @@
 {% block content %}
 <section class="panel">
   <h1>What do you want to remember?</h1>
+  <p class="muted">
+    You don't need the exact words. Start with whatever you remember --
+    if it's not enough to find a unique memory, membase will ask a
+    follow-up question.
+  </p>
+
   <form id="recall-form">
     <input id="query" type="text" placeholder="e.g. Who recommended that robotics paper?" required />
     <button type="submit">Recall</button>
@@ -10,14 +16,27 @@
 
   <div id="status" class="status hidden"></div>
 
-  <div id="result" class="card hidden">
-    <h2>Answer</h2>
-    <p id="answer" class="answer"></p>
+  <div id="conversation" class="card hidden">
+    <div id="session-status" class="session-status"></div>
+    <div id="transcript" class="transcript"></div>
 
-    <div id="sources-wrap">
+    <form id="reply-form" class="hidden">
+      <label for="reply">Your reply</label>
+      <input id="reply" type="text" placeholder="Answer the question, or add anything else you remember" />
+      <div class="button-row">
+        <button type="submit">Send</button>
+        <button type="button" id="cancel-session" class="secondary">Give up</button>
+      </div>
+    </form>
+
+    <div id="sources-wrap" class="hidden">
       <h3>Supporting memories</h3>
       <p class="muted">This is the actual stored data the answer above was grounded in -- not generated text.</p>
       <ul id="sources"></ul>
+    </div>
+
+    <div class="button-row">
+      <button type="button" id="start-over" class="secondary hidden">Start a new recall</button>
     </div>
   </div>
 </section>

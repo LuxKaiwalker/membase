@@ -153,35 +153,115 @@ const membase = (() => {
     }
   }
 
+  const SESSION_STATUS_TEXT = {
+    needs_user_cue: (s) =>
+      s.last_candidate_count > 0
+        ? `Found ${s.last_candidate_count} related memor${s.last_candidate_count === 1 ? "y" : "ies"} so far -- one more detail would help.`
+        : "Looking for another angle to search by...",
+    success: () => "Found it.",
+    exhausted: () => "I don't have enough stored evidence to determine this.",
+    cancelled: () => "Recall cancelled.",
+    error: () => "Something went wrong.",
+  };
+
+  function renderTranscript(transcriptEl, session) {
+    transcriptEl.innerHTML = "";
+    for (const m of session.messages) {
+      const div = document.createElement("div");
+      const isFinal = m.role === "system" && (m.text === session.final_answer);
+      div.className = `turn ${m.role}${isFinal ? " final" : ""}`;
+      div.textContent = m.text;
+      transcriptEl.appendChild(div);
+    }
+  }
+
+  // Iterative recall: a query may only be a weak cue. The session walks
+  // SEARCH -> (ANSWER | ASK_USER) -> ... until it succeeds, gives up, or
+  // the user cancels -- see app/retrieval/session.py.
   function initRecallPage() {
-    const form = document.getElementById("recall-form");
+    const queryForm = document.getElementById("recall-form");
     const statusEl = document.getElementById("status");
-    const resultCard = document.getElementById("result");
-    const answerEl = document.getElementById("answer");
+    const conversation = document.getElementById("conversation");
+    const sessionStatusEl = document.getElementById("session-status");
+    const transcriptEl = document.getElementById("transcript");
+    const replyForm = document.getElementById("reply-form");
+    const replyInput = document.getElementById("reply");
+    const cancelBtn = document.getElementById("cancel-session");
+    const startOverBtn = document.getElementById("start-over");
     const sourcesEl = document.getElementById("sources");
     const sourcesWrap = document.getElementById("sources-wrap");
 
-    form.addEventListener("submit", async (ev) => {
+    let sessionId = null;
+    const TERMINAL = new Set(["success", "exhausted", "cancelled", "error"]);
+
+    function render(session) {
+      sessionId = session.id;
+      renderTranscript(transcriptEl, session);
+      const textFn = SESSION_STATUS_TEXT[session.status];
+      sessionStatusEl.textContent = textFn ? textFn(session) : session.status;
+
+      const terminal = TERMINAL.has(session.status);
+      replyForm.classList.toggle("hidden", terminal);
+      startOverBtn.classList.toggle("hidden", !terminal);
+
+      if (session.status === "success" && session.sources.length > 0) {
+        show(sourcesWrap);
+        renderSources(sourcesEl, session.sources);
+      } else {
+        hide(sourcesWrap);
+      }
+
+      if (!terminal) {
+        replyInput.value = "";
+        replyInput.focus();
+      }
+      show(conversation);
+    }
+
+    queryForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
-      hide(resultCard);
-      showStatus(statusEl, "Recalling...");
+      hide(conversation);
+      showStatus(statusEl, "Searching your memories...");
       const query = document.getElementById("query").value;
 
       try {
-        const data = await postJSON("/api/recall", { query });
+        const session = await postJSON("/api/recall/sessions", { query });
         hide(statusEl);
-        answerEl.textContent = data.answer;
-        answerEl.classList.toggle("abstained", data.abstained);
-        if (data.abstained) {
-          hide(sourcesWrap);
-        } else {
-          show(sourcesWrap);
-          renderSources(sourcesEl, data.sources);
-        }
-        show(resultCard);
+        render(session);
       } catch (err) {
         showStatus(statusEl, err.message, true);
       }
+    });
+
+    replyForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      if (!replyInput.value.trim()) return;
+      showStatus(statusEl, "Searching...");
+      try {
+        const session = await postJSON(`/api/recall/sessions/${sessionId}/messages`, {
+          text: replyInput.value,
+        });
+        hide(statusEl);
+        render(session);
+      } catch (err) {
+        showStatus(statusEl, err.message, true);
+      }
+    });
+
+    cancelBtn.addEventListener("click", async () => {
+      try {
+        const session = await postJSON(`/api/recall/sessions/${sessionId}/cancel`, {});
+        render(session);
+      } catch (err) {
+        showStatus(statusEl, err.message, true);
+      }
+    });
+
+    startOverBtn.addEventListener("click", () => {
+      sessionId = null;
+      hide(conversation);
+      queryForm.reset();
+      document.getElementById("query").focus();
     });
   }
 
