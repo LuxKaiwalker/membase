@@ -216,13 +216,30 @@ async def hybrid_search(
     ]
 
 
+#  Gating bug fix: attachment_chunks are indexed as soon as the attachment
+#  is uploaded (_index_attachment_chunks runs during create_capture()
+#  before segmentation/clarification even happens), with no status column
+#  of their own -- so without this EXISTS check, a chunk stayed
+#  searchable even while every sibling MemoryUnit in the same capture was
+#  still "awaiting_clarification" or "processing" (not yet "ready"),
+#  silently bypassing the status gate that hybrid_search() enforces for
+#  memory_units (see docs/ARCHITECTURE.md "Status gate"). Requiring at
+#  least one ready sibling unit applies the same gate at the capture
+#  granularity attachment_chunks actually have.
+_CHUNK_READY_GATE = """
+            AND EXISTS (
+                SELECT 1 FROM memory_units mu
+                WHERE mu.capture_id = attachment_chunks.capture_id AND mu.status = 'ready'
+            )"""
+
+
 def _chunk_vector_candidates(db: Session, query_vector: list[float], limit: int) -> dict[uuid.UUID, float]:
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, 1 - (embedding <=> (:qv)::vector) AS score
             FROM attachment_chunks
-            WHERE embedding IS NOT NULL
+            WHERE embedding IS NOT NULL{_CHUNK_READY_GATE}
             ORDER BY embedding <=> (:qv)::vector
             LIMIT :limit
             """
@@ -235,10 +252,10 @@ def _chunk_vector_candidates(db: Session, query_vector: list[float], limit: int)
 def _chunk_fts_candidates(db: Session, query: str, limit: int) -> dict[uuid.UUID, float]:
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, ts_rank(fts, websearch_to_tsquery('english', :q)) AS score
             FROM attachment_chunks
-            WHERE fts @@ websearch_to_tsquery('english', :q)
+            WHERE fts @@ websearch_to_tsquery('english', :q){_CHUNK_READY_GATE}
             ORDER BY score DESC
             LIMIT :limit
             """

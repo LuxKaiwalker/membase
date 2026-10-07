@@ -197,7 +197,18 @@ async def finish_unit_processing(unit_id: uuid.UUID, llm: LLMProvider | None = N
     try:
         if llm is None:
             llm = get_llm_provider()
-        unit = db.get(MemoryUnit, unit_id)
+        # with_for_update: a user hitting POST /retry on a unit that's
+        # still "processing" (allowed, to recover from a server restart
+        # that dropped an in-flight BackgroundTask -- see api/units.py)
+        # schedules a second finish_unit_processing for the same unit_id.
+        # Without a lock here, both would read status=="processing",
+        # both run full enrichment, and whichever commits last wins --
+        # wasted duplicate LLM calls at best, a lost update at worst. The
+        # row lock serializes them: the second call blocks until the
+        # first's transaction commits, then re-reads status as "ready"/
+        # "failed" and bails out via the check below instead of redoing
+        # the work.
+        unit = db.get(MemoryUnit, unit_id, with_for_update=True)
         if unit is None or unit.status != "processing":
             # Deleted, discarded, or already finished by a concurrent
             # retry in the time between scheduling and running -- nothing
