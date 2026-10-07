@@ -74,6 +74,28 @@
   benchmark finding below) before a promotion mechanism is worth
   designing. Open: what exactly gets promoted, in whose words, with what
   provenance.
+- **A "forget" process driven by causal relationships between captures.**
+  Raised by the user, not formalized -- written down as a direction,
+  not a spec. Idea: a new capture can causally resolve or consume an
+  earlier one, and that should be reflected in storage somehow (delete,
+  archive, or some new status) rather than just adding another memory
+  alongside the stale one. Example: logging "went grocery shopping"
+  should somehow act on a previously stored shopping-list memory --
+  roughly delete or archive the items that were just bought. This is
+  distinct from the generic time-decay "human-like forgetting" listed
+  under "Explicitly deferred" below -- this is triggered by the
+  semantic content of a *new* capture, not by elapsed time. Currently
+  nothing in the pipeline looks for this relationship at all: every
+  capture is additive, and the only existing deletion path is the
+  user's own explicit `DELETE /api/captures/{id}`. Open, unformalized
+  questions this would need to answer before it could be designed:
+  how a causal/consuming link between two memories would even be
+  detected (an LLM judgment per new capture against candidate related
+  memories? something cheaper?), what "resolved" should mean for a unit
+  that wasn't deleted outright (archived-but-still-searchable? excluded
+  from recall like `awaiting_clarification`?), how wrong/false-positive
+  matches get corrected or undone, and whether this should ever run
+  automatically vs. always surfacing as a confirmation to the user first.
 
 ## Known technical gaps
 
