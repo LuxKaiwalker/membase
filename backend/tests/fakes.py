@@ -77,7 +77,18 @@ class FakeLLMProvider(LLMProvider):
       - "grounded"            -> final answer generation
       - "cues"                -> recall-session cue extraction
       - "questions"           -> storage-time clarification-question generation
-      - (none of the above)   -> semantic enrichment
+      - (none of the above)   -> semantic enrichment (narrative / entities /
+                                 retrieval-aids sub-calls, see
+                                 app/ingestion/enrichment.py -- none of their
+                                 three schemas use a key distinct enough to
+                                 need their own dispatch branch, so all three
+                                 draw from the same `enrichment_response`
+                                 queue; a single-dict config is returned to
+                                 all three calls unchanged since each only
+                                 reads the fields relevant to it, but a
+                                 LIST config is now consumed 3x per enrich()
+                                 invocation, not 1x -- size list configs
+                                 accordingly)
 
     Each may be a single dict (returned every time) or a list (consumed in
     order, popped in order with the last value held once exhausted) --

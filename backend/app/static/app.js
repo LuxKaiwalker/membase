@@ -21,10 +21,15 @@ const membase = (() => {
 
   // A hung request (e.g. a stuck DB transaction server-side) must never
   // leave the page silently spinning forever with no feedback -- that's
-  // indistinguishable from a frozen UI. 90s is generous enough for a
-  // real multi-round recall (several sequential LLM calls) but still
-  // bounds the worst case to a visible error instead of an infinite wait.
-  const REQUEST_TIMEOUT_MS = 90_000;
+  // indistinguishable from a frozen UI. 420s is sized to the server's own
+  // worst legitimate case, not guessed independently: ingestion can run
+  // up to 5 sequential LLM calls (generate_questions, enrich()'s three
+  // narrative/entities/retrieval-aids sub-calls, embed), each up to the
+  // server's configured 90s llm_timeout_seconds -- a shorter client
+  // timeout would abort a slow-but-working request and misreport it as
+  // stuck. Still bounds the true-hang case to a visible error instead of
+  // an infinite wait.
+  const REQUEST_TIMEOUT_MS = 420_000;
 
   async function fetchWithTimeout(url, options) {
     const controller = new AbortController();

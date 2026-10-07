@@ -61,35 +61,42 @@ def _patch_rounds(monkeypatch, results: list[AutomaticSearchResult], calls: list
 async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
     """Two independent, equally-plausible candidate memories from
     different origin captures -- the ambiguous case the spec's worked
-    example is built around."""
-    ingest_llm = FakeLLMProvider(
-        enrichment_response=[
-            {
-                "meaning": "Anna recommended a paper",
-                "aliases": [],
-                "people": ["Anna"],
-                "organizations": [],
-                "locations": ["ETH"],
-                "topics": ["robotics"],
-                "definitions": [],
-                "relations": [],
-                "event_date": "",
-            },
-            {
-                "meaning": "Markus recommended a book",
-                "aliases": [],
-                "people": ["Markus"],
-                "organizations": [],
-                "locations": ["Paris"],
-                "topics": ["machine learning"],
-                "definitions": [],
-                "relations": [],
-                "event_date": "",
-            },
-        ]
+    example is built around.
+
+    Two separate FakeLLMProvider instances (not one with a 2-item list):
+    enrich() is now three independent sub-calls all drawing from the same
+    enrichment_response queue (see app/ingestion/enrichment.py), so a
+    single dict per instance -- returned unchanged to all three sub-calls
+    -- keeps each capture's semantics cleanly separate.
+    """
+    anna_llm = FakeLLMProvider(
+        enrichment_response={
+            "meaning": "Anna recommended a paper",
+            "aliases": [],
+            "people": ["Anna"],
+            "organizations": [],
+            "locations": ["ETH"],
+            "topics": ["robotics"],
+            "definitions": [],
+            "relations": [],
+            "event_date": "",
+        }
     )
-    cap_a = await create_capture(db, ingest_llm, text="Anna recommended a paper to me.", uploads=[])
-    cap_b = await create_capture(db, ingest_llm, text="Markus recommended a book to me.", uploads=[])
+    markus_llm = FakeLLMProvider(
+        enrichment_response={
+            "meaning": "Markus recommended a book",
+            "aliases": [],
+            "people": ["Markus"],
+            "organizations": [],
+            "locations": ["Paris"],
+            "topics": ["machine learning"],
+            "definitions": [],
+            "relations": [],
+            "event_date": "",
+        }
+    )
+    cap_a = await create_capture(db, anna_llm, text="Anna recommended a paper to me.", uploads=[])
+    cap_b = await create_capture(db, markus_llm, text="Markus recommended a book to me.", uploads=[])
     return cap_a.units[0], cap_b.units[0]
 
 
