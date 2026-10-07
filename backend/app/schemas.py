@@ -78,5 +78,46 @@ class RecallResponse(BaseModel):
     chunk_sources: list[ChunkSourceOut] = []
 
 
+class RecallSessionMessageRequest(BaseModel):
+    text: str
+
+
+class MessageOut(BaseModel):
+    role: str
+    text: str
+    created_at: str
+
+
+class CueOut(BaseModel):
+    text: str
+    confidence: str
+    polarity: str
+    round: int
+    created_at: str
+
+
+class HypothesisOut(BaseModel):
+    text: str
+    round: int
+    created_at: str
+
+
+class RecallSessionOut(BaseModel):
+    id: uuid.UUID
+    original_query: str
+    status: str
+    current_question: str | None
+    messages: list[MessageOut]
+    cues: list[CueOut]
+    hypotheses: list[HypothesisOut]
+    round_count: int
+    last_candidate_count: int
+    final_answer: str | None
+    sources: list[SourceOut]
+    chunk_sources: list[ChunkSourceOut]
+    created_at: datetime
+    updated_at: datetime
+
+
 class ErrorResponse(BaseModel):
     detail: str
