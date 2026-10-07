@@ -1,0 +1,264 @@
+# Interactive-retrieval benchmark. Answers one question: does
+# interactive (ask-a-clarifying-question) retrieval recover information
+# that single-shot semantic/LLM-reasoning retrieval cannot efficiently
+# recover? Deliberately NOT random memories -- a small synthetic
+# autobiographical world with controlled ambiguity, indirect reference,
+# temporal relations, and distractors (see eval/run_interactive_benchmark.py).
+#
+# Each memory is ingested as its own independent capture (no grouping),
+# so retrieval must actually find the right one(s) among genuine
+# competition rather than within a hand-grouped paragraph.
+
+memories:
+  # --- Projects ---
+  - id: M1
+    theme: projects
+    text: "In March 2024, I worked with Lena and Marco on Atlas, a small machine-learning platform. We abandoned it after users repeatedly submitted malformed configuration files. The experience taught me that user-provided information should be validated before entering the main processing pipeline."
+  - id: M2
+    theme: projects
+    text: "In July 2024, I worked with Daniel on Orion, a compiler optimization project written primarily in Rust. The project was technically successful, but I eventually stopped working on it because maintaining the optimizer became too time-consuming."
+  - id: M3
+    theme: projects
+    text: "In November 2024, I built Nimbus, a visualization tool with Sarah. The project initially failed because we optimized rendering performance before understanding what users actually needed. This taught me to validate requirements before optimizing implementation details."
+  - id: M4
+    theme: projects
+    text: "In February 2025, I worked alone on Helix, an experiment involving financial time-series prediction. I abandoned it after discovering that an apparent improvement disappeared when the evaluation methodology was corrected."
+  - id: M5
+    theme: projects
+    text: "In May 2025, I built Echo with Marco and Daniel. It was a distributed systems experiment using Go. The project worked technically, but communication between the three of us became inefficient, so we stopped developing it."
+
+  # --- People ---
+  - id: M6
+    theme: people
+    text: "Lena was the person who first suggested using structured validation for Atlas. I met her at a university hackathon in 2023."
+  - id: M7
+    theme: people
+    text: "Marco worked with me on both Atlas and Echo. He was particularly interested in machine learning infrastructure."
+  - id: M8
+    theme: people
+    text: "Daniel worked with me on Orion and Echo. I first met him through a programming competition."
+  - id: M9
+    theme: people
+    text: "Sarah worked with me on Nimbus. I met her through a visualization course."
+
+  # --- Events ---
+  - id: M10
+    theme: events
+    text: "At the university hackathon in 2023, I met Lena. We later worked together on a machine-learning project."
+  - id: M11
+    theme: events
+    text: "At a programming competition in 2023, I met Daniel. We later collaborated on a systems-oriented project."
+  - id: M12
+    theme: events
+    text: "During a visualization course in 2024, I met Sarah, who later collaborated with me on Nimbus."
+
+  # --- Lessons / causal chains ---
+  - id: M13
+    theme: lessons
+    text: "After Atlas, I became much more cautious about trusting information supplied directly by users."
+  - id: M14
+    theme: lessons
+    text: "After Nimbus, I became more convinced that optimizing a system before understanding the user's actual requirements is often wasted effort."
+  - id: M15
+    theme: lessons
+    text: "After Helix, I became more skeptical of improvements that depend on a particular evaluation methodology."
+  - id: M16
+    theme: lessons
+    text: "After Echo, I became more conscious of the communication overhead introduced by collaborative projects."
+
+  # --- Temporal relationships ---
+  - id: M17
+    theme: temporal
+    text: "Atlas was completed before Orion was started."
+  - id: M18
+    theme: temporal
+    text: "Orion was started before Nimbus."
+  - id: M19
+    theme: temporal
+    text: "Nimbus was completed before Helix."
+  - id: M20
+    theme: temporal
+    text: "Helix was completed before Echo."
+  - id: M21
+    theme: temporal
+    text: "I met Lena before I started Atlas."
+  - id: M22
+    theme: temporal
+    text: "I met Daniel before I started Orion."
+
+  # --- Distractors: share vocabulary with the real answers on purpose ---
+  - id: M23
+    theme: distractor
+    text: "I experimented with validating JSON input in a personal programming exercise."
+  - id: M24
+    theme: distractor
+    text: "I optimized a small visualization program before understanding its performance requirements."
+  - id: M25
+    theme: distractor
+    text: "I encountered unreliable financial data while experimenting with a different prediction model."
+  - id: M26
+    theme: distractor
+    text: "I used Rust for a small personal tool unrelated to Orion."
+  - id: M27
+    theme: distractor
+    text: "Marco helped me debug a machine-learning script unrelated to Atlas."
+  - id: M28
+    theme: distractor
+    text: "Daniel and I discussed a compiler project that we never actually started."
+  - id: M29
+    theme: distractor
+    text: "I abandoned a small web application because I lost interest in it."
+  - id: M30
+    theme: distractor
+    text: "I once considered building a distributed systems project with Sarah, but we never started it."
+
+  # --- Fine-grained discrimination pairs (section 6) ---
+  - id: M31
+    theme: discrimination_pair
+    text: "I abandoned a project because users supplied malformed configuration."
+  - id: M32
+    theme: discrimination_pair
+    text: "I abandoned a project because external data contained malformed records."
+  - id: M33
+    theme: discrimination_pair
+    text: "I optimized before understanding user requirements."
+  - id: M34
+    theme: discrimination_pair
+    text: "I optimized after understanding user requirements, but performance was still insufficient."
+
+# `expect_contains`: case-insensitive substring check against the final
+# answer text -- robust here because the expected answers are distinct
+# proper nouns (project names) that a correct grounded answer will
+# almost certainly name.
+#
+# `expect_include_any`/`expect_exclude` (used where there's no project
+# name to check, e.g. the discrimination pairs): scored against which
+# memory ids the answer's cited sources actually trace back to, not the
+# answer text.
+#
+# `ground_truth_memory`: which memory's real (post-ingestion) semantic
+# metadata grounds the simulated user's replies to mode C's
+# clarifying questions (see simulate_reply() in the runner).
+queries:
+  - id: Q1
+    level: 1
+    category: direct
+    question: "What was the name of my machine-learning platform?"
+    expect_contains: ["atlas"]
+    ground_truth_memory: M1
+  - id: Q2
+    level: 1
+    category: direct
+    question: "Who worked with me on Nimbus?"
+    expect_contains: ["sarah"]
+    ground_truth_memory: M3
+  - id: Q3
+    level: 1
+    category: direct
+    question: "Which project used Rust?"
+    expect_contains: ["orion"]
+    ground_truth_memory: M2
+
+  - id: Q4
+    level: 2
+    category: indirect
+    question: "Which project made me more careful about trusting information provided by other people?"
+    expect_contains: ["atlas"]
+    ground_truth_memory: M1
+  - id: Q5
+    level: 2
+    category: indirect
+    question: "Which project convinced me that optimizing too early can be a mistake?"
+    expect_contains: ["nimbus"]
+    ground_truth_memory: M3
+  - id: Q6
+    level: 2
+    category: indirect
+    question: "Which project made me skeptical of apparent improvements in experiments?"
+    expect_contains: ["helix"]
+    ground_truth_memory: M4
+
+  - id: Q7
+    level: 3
+    category: ambiguous
+    question: "Which project taught me an important lesson about validation?"
+    expect_contains: ["atlas"]
+    ground_truth_memory: M1
+    candidates: [M1, M23]
+  - id: Q8
+    level: 3
+    category: ambiguous
+    question: "Which project taught me that optimization can be premature?"
+    expect_contains: ["nimbus"]
+    ground_truth_memory: M3
+    candidates: [M3, M24]
+
+  - id: Q9
+    level: 4
+    category: relational
+    question: "Which project did the person I met at a university hackathon later work on with me?"
+    expect_contains: ["atlas"]
+    ground_truth_memory: M1
+  - id: Q10
+    level: 4
+    category: relational
+    question: "Which project involved the person I met through a programming competition?"
+    expect_contains: ["orion"]
+    ground_truth_memory: M2
+    candidates: [M2, M5]
+
+  - id: Q11
+    level: 5
+    category: temporal
+    question: "What project did I work on after the one where I first collaborated with Lena?"
+    expect_contains: ["orion"]
+    ground_truth_memory: M2
+  - id: Q12
+    level: 5
+    category: temporal
+    question: "What was the last project I abandoned before working on Echo?"
+    expect_contains: ["helix"]
+    ground_truth_memory: M4
+
+  - id: Q13
+    level: 6
+    category: causal
+    question: "What project eventually changed how I treat information coming from users?"
+    expect_contains: ["atlas"]
+    ground_truth_memory: M1
+  - id: Q14
+    level: 6
+    category: causal
+    question: "Which abandoned project changed how I evaluate experimental improvements?"
+    expect_contains: ["helix"]
+    ground_truth_memory: M4
+
+  - id: Q15
+    level: 7
+    category: vague_episodic
+    question: "What was that project where things technically worked but I still stopped working on it?"
+    expect_contains: ["echo"]
+    ground_truth_memory: M5
+    candidates: [M2, M5]
+  - id: Q16
+    level: 7
+    category: vague_episodic
+    question: "What was the project where the problem wasn't really the technology, but something about how we approached it?"
+    expect_contains: ["nimbus"]
+    ground_truth_memory: M3
+    candidates: [M2, M3, M5]
+
+  - id: Q17
+    level: 8
+    category: fine_grained_discrimination
+    question: "Which project taught me to be more careful with user-provided information?"
+    ground_truth_memory: M1
+    expect_include_any: [M1, M31]
+    expect_exclude: [M32]
+  - id: Q18
+    level: 8
+    category: fine_grained_discrimination
+    question: "Which project taught me not to optimize too early?"
+    ground_truth_memory: M3
+    expect_include_any: [M3, M33]
+    expect_exclude: [M34]
