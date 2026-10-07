@@ -19,8 +19,30 @@ const membase = (() => {
     return div.innerHTML;
   }
 
+  // A hung request (e.g. a stuck DB transaction server-side) must never
+  // leave the page silently spinning forever with no feedback -- that's
+  // indistinguishable from a frozen UI. 90s is generous enough for a
+  // real multi-round recall (several sequential LLM calls) but still
+  // bounds the worst case to a visible error instead of an infinite wait.
+  const REQUEST_TIMEOUT_MS = 90_000;
+
+  async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err.name === "AbortError") {
+        throw new Error("Request timed out. The server may be stuck -- please try again in a moment.");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function postJSON(url, body) {
-    const resp = await fetch(url, {
+    const resp = await fetchWithTimeout(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -86,7 +108,7 @@ const membase = (() => {
 
       const formData = new FormData(form);
       try {
-        const resp = await fetch("/api/captures", { method: "POST", body: formData });
+        const resp = await fetchWithTimeout("/api/captures", { method: "POST", body: formData });
         const capture = await resp.json();
         if (!resp.ok) throw new Error(capture.detail || "Failed to save");
 
@@ -122,9 +144,9 @@ const membase = (() => {
     clarificationDiscard.addEventListener("click", async () => {
       const current = pendingQueue[0];
       try {
-        const updatedUnit = await fetch(`/api/memory-units/${current.unitId}/discard`, { method: "POST" }).then((r) =>
-          r.json()
-        );
+        const updatedUnit = await fetchWithTimeout(`/api/memory-units/${current.unitId}/discard`, {
+          method: "POST",
+        }).then((r) => r.json());
         allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
         pendingQueue = pendingQueue.slice(1);
         askNextClarification();
@@ -153,115 +175,42 @@ const membase = (() => {
     }
   }
 
-  const SESSION_STATUS_TEXT = {
-    needs_user_cue: (s) =>
-      s.last_candidate_count > 0
-        ? `Found ${s.last_candidate_count} related memor${s.last_candidate_count === 1 ? "y" : "ies"} so far -- one more detail would help.`
-        : "Looking for another angle to search by...",
-    success: () => "Found it.",
-    exhausted: () => "I don't have enough stored evidence to determine this.",
-    cancelled: () => "Recall cancelled.",
-    error: () => "Something went wrong.",
-  };
-
-  function renderTranscript(transcriptEl, session) {
-    transcriptEl.innerHTML = "";
-    for (const m of session.messages) {
-      const div = document.createElement("div");
-      const isFinal = m.role === "system" && (m.text === session.final_answer);
-      div.className = `turn ${m.role}${isFinal ? " final" : ""}`;
-      div.textContent = m.text;
-      transcriptEl.appendChild(div);
-    }
-  }
-
-  // Iterative recall: a query may only be a weak cue. The session walks
-  // SEARCH -> (ANSWER | ASK_USER) -> ... until it succeeds, gives up, or
-  // the user cancels -- see app/retrieval/session.py.
+  // One-shot recall (app/retrieval/agent.py:run_agent): a single query,
+  // a single grounded answer or abstention. The multi-round interactive
+  // RecallSession (app/retrieval/session.py, POST /api/recall/sessions)
+  // remains fully implemented and reachable via the API -- it's just not
+  // this page's default, after a benchmark measured it underperforming
+  // this simpler path on a deliberately ambiguous corpus; see
+  // docs/DECISIONS.md.
   function initRecallPage() {
-    const queryForm = document.getElementById("recall-form");
+    const form = document.getElementById("recall-form");
     const statusEl = document.getElementById("status");
-    const conversation = document.getElementById("conversation");
-    const sessionStatusEl = document.getElementById("session-status");
-    const transcriptEl = document.getElementById("transcript");
-    const replyForm = document.getElementById("reply-form");
-    const replyInput = document.getElementById("reply");
-    const cancelBtn = document.getElementById("cancel-session");
-    const startOverBtn = document.getElementById("start-over");
+    const resultCard = document.getElementById("result");
+    const answerEl = document.getElementById("answer");
     const sourcesEl = document.getElementById("sources");
     const sourcesWrap = document.getElementById("sources-wrap");
 
-    let sessionId = null;
-    const TERMINAL = new Set(["success", "exhausted", "cancelled", "error"]);
-
-    function render(session) {
-      sessionId = session.id;
-      renderTranscript(transcriptEl, session);
-      const textFn = SESSION_STATUS_TEXT[session.status];
-      sessionStatusEl.textContent = textFn ? textFn(session) : session.status;
-
-      const terminal = TERMINAL.has(session.status);
-      replyForm.classList.toggle("hidden", terminal);
-      startOverBtn.classList.toggle("hidden", !terminal);
-
-      if (session.status === "success" && session.sources.length > 0) {
-        show(sourcesWrap);
-        renderSources(sourcesEl, session.sources);
-      } else {
-        hide(sourcesWrap);
-      }
-
-      if (!terminal) {
-        replyInput.value = "";
-        replyInput.focus();
-      }
-      show(conversation);
-    }
-
-    queryForm.addEventListener("submit", async (ev) => {
+    form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
-      hide(conversation);
-      showStatus(statusEl, "Searching your memories...");
+      hide(resultCard);
+      showStatus(statusEl, "Recalling...");
       const query = document.getElementById("query").value;
 
       try {
-        const session = await postJSON("/api/recall/sessions", { query });
+        const data = await postJSON("/api/recall", { query });
         hide(statusEl);
-        render(session);
+        answerEl.textContent = data.answer;
+        answerEl.classList.toggle("abstained", data.abstained);
+        if (data.abstained) {
+          hide(sourcesWrap);
+        } else {
+          show(sourcesWrap);
+          renderSources(sourcesEl, data.sources);
+        }
+        show(resultCard);
       } catch (err) {
         showStatus(statusEl, err.message, true);
       }
-    });
-
-    replyForm.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      if (!replyInput.value.trim()) return;
-      showStatus(statusEl, "Searching...");
-      try {
-        const session = await postJSON(`/api/recall/sessions/${sessionId}/messages`, {
-          text: replyInput.value,
-        });
-        hide(statusEl);
-        render(session);
-      } catch (err) {
-        showStatus(statusEl, err.message, true);
-      }
-    });
-
-    cancelBtn.addEventListener("click", async () => {
-      try {
-        const session = await postJSON(`/api/recall/sessions/${sessionId}/cancel`, {});
-        render(session);
-      } catch (err) {
-        showStatus(statusEl, err.message, true);
-      }
-    });
-
-    startOverBtn.addEventListener("click", () => {
-      sessionId = null;
-      hide(conversation);
-      queryForm.reset();
-      document.getElementById("query").focus();
     });
   }
 
