@@ -27,6 +27,63 @@ VECTOR_SIM_THRESHOLD = 0.55
 
 ABSTENTION_MESSAGE = "I don't have a stored memory about this."
 
+_EVALUATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sufficient": {"type": "boolean"},
+        "reformulated_queries": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["sufficient", "reformulated_queries"],
+}
+
+_EVALUATE_SYSTEM = (
+    "You are deciding how to search a personal memory store, not answering "
+    "the user's question yet. Given the question and the best snippets "
+    "found so far (there may be none), decide whether there is already "
+    "enough to answer. If not, propose up to 2 alternative search queries: "
+    "different phrasings, synonyms, or terminology the user's own notes "
+    "might use instead of the question's wording (their notes may use an "
+    "abbreviation, nickname, or alias instead of the question's term, or "
+    "vice versa). You may use your general knowledge to guess what "
+    "alternate terminology might appear in the notes, purely to decide "
+    "what to search for -- never state such knowledge as a fact about the "
+    "user. If you have no promising alternative queries left to try, "
+    "return an empty list."
+)
+
+
+async def evaluate_sufficiency(
+    llm: LLMProvider, query: str, ranked: list["ScoredUnit"], tried: set[str]
+) -> dict:
+    """Narrow structured decision: is what's been found so far enough to
+    answer `query`, and if not, what else is worth searching for? The
+    reformulated queries this proposes are themselves a form of system
+    hypothesis (spec section 6c/18) -- they may use general-knowledge
+    guesses about likely terminology, never asserted as fact about the
+    user. Used both by the bounded one-shot agent (app/retrieval/agent.py)
+    and by each round of an iterative RecallSession
+    (app/retrieval/session.py).
+    """
+    if ranked:
+        snippets = "\n".join(f"- {s.unit.authoritative_content}" for s in ranked)
+        evidence_block = f"Snippets found so far:\n{snippets}"
+    else:
+        evidence_block = "No snippets found yet."
+    tried_block = f"Already tried: {', '.join(sorted(tried))}" if tried else ""
+    prompt = f"Question: {query}\n\n{evidence_block}\n{tried_block}"
+    try:
+        result = await llm.generate_structured(prompt, schema=_EVALUATE_SCHEMA, system=_EVALUATE_SYSTEM)
+    except LLMError:
+        # Can't reformulate without the LLM; stop searching and answer
+        # with whatever was already found (possibly nothing).
+        return {"sufficient": True, "reformulated_queries": []}
+
+    sufficient = bool(result.get("sufficient"))
+    queries = result.get("reformulated_queries")
+    queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()] if isinstance(queries, list) else []
+    return {"sufficient": sufficient, "reformulated_queries": queries}
+
+
 _ANSWER_SCHEMA = {
     "type": "object",
     "properties": {
