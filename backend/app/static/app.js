@@ -27,12 +27,26 @@ const membase = (() => {
   // never opens the settings menu.
   const OBLIGATORY_SETTING_KEY = "membase.obligatoryQuestions";
 
+  // localStorage can throw (not just be unavailable) in some browser
+  // privacy modes/configurations -- this is called unconditionally at
+  // page-load time via initSettingsMenu(), so an uncaught exception here
+  // would break this entire script's top-level execution, silently
+  // disabling every button on the page, not just the settings menu.
   function isObligatory() {
-    return localStorage.getItem(OBLIGATORY_SETTING_KEY) !== "0";
+    try {
+      return localStorage.getItem(OBLIGATORY_SETTING_KEY) !== "0";
+    } catch {
+      return true;
+    }
   }
 
   function setObligatory(value) {
-    localStorage.setItem(OBLIGATORY_SETTING_KEY, value ? "1" : "0");
+    try {
+      localStorage.setItem(OBLIGATORY_SETTING_KEY, value ? "1" : "0");
+    } catch {
+      // Preference just won't persist across reloads -- not worth
+      // surfacing an error for.
+    }
   }
 
   // Present in base.html on every page, so this runs unconditionally --
