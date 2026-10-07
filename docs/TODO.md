@@ -74,6 +74,20 @@
   benchmark finding below) before a promotion mechanism is worth
   designing. Open: what exactly gets promoted, in whose words, with what
   provenance.
+- **Narrower case of the above, raised by the user: a follow-up/
+  discriminating-question answer during a `RecallSession` round
+  (`app/retrieval/discriminate.py`, `app/retrieval/cues.py`) should be
+  added as a new memory if it reveals something not already captured
+  anywhere.** Not formalized, just written down. Today that answer is
+  only ever consumed as a disambiguation cue for the current session
+  (see `RecallSession.cues` in `app/retrieval/session.py`) and never
+  persisted as a `MemoryUnit` -- even when the user volunteers a
+  genuinely new fact while answering, it's discarded once the session
+  ends. Open: how to detect "not already captured" (dedup against
+  existing units -- by what, embedding similarity?), whether this
+  happens automatically or needs the user to confirm first, and in
+  whose words the new memory gets written (the literal answer text, or
+  something derived from it).
 - **A "forget" process driven by causal relationships between captures.**
   Raised by the user, not formalized -- written down as a direction,
   not a spec. Idea: a new capture can causally resolve or consume an
