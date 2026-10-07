@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.ingestion.chunking import chunk_attachment
+from app.ingestion.clarify import generate_questions
 from app.ingestion.enrichment import build_retrieval_text, enrich
 from app.ingestion.files import ProcessedFile, UnsupportedFileError, process_upload
 from app.ingestion.segmentation import segment_capture
@@ -14,9 +15,14 @@ from app.models import Attachment, AttachmentChunk, Capture, MemoryUnit
 
 logger = logging.getLogger(__name__)
 
-# 0 or 1 clarification question per unit. See docs/DECISIONS.md: bounded
-# deliberately low so the system never turns into an interrogation.
-MAX_CLARIFICATION_ROUNDS = 1
+# Bounded, but no longer a single yes/no: each round can surface several
+# relevant questions at once (asked one at a time), and an answer that
+# reveals new ambiguity can trigger another round. Both bounds exist for
+# the same reason the original single-question cap did -- stop the
+# *system* from interrogating the user -- not to limit a user-initiated
+# correct_unit(), which doesn't touch either budget. See docs/DECISIONS.md.
+MAX_CLARIFICATION_ROUNDS = 3
+MAX_QUESTIONS_PER_ROUND = 3
 
 
 class IngestionError(ValueError):
@@ -67,16 +73,15 @@ async def _index_attachment_chunks(db: Session, llm: LLMProvider, attachment: At
     db.commit()
 
 
-async def _enrich_and_index(db: Session, llm: LLMProvider, unit: MemoryUnit, attachment_text: str) -> None:
-    """Run semantic enrichment, build retrieval_text/searchable_text, embed,
-    and set unit.status -- the "derived processing" half of the two-phase
-    commit described in app/ingestion/pipeline.py:create_capture.
-
-    Status becomes "awaiting_clarification" (NOT "ready") if enrichment
-    surfaces a genuinely open question -- see docs/DECISIONS.md: this is
-    the clarification *gate*. hybrid_search() only ever considers
-    status='ready' units, so an awaiting_clarification unit is durably
-    saved but invisible to recall until answered.
+async def _run_full_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit, attachment_text: str) -> None:
+    """Run full semantic enrichment, build retrieval_text/searchable_text,
+    embed, and flip the unit to "ready". Only ever called once no
+    clarification question is pending and the round budget has either
+    resolved cleanly or been exhausted -- see _advance_unit(). Running
+    this *before* clarification is settled would be wasted work: the
+    semantic representation would just be redone once an answer comes in,
+    since enrich() takes `clarifications` as context (see
+    docs/DECISIONS.md for why these were split into two calls).
 
     Never raises outward: an *unexpected* exception here is caught and
     recorded as status="failed" (retryable via retry_enrichment), rather
@@ -89,21 +94,8 @@ async def _enrich_and_index(db: Session, llm: LLMProvider, unit: MemoryUnit, att
     the LLM being up).
     """
     try:
-        allow_clarification = unit.clarification_round < MAX_CLARIFICATION_ROUNDS
-        semantic = await enrich(
-            llm, unit.authoritative_content, unit.clarifications, allow_clarification=allow_clarification
-        )
+        semantic = await enrich(llm, unit.authoritative_content, unit.clarifications)
         unit.semantic = semantic
-
-        if semantic.get("clarification_question") and allow_clarification:
-            unit.pending_clarification = {
-                "question": semantic["clarification_question"],
-                "field": semantic.get("clarification_field") or "clarification",
-                "round": unit.clarification_round,
-            }
-        else:
-            unit.pending_clarification = None
-
         unit.retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
         unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
 
@@ -115,11 +107,51 @@ async def _enrich_and_index(db: Session, llm: LLMProvider, unit: MemoryUnit, att
         except LLMError:
             logger.warning("Embedding failed for unit %s; leaving unindexed for vector search", unit.id)
 
-        unit.status = "awaiting_clarification" if unit.pending_clarification else "ready"
+        unit.status = "ready"
     except Exception:
         logger.exception("Unexpected failure enriching unit %s", unit.id)
         unit.status = "failed"
     db.commit()
+
+
+async def _advance_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, attachment_text: str) -> None:
+    """The single entry point for "what happens to this unit next",
+    called after a fresh draft, after a clarification answer, or on
+    retry. Drains any already-generated candidate questions first (fast
+    -- no LLM call); only once the queue is empty does it decide whether
+    another bounded round of clarify.generate_questions() is warranted
+    (the *iterative* part: an answer can reveal new ambiguity worth a
+    fresh question) or whether to run full enrichment and finish.
+
+    This ordering is the whole point of the clarification/enrichment
+    split (see docs/DECISIONS.md): a unit reaches "awaiting_clarification"
+    -- and the user sees a question -- after one narrow, fast LLM call,
+    never after the slower full-enrichment call.
+    """
+    if unit.clarification_queue:
+        next_question, *rest = unit.clarification_queue
+        unit.pending_clarification = {**next_question, "round": unit.clarification_round}
+        unit.clarification_queue = rest
+        unit.status = "awaiting_clarification"
+        db.commit()
+        return
+
+    if unit.clarification_round < MAX_CLARIFICATION_ROUNDS:
+        questions = await generate_questions(
+            llm, unit.authoritative_content, unit.clarifications, max_questions=MAX_QUESTIONS_PER_ROUND
+        )
+        if questions:
+            # Only a round that actually surfaces a question counts --
+            # an ordinary unit that never needed clarification keeps
+            # clarification_round at 0 forever, not "1 check used up".
+            unit.clarification_round += 1
+            unit.pending_clarification = {**questions[0], "round": unit.clarification_round}
+            unit.clarification_queue = questions[1:]
+            unit.status = "awaiting_clarification"
+            db.commit()
+            return
+
+    await _run_full_enrichment(db, llm, unit, attachment_text)
 
 
 async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: list[tuple[str, bytes]]) -> Capture:
@@ -164,7 +196,7 @@ async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: l
 
     attachment_text = _attachment_text_for(capture)
     for unit in units:
-        await _enrich_and_index(db, llm, unit, attachment_text)
+        await _advance_unit(db, llm, unit, attachment_text)
 
     db.refresh(capture)
     return capture
@@ -185,10 +217,13 @@ async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit,
         "created_at": dt.datetime.now(dt.UTC).isoformat(),
     }]
     unit.clarifications = clarifications
-    unit.clarification_round += 1
     unit.pending_clarification = None
+    # clarification_round itself advances in _advance_unit(), only when a
+    # *new* round of questions is actually generated -- not here, so that
+    # every question drained from the same batch's queue keeps the round
+    # number it was asked under.
 
-    await _enrich_and_index(db, llm, unit, _attachment_text_for(unit.capture))
+    await _advance_unit(db, llm, unit, _attachment_text_for(unit.capture))
     db.refresh(unit)
     return unit
 
@@ -220,7 +255,11 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
     unit.clarifications = clarifications
     unit.pending_clarification = None
 
-    await _enrich_and_index(db, llm, unit, _attachment_text_for(unit.capture))
+    # Straight to full enrichment, bypassing _advance_unit()'s clarification
+    # check entirely -- a correction is the user proactively fixing
+    # something, not grounds for the system to open a new round of its
+    # own questions.
+    await _run_full_enrichment(db, llm, unit, _attachment_text_for(unit.capture))
     db.refresh(unit)
     return unit
 
@@ -228,8 +267,10 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
 async def retry_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit) -> MemoryUnit:
     """Retry derived processing for a unit stuck in draft/failed (e.g. the
     LLM was down during ingestion). authoritative_content/clarifications
-    are untouched; only the derived half re-runs."""
-    await _enrich_and_index(db, llm, unit, _attachment_text_for(unit.capture))
+    are untouched; resumes from wherever it got stuck -- _advance_unit()
+    drains any already-generated queue, otherwise re-evaluates from the
+    current clarification_round."""
+    await _advance_unit(db, llm, unit, _attachment_text_for(unit.capture))
     db.refresh(unit)
     return unit
 

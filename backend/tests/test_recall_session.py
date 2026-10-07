@@ -74,8 +74,6 @@ async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
                 "definitions": [],
                 "relations": [],
                 "event_date": "",
-                "clarification_question": "",
-                "clarification_field": "",
             },
             {
                 "meaning": "Markus recommended a book",
@@ -87,8 +85,6 @@ async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
                 "definitions": [],
                 "relations": [],
                 "event_date": "",
-                "clarification_question": "",
-                "clarification_field": "",
             },
         ]
     )

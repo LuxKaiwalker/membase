@@ -69,6 +69,12 @@ class MemoryUnit(Base):
     # --- pipeline state (see app/ingestion/pipeline.py) ---
     status: Mapped[str] = mapped_column(Text, nullable=False, default="draft")
     pending_clarification: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Candidate questions from the current clarification round not yet
+    # asked -- drained one at a time into pending_clarification as each is
+    # answered (app/ingestion/clarify.py generates up to several at once;
+    # the API/UI contract still only ever shows one at a time). Internal
+    # bookkeeping only, not exposed via MemoryUnitOut.
+    clarification_queue: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     clarification_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # --- derived (LLM-derived semantic representation; regenerable) ---

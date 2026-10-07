@@ -6,26 +6,14 @@ from app.llm.base import LLMError, LLMProvider
 _SYSTEM = (
     "You derive a semantic representation of a personal memory, meant to "
     "make it recoverable later via different wording than the original "
-    "(synonyms, aliases, indirect descriptions).\n\n"
-    "From the memory text (and any clarifications already given), extract:\n"
-    "- meaning, aliases, people, organizations, locations, topics, "
-    "definitions, relations, event_date (see schema).\n"
-    "- clarification_question / clarification_field: ask when the text "
-    "contains a term/abbreviation/name you are NOT actually certain of the "
-    "meaning of, and no clarification has resolved it yet. A wrong guessed "
-    "definition is worse than asking.\n\n"
-    "Example where clarification IS needed (an invented/unfamiliar term, "
-    'not a real known abbreviation):\nText: "My Zorblex code is 42."\n'
-    '-> clarification_question: "What is a Zorblex code?", '
-    'clarification_field: "Zorblex code"\n'
-    '(aliases/definitions for "Zorblex code" stay empty/unknown until '
-    "answered -- do not invent a definition)\n\n"
-    "Example where clarification is NOT needed (ordinary text, nothing "
-    'uncertain):\nText: "I had lunch today."\n'
-    '-> clarification_question: "", clarification_field: ""\n\n'
-    'Leave clarification_question/_field "" whenever nothing qualifies -- '
-    "most memories need no clarification. Be terse. Use \"\" or [] for "
-    "anything not clearly stated or inferable."
+    "(synonyms, aliases, indirect descriptions). Clarification questions "
+    "are handled by a separate pass before this one runs -- do not ask "
+    "anything here, only extract.\n\n"
+    "From the memory text (and any clarifications already given), extract "
+    "meaning, aliases, people, organizations, locations, topics, "
+    "definitions, relations, event_date (see schema). Use \"\" or [] for "
+    "anything not clearly stated or inferable -- never guess a definition "
+    "you're not confident of."
 )
 
 _SCHEMA = {
@@ -58,8 +46,6 @@ _SCHEMA = {
             },
         },
         "event_date": {"type": "string"},
-        "clarification_question": {"type": "string"},
-        "clarification_field": {"type": "string"},
     },
     "required": [
         "meaning",
@@ -71,8 +57,6 @@ _SCHEMA = {
         "definitions",
         "relations",
         "event_date",
-        "clarification_question",
-        "clarification_field",
     ],
 }
 
@@ -98,8 +82,6 @@ class Semantics(TypedDict):
     definitions: list[Definition]
     relations: list[Relation]
     event_date: str
-    clarification_question: str
-    clarification_field: str
     enrichment_status: str  # "ok" | "unavailable", not part of the LLM schema
 
 
@@ -114,8 +96,6 @@ def _empty_semantics(status: str) -> Semantics:
         definitions=[],
         relations=[],
         event_date="",
-        clarification_question="",
-        clarification_field="",
         enrichment_status=status,
     )
 
@@ -170,15 +150,15 @@ async def enrich(
     content: str,
     clarifications: list[dict],
     *,
-    allow_clarification: bool,
     now: dt.datetime | None = None,
 ) -> Semantics:
     """Best-effort semantic enrichment. Never raises: a unit must remain
     valid (authoritative_content + whatever enrichment already existed)
     even if the LLM is down -- see app/ingestion/pipeline.py.
 
-    `allow_clarification=False` discards any clarification question the
-    model proposes (used once MAX_CLARIFICATION_ROUNDS is reached).
+    Deliberately does not decide clarification questions -- that's
+    app/ingestion/clarify.py, run and fully resolved before this is ever
+    called (see docs/DECISIONS.md for why these are two separate calls).
     """
     today = (now or dt.datetime.now(dt.UTC)).date().isoformat()
     clar_block = _format_clarifications(clarifications)
@@ -188,9 +168,6 @@ async def enrich(
         raw = await llm.generate_structured(prompt, schema=_SCHEMA, system=_SYSTEM)
     except LLMError:
         return _empty_semantics("unavailable")
-
-    question = _as_str(raw.get("clarification_question")) if allow_clarification else ""
-    field = _as_str(raw.get("clarification_field")) if allow_clarification else ""
 
     return Semantics(
         meaning=_as_str(raw.get("meaning")),
@@ -202,8 +179,6 @@ async def enrich(
         definitions=_as_definitions(raw.get("definitions")),
         relations=_as_relations(raw.get("relations")),
         event_date=_as_str(raw.get("event_date")),
-        clarification_question=question,
-        clarification_field=field,
         enrichment_status="ok",
     )
 

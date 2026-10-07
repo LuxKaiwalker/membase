@@ -34,8 +34,6 @@ async def test_correction_updates_semantic_representation(db):
                 "definitions": [],
                 "relations": [],
                 "event_date": "",
-                "clarification_question": "",
-                "clarification_field": "",
             },
             {
                 "meaning": "The user's bike lock PIN is 42.",
@@ -47,8 +45,6 @@ async def test_correction_updates_semantic_representation(db):
                 "definitions": [],
                 "relations": [],
                 "event_date": "",
-                "clarification_question": "",
-                "clarification_field": "",
             },
         ]
     )
