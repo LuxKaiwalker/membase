@@ -8,7 +8,9 @@ from tests.fakes import FakeLLMProvider
 @pytest.fixture()
 def db():
     session = get_sessionmaker()()
-    session.execute(sql_text("TRUNCATE captures, memory_units, attachments, attachment_chunks"))
+    session.execute(
+        sql_text("TRUNCATE captures, memory_units, attachments, attachment_chunks, recall_sessions")
+    )
     session.commit()
     yield session
     session.close()

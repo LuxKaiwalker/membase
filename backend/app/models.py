@@ -163,3 +163,69 @@ class AttachmentChunk(Base):
     )
 
     attachment: Mapped[Attachment] = relationship(back_populates="chunks")
+
+
+class RecallSession(Base):
+    """Retrieval-as-a-process state (see docs/ARCHITECTURE.md "Iterative
+    recall"). A user's recall query is the start of retrieval, not a
+    single stateless request: the session accumulates user-provided cues
+    and agent search hypotheses across possibly several rounds before
+    producing a grounded answer (or giving up explicitly).
+
+    This is reasoning/session state, NOT memory. Nothing stored here
+    (`cues`, `hypotheses`, `messages`) is ever written into `Capture` or
+    `MemoryUnit` by this system -- the only way a fact discussed during
+    recall becomes a durable memory is the user separately using the
+    ordinary capture-creation flow. `final_sources`/`final_chunk_sources`
+    are a snapshot of already-durable evidence (unit/chunk ids + the
+    content as of answer time), not new data.
+
+    Persisted in Postgres -- the app's only state store (see
+    docs/DECISIONS.md) -- so an in-progress multi-turn recall survives an
+    application restart, same durability guarantee as everything else.
+    """
+
+    __tablename__ = "recall_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    original_query: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # active | needs_user_cue | success | exhausted | cancelled | error
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    current_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Conversation transcript: [{role: "user"|"system", text, created_at}].
+    messages: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # User-provided retrieval cues, accumulated across rounds:
+    # [{text, confidence: certain|likely|uncertain, polarity: positive|negative, round, created_at}].
+    # Search signal only -- never passed into answer-generation evidence.
+    cues: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Agent-proposed search reformulations, kept visible for transparency
+    # (spec: hypotheses must never be promoted to fact):
+    # [{text, round, created_at}].
+    hypotheses: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Union of every query string searched so far this session (original +
+    # cues + reformulations), used only to avoid re-proposing an identical
+    # reformulation -- never to skip re-searching the original query/cues.
+    tried_queries: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Discriminating questions already asked, so the heuristic never repeats one.
+    asked_questions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    round_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Candidate count found in the most recent round, for a lightweight
+    # "I found N related memories" progress indicator (no internal
+    # reasoning/scores exposed).
+    last_candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Snapshots (not live references) of the evidence a successful answer
+    # was grounded in: [{id, capture_id, content, semantic, created_at,
+    # vector_score, fts_score, fused_score}] / chunk equivalent.
+    final_sources: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    final_chunk_sources: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
