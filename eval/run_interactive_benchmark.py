@@ -38,7 +38,7 @@ from app.ingestion.pipeline import create_capture  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
 from app.llm.base import LLMProvider  # noqa: E402
 from app.retrieval.agent import automatic_search, run_agent  # noqa: E402
-from app.retrieval.discriminate import _ATTRIBUTE_TEMPLATES, apply_positive_cue_boost  # noqa: E402
+from app.retrieval.discriminate import _ATTRIBUTE_TEMPLATES, apply_positive_cue_boost, values_for_field  # noqa: E402
 from app.retrieval.pipeline import (  # noqa: E402
     ABSTENTION_MESSAGE,
     TOP_K_FOR_ANSWER,
@@ -73,9 +73,12 @@ def simulate_reply(question: str, ground_truth_semantic: dict) -> str:
         if not m:
             continue
         value = m.group("value")
-        raw = ground_truth_semantic.get(field)
-        truth_values = [raw] if field == "event_date" else (raw or [])
-        truth_values = [v.lower() for v in truth_values if isinstance(v, str)]
+        # Same extraction discriminate.py's own functions use (handles
+        # relations/definitions' nested shape, not just flat string
+        # lists) -- duplicating this logic here previously caused the
+        # oracle to answer "no" for any relations/definitions-sourced
+        # question regardless of the true answer.
+        truth_values = [v.lower() for v in values_for_field(ground_truth_semantic, field)]
         if value.strip().lower() in truth_values:
             return f"Yes, that's right -- it was about {value}."
         return f"No, that's not it. It had nothing to do with {value}."

@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.db import get_sessionmaker  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
-from app.retrieval.discriminate import apply_negative_cues  # noqa: E402
+from app.retrieval.discriminate import _CUE_MATCH_FIELDS, apply_negative_cues, values_for_field  # noqa: E402
 from app.retrieval.session import continue_session, start_session  # noqa: E402
 from run_interactive_benchmark import (  # noqa: E402
     MAX_SIMULATED_TURNS,
@@ -66,9 +66,7 @@ async def run_mode_c_traced(db, llm, query: str, ground_truth_semantic: dict, ca
         reply = simulate_reply(question, ground_truth_semantic)
         matched_truth = None
         if field is not None:
-            raw = ground_truth_semantic.get(field)
-            truth_values = [raw] if field == "event_date" else (raw or [])
-            truth_values = [v.lower() for v in truth_values if isinstance(v, str)]
+            truth_values = [v.lower() for v in values_for_field(ground_truth_semantic, field)]
             matched_truth = value.strip().lower() in truth_values
 
         session = await continue_session(db, llm, session, reply)
@@ -110,7 +108,12 @@ async def run_mode_c_traced(db, llm, query: str, ground_truth_semantic: dict, ca
 async def field_coverage_case(db, llm, capture_to_memory: dict) -> dict:
     """The Q3/Orion anomaly, captured directly: where does the target
     entity actually live across all semantic fields, vs. which fields
-    apply_negative_cues/apply_positive_cue_boost actually check?"""
+    apply_negative_cues/apply_positive_cue_boost actually check? Field
+    lists come straight from discriminate.py rather than being
+    hand-duplicated here, so this stays accurate if that module's
+    coverage ever changes again (it was exactly this kind of silent
+    drift -- a hardcoded copy of the field list going stale after a fix
+    -- that let the original bug go unnoticed)."""
     from app.models import Capture
 
     orion_id = next(cid for cid, mid in capture_to_memory.items() if mid == "M2")
@@ -118,25 +121,14 @@ async def field_coverage_case(db, llm, capture_to_memory: dict) -> dict:
     unit = capture.units[0]
     semantic = unit.semantic
 
-    negative_fields = ["people", "organizations", "locations", "aliases"]
-    positive_fields = ["people", "organizations", "locations", "aliases", "topics"]
-    unchecked_fields = ["relations", "definitions", "meaning"]
-
-    def _flatten(field):
-        v = semantic.get(field)
-        if field == "relations":
-            return [f"{r['subject']} {r['predicate']} {r['object']}" for r in (v or [])]
-        if field == "definitions":
-            return [d["term"] for d in (v or [])]
-        if field == "meaning":
-            return [v] if v else []
-        return v or []
+    checked_fields = list(_CUE_MATCH_FIELDS)
+    unchecked_fields = ["meaning"]  # free text, never matched against by design
 
     target = "orion"
-    all_fields = negative_fields + ["topics"] + unchecked_fields
+    all_fields = checked_fields + unchecked_fields
     presence = {}
     for f in all_fields:
-        values = _flatten(f)
+        values = values_for_field(semantic, f) if f != "meaning" else ([semantic["meaning"]] if semantic.get("meaning") else [])
         presence[f] = {
             "values": values,
             "contains_target": any(target in str(v).lower() for v in values),
@@ -146,8 +138,8 @@ async def field_coverage_case(db, llm, capture_to_memory: dict) -> dict:
         "memory_id": "M2",
         "text": capture.raw_text,
         "target_value": "Orion",
-        "checked_by_negative_cues": negative_fields,
-        "checked_by_positive_boost": positive_fields,
+        "checked_by_negative_cues": checked_fields,
+        "checked_by_positive_boost": checked_fields,
         "never_checked": unchecked_fields,
         "field_presence": presence,
     }
