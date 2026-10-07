@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import text as sql_text
 
 from app.config import get_settings
+from tests.helpers import create_capture_and_finish
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -49,9 +50,7 @@ def _run_reembed(*args: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.asyncio
 async def test_reembed_backfills_a_null_embedding(db, fake_llm):
-    from app.ingestion.pipeline import create_capture
-
-    capture = await create_capture(db, fake_llm, text="A memory to test backfill.", uploads=[])
+    capture = await create_capture_and_finish(db, fake_llm, text="A memory to test backfill.")
     unit = capture.units[0]
     assert unit.status == "ready", "test assumes no clarification fired for this fake"
 
@@ -76,9 +75,7 @@ async def test_reembed_backfills_a_null_embedding(db, fake_llm):
 
 @pytest.mark.asyncio
 async def test_reembed_is_idempotent_on_second_run(db, fake_llm):
-    from app.ingestion.pipeline import create_capture
-
-    await create_capture(db, fake_llm, text="Another memory.", uploads=[])
+    await create_capture_and_finish(db, fake_llm, text="Another memory.")
 
     first = _run_reembed()
     assert first.returncode == 0, first.stderr

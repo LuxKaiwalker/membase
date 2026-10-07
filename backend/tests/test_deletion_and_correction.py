@@ -3,6 +3,7 @@ import pytest
 from app.ingestion.pipeline import correct_unit, create_capture, delete_capture
 from app.models import Capture
 from tests.fakes import FakeLLMProvider
+from tests.helpers import create_capture_and_finish
 
 
 @pytest.mark.asyncio
@@ -54,7 +55,7 @@ async def test_correction_updates_semantic_representation(db):
     }
 
     llm = FakeLLMProvider(enrichment_response=gym_semantics)
-    capture = await create_capture(db, llm, text="My code is 42.", uploads=[])
+    capture = await create_capture_and_finish(db, llm, text="My code is 42.")
     unit = capture.units[0]
     assert unit.semantic["aliases"] == ["gym locker combination"]
 

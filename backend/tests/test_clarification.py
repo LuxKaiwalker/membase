@@ -3,6 +3,7 @@ import pytest
 from app.ingestion.pipeline import MAX_CLARIFICATION_ROUNDS, create_capture, resolve_clarification
 from app.retrieval.pipeline import hybrid_search
 from tests.fakes import FakeLLMProvider
+from tests.helpers import resolve_clarification_and_finish
 
 _ZORBLEX_QUESTION = {
     "questions": [{"question": "What is a Zorblex code?", "field": "Zorblex code", "relevance": "high"}]
@@ -51,7 +52,7 @@ async def test_clarification_answer_is_persisted(db):
     # a question is pending -- see docs/DECISIONS.md.
     assert unit.embedding is None
 
-    unit = await resolve_clarification(db, llm, unit, "It's my gym locker combination.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
 
     assert unit.pending_clarification is None
     assert len(unit.clarifications) == 1
@@ -79,7 +80,7 @@ async def test_clarification_rounds_are_bounded(db):
     for expected_round in range(1, MAX_CLARIFICATION_ROUNDS + 1):
         assert unit.pending_clarification is not None, f"expected a question in round {expected_round}"
         assert unit.clarification_round == expected_round
-        unit = await resolve_clarification(db, llm, unit, "An answer.")
+        unit = await resolve_clarification_and_finish(db, llm, unit, "An answer.")
 
     # Round limit reached: even though the model still wants to ask,
     # the question must not be surfaced again -- enrichment runs instead.
@@ -107,14 +108,14 @@ async def test_multiple_questions_in_one_round_asked_in_sequence(db):
     assert unit.clarification_queue == [{"question": "Which gym is this?", "field": "gym"}]
     calls_after_first_round = llm.calls.count("questions")
 
-    unit = await resolve_clarification(db, llm, unit, "It's my gym locker combination.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
     # Second question drained from the queue -- no new "questions" call yet.
     assert unit.pending_clarification == {"question": "Which gym is this?", "field": "gym", "round": 1}
     assert unit.clarification_queue == []
     assert unit.status == "awaiting_clarification"
     assert llm.calls.count("questions") == calls_after_first_round
 
-    unit = await resolve_clarification(db, llm, unit, "Downtown gym.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "Downtown gym.")
     assert unit.pending_clarification is None
     assert len(unit.clarifications) == 2
     assert unit.status == "ready"
@@ -137,12 +138,12 @@ async def test_answer_can_trigger_a_new_round_of_questions(db):
     unit = capture.units[0]
     assert unit.clarification_round == 1
 
-    unit = await resolve_clarification(db, llm, unit, "It's my gym locker combination.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
     assert unit.pending_clarification == {"question": "Which gym is this?", "field": "gym", "round": 2}
     assert unit.clarification_round == 2
     assert unit.status == "awaiting_clarification"
 
-    unit = await resolve_clarification(db, llm, unit, "Downtown gym.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "Downtown gym.")
     assert unit.pending_clarification is None
     assert unit.status == "ready"
     assert len(unit.clarifications) == 2
@@ -162,7 +163,7 @@ async def test_retrieval_succeeds_via_clarification_derived_alias(db):
         enrichment_response=_GYM_SEMANTICS,
     )
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
-    unit = await resolve_clarification(db, llm, capture.units[0], "It's my gym locker combination.")
+    unit = await resolve_clarification_and_finish(db, llm, capture.units[0], "It's my gym locker combination.")
     assert unit.status == "ready"
 
     scored = await hybrid_search(db, llm, "gym locker combination")

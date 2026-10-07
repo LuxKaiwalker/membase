@@ -1,9 +1,10 @@
 import pytest
 
-from app.ingestion.pipeline import create_capture, discard_unit, resolve_clarification
+from app.ingestion.pipeline import create_capture, discard_unit
 from app.models import MemoryUnit
 from app.retrieval.pipeline import hybrid_search
 from tests.fakes import FakeLLMProvider
+from tests.helpers import resolve_clarification_and_finish
 
 _ASKS_QUESTION = {
     "questions": [{"question": "What is a Zorblex code?", "field": "Zorblex code", "relevance": "high"}]
@@ -68,7 +69,7 @@ async def test_clarifying_transitions_from_gated_to_searchable(db):
     unit = capture.units[0]
     assert (await hybrid_search(db, llm, "Zorblex code")) == []
 
-    unit = await resolve_clarification(db, llm, unit, "It's my gym locker combination.")
+    unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
     assert unit.status == "ready"
     scored = await hybrid_search(db, llm, "Zorblex code")
     assert scored and scored[0].unit.id == unit.id

@@ -2,11 +2,12 @@ import pytest
 
 from app.ingestion.pipeline import IngestionError, create_capture
 from app.models import Capture
+from tests.helpers import create_capture_and_finish
 
 
 @pytest.mark.asyncio
 async def test_create_capture_persists(db, fake_llm):
-    capture = await create_capture(db, fake_llm, text="Test memory", uploads=[])
+    capture = await create_capture_and_finish(db, fake_llm, text="Test memory")
     assert capture.id is not None
     assert len(capture.units) == 1
     assert capture.units[0].authoritative_content == "Test memory"
@@ -28,7 +29,7 @@ async def test_create_capture_rejects_empty_text(db, fake_llm):
 
 @pytest.mark.asyncio
 async def test_attachment_persists_on_capture(db, fake_llm):
-    capture = await create_capture(
+    capture = await create_capture_and_finish(
         db, fake_llm, text="Has an attachment", uploads=[("notes.txt", b"hello world")]
     )
     assert len(capture.attachments) == 1

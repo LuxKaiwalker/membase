@@ -3,14 +3,15 @@ import pytest
 from app.ingestion.pipeline import create_capture
 from app.retrieval.agent import MAX_AGENT_ITERATIONS, run_agent
 from tests.fakes import FakeLLMProvider
+from tests.helpers import create_capture_and_finish
 
 _ABSTENTION = "I don't have a stored memory about this."
 
 
 @pytest.mark.asyncio
 async def test_direct_search_stops_after_one_round_when_sufficient(db, fake_llm):
-    cap_foo = await create_capture(db, fake_llm, text="foo content here", uploads=[])
-    await create_capture(db, fake_llm, text="bar content elsewhere", uploads=[])
+    cap_foo = await create_capture_and_finish(db, fake_llm, text="foo content here")
+    await create_capture_and_finish(db, fake_llm, text="bar content elsewhere")
 
     # Default evaluate_response is sufficient=True immediately, so the
     # agent must never even consider searching for "bar".
@@ -24,8 +25,8 @@ async def test_direct_search_stops_after_one_round_when_sufficient(db, fake_llm)
 
 @pytest.mark.asyncio
 async def test_reformulation_pulls_in_additional_evidence(db, fake_llm):
-    cap_foo = await create_capture(db, fake_llm, text="foo content here", uploads=[])
-    cap_bar = await create_capture(db, fake_llm, text="bar content elsewhere", uploads=[])
+    cap_foo = await create_capture_and_finish(db, fake_llm, text="foo content here")
+    cap_bar = await create_capture_and_finish(db, fake_llm, text="bar content elsewhere")
 
     agent_llm = FakeLLMProvider(
         evaluate_response=[
@@ -43,7 +44,7 @@ async def test_reformulation_pulls_in_additional_evidence(db, fake_llm):
 
 @pytest.mark.asyncio
 async def test_iteration_limit_is_bounded(db, fake_llm):
-    await create_capture(db, fake_llm, text="foo content here", uploads=[])
+    await create_capture_and_finish(db, fake_llm, text="foo content here")
 
     # The model always wants to try one more reformulation; the loop must
     # still terminate at MAX_AGENT_ITERATIONS regardless.
@@ -62,7 +63,7 @@ async def test_iteration_limit_is_bounded(db, fake_llm):
 
 @pytest.mark.asyncio
 async def test_malformed_evaluate_output_degrades_to_best_effort_answer(db, fake_llm):
-    await create_capture(db, fake_llm, text="foo content here", uploads=[])
+    await create_capture_and_finish(db, fake_llm, text="foo content here")
 
     broken = FakeLLMProvider(fail="malformed")
     result = await run_agent(db, broken, "foo")
@@ -74,7 +75,7 @@ async def test_malformed_evaluate_output_degrades_to_best_effort_answer(db, fake
 
 @pytest.mark.asyncio
 async def test_unavailable_llm_degrades_to_fulltext_then_abstains_or_answers(db, fake_llm):
-    await create_capture(db, fake_llm, text="findable by fulltext only", uploads=[])
+    await create_capture_and_finish(db, fake_llm, text="findable by fulltext only")
 
     broken = FakeLLMProvider(fail="unavailable")
     result = await run_agent(db, broken, "findable by fulltext")

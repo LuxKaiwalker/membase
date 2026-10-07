@@ -35,6 +35,7 @@ from app.retrieval.session import (
     start_session,
 )
 from tests.fakes import FakeLLMProvider
+from tests.helpers import create_capture_and_finish
 
 
 def _scored(unit: MemoryUnit, score: float) -> ScoredUnit:
@@ -95,8 +96,8 @@ async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
             "event_date": "",
         }
     )
-    cap_a = await create_capture(db, anna_llm, text="Anna recommended a paper to me.", uploads=[])
-    cap_b = await create_capture(db, markus_llm, text="Markus recommended a book to me.", uploads=[])
+    cap_a = await create_capture_and_finish(db, anna_llm, text="Anna recommended a paper to me.")
+    cap_b = await create_capture_and_finish(db, markus_llm, text="Markus recommended a book to me.")
     return cap_a.units[0], cap_b.units[0]
 
 
