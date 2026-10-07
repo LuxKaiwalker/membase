@@ -328,6 +328,111 @@ cues*, not search quality in general.
 
 ---
 
+**Decision:** Storage-time clarification is split into two separate LLM
+calls -- `app/ingestion/clarify.py:generate_questions()` (fast, narrow:
+only decides whether to ask and about what) runs *first*; full semantic
+enrichment (`app/ingestion/enrichment.py:enrich()`) only runs once no
+clarification question is pending. The combined single-call design from
+the previous phase is gone.
+
+**Reason:** Two problems with asking one combined call to both derive
+the full semantic representation *and* decide on a clarification
+question: (1) the user never sees a question until the whole (larger)
+enrichment schema finishes generating, even though the question is the
+time-sensitive part; (2) if a question *was* needed, that enrichment
+work was wasted anyway, since resolving the clarification re-runs
+enrichment from scratch with the answer as context. Splitting means a
+unit reaches `awaiting_clarification` after one small, fast call, and
+full enrichment runs exactly once, after clarification is fully settled
+-- strictly less wasted LLM work for any unit that ends up needing a
+question, at the cost of one extra fast call for units that don't.
+
+**Alternatives considered:** Keep one combined call but reorder its
+internal reasoning (ask the model to decide clarification "first" within
+the same response) -- rejected because the user still can't see anything
+until the whole response is generated; a single LLM call has no
+meaningful partial-result boundary to exploit without streaming, which
+this project doesn't use.
+
+---
+
+**Decision:** Clarification now supports multiple questions per round
+(`MAX_QUESTIONS_PER_ROUND = 3`, asked one at a time via
+`MemoryUnit.clarification_queue`, never shown as a batch) and multiple
+rounds (`MAX_CLARIFICATION_ROUNDS` raised from 1 to 3) -- an answer that
+reveals new ambiguity can trigger a fresh round of questions, the same
+iterative principle `RecallSession` uses for retrieval-time
+clarification, applied here to storage-time clarification. A round only
+counts against the budget if it actually surfaced a question; a unit
+that never needed clarification stays at `clarification_round = 0`
+indefinitely, not "one check used up".
+
+**Reason:** The old single-question cap meant a unit with two genuinely
+unclear terms could only ever be asked about one of them. Generating
+several candidates at once and ranking them lets the fast question-check
+call surface everything worth asking in one pass, while still asking the
+user one concrete question at a time (never an interrogation-style
+batch, same UX principle as `RecallSession`'s discriminating questions).
+Allowing a follow-up round after an answer closes a real gap: an answer
+can introduce a *new* unclear term the model couldn't have known to ask
+about up front.
+
+**Caveat:** Raising the round/question bounds increases the *number* of
+questions a unit could in principle generate before this was measured
+against real usage -- this is a judgment call, not a calibrated number
+(unlike `VECTOR_SIM_THRESHOLD`, which had a sweep). If real usage shows
+this interrogates users more than it helps, the bounds should come back
+down; see docs/TODO.md.
+
+---
+
+**Decision (open, deliberately not implemented):** Information gained
+during a *retrieval* session (user cues, confirmed facts) should, in
+principle, eventually be promotable into durable memory -- the answer to
+"should this ever happen" is yes. This is **not implemented**: no code
+path exists for it, and none should be added yet.
+
+**Reason:** The retrieval-session architecture itself may still change
+(see the interactive-vs-one-shot benchmark findings below) before it's
+worth designing a promotion mechanism on top of it -- building that now
+risks designing against a shape that doesn't hold. Recorded here
+explicitly per the user's instruction, so the "yes in principle" answer
+isn't lost, without committing to an implementation prematurely. See
+docs/TODO.md for what a future design would need to resolve (what
+exactly gets promoted, in whose words, with what provenance).
+
+---
+
+**Decision:** The default user-facing recall experience reverted to the
+one-shot agent (`run_agent`, `POST /api/recall`); the interactive
+multi-round `RecallSession` code, tests, and API
+(`/api/recall/sessions/*`) all remain in the codebase and fully
+functional, just not wired into the `/recall` page's default UI.
+
+**Reason:** The interactive-retrieval benchmark
+(`eval/interactive_benchmark.yaml`, `eval/run_interactive_benchmark.py`)
+measured the interactive mode *underperforming* both the semantic
+baseline and the one-shot agent overall (44% vs. 61%/67% on an
+18-question, deliberately ambiguous synthetic corpus) -- including
+asking 5 clarifying questions on a direct, one-hop lookup that the other
+two modes answered immediately, the specific failure the spec called
+"crucial" to avoid. Root-caused (not just observed): the discriminating-
+question/cue-boost heuristics only inspect `people`/`organizations`/
+`locations`/`aliases`/`topics`, but an entity name frequently lands in
+`relations` or `definitions` instead, which neither function checks (see
+the trace visualization built from that benchmark run). Shipping the
+underperforming mode as the default wasn't justified by the evidence;
+shipping it at all (rather than deleting it) is, since the root cause is
+specific and fixable, not fundamental to the approach.
+
+**Alternatives considered:** Fix the field-coverage gap first, then
+decide -- rejected for now because the fix needs validating against a
+rerun of the same benchmark before it earns back default status, and
+that's follow-up work, not something to rush ahead of reverting the
+default.
+
+---
+
 **Decision:** `MAX_SESSION_ROUNDS = 12` is a runaway-loop safeguard on a
 `RecallSession`, deliberately much larger than `MAX_AGENT_ITERATIONS = 3`
 (the bounded *automatic* search loop within one round) and not exposed

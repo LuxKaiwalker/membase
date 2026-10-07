@@ -62,12 +62,34 @@
 - **Should there be a UI affordance for browsing/deleting individual
   captures**, not just creating and recalling? The API supports it
   (`GET`/`DELETE /api/captures/{id}`); the web UI doesn't expose it yet.
-- **Should `MAX_CLARIFICATION_ROUNDS` ever be >1?** Bounded to 1
-  deliberately (spec: avoid interrogation); unclear if real usage ever
-  needs a second round, or whether `correct_unit()` (unbounded,
-  user-initiated) already covers that need well enough.
+- **Resolved: `MAX_CLARIFICATION_ROUNDS` is now 3** (was 1), with up to
+  `MAX_QUESTIONS_PER_ROUND = 3` candidate questions surfaced per round
+  (asked one at a time) -- see docs/DECISIONS.md. Still a judgment call,
+  not calibrated against real usage; revisit if it turns out to
+  interrogate users more than it helps.
+- **Should retrieval-session-gained information ever be promotable to
+  durable memory?** Answer in principle: yes (user-confirmed). Not
+  implemented -- deliberately deferred, since the retrieval-session
+  architecture itself may still change (see the interactive-vs-one-shot
+  benchmark finding below) before a promotion mechanism is worth
+  designing. Open: what exactly gets promoted, in whose words, with what
+  provenance.
 
 ## Known technical gaps
+
+- **Interactive recall (`RecallSession`) is not the default UI** --
+  reverted after `eval/run_interactive_benchmark.py` measured it
+  underperforming both the semantic baseline and the one-shot agent
+  overall (see docs/DECISIONS.md). Root cause identified:
+  `apply_negative_cues`/`apply_positive_cue_boost`/
+  `generate_discriminating_question` (`app/retrieval/discriminate.py`)
+  only check `people`/`organizations`/`locations`/`aliases`/`topics` --
+  an entity name that lands in `relations` or `definitions` instead
+  (common for a project/thing name, per the benchmark trace) is invisible
+  to all three. Fixing this and re-running the benchmark is the natural
+  next step before restoring it as the default; code, tests, and the
+  `/api/recall/sessions/*` API are untouched and fully usable in the
+  meantime.
 
 - **Ambiguity detection is sensitive to full-text-search score
   asymmetry.** Observed directly during manual testing: two candidates

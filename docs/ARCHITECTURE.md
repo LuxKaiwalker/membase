@@ -84,12 +84,30 @@ capture text + files
       ├─ COMMIT (phase 1): every unit's authoritative_content durably saved,
       |   status="draft"
       |
-      └─ for each unit: _enrich_and_index() (app/ingestion/pipeline.py)
-            ├─ enrich() (app/ingestion/enrichment.py): LLM structured-output
-            |   call -> meaning, aliases, entities, topics, definitions,
-            |   relations, event_date, optional clarification_question
-            |   (never raises: LLM failure -> unit still persists, just
-            |   with semantic={"enrichment_status": "unavailable"})
+      └─ for each unit: _advance_unit() (app/ingestion/pipeline.py)
+            ├─ generate_questions() (app/ingestion/clarify.py): a fast,
+            |   narrow LLM call asking ONLY "does this need clarification,
+            |   and about what" -- deliberately separate from the heavier
+            |   semantic call below, and runs first, so a unit reaches
+            |   "awaiting_clarification" (and the user sees a question)
+            |   without waiting on full enrichment at all. May return
+            |   several candidate questions at once (bounded,
+            |   MAX_QUESTIONS_PER_ROUND); only the first is shown, the
+            |   rest queue (MemoryUnit.clarification_queue) and drain one
+            |   at a time as each is answered, with no further LLM call.
+            |   If the queue empties and the round budget
+            |   (MAX_CLARIFICATION_ROUNDS) isn't exhausted, answering can
+            |   trigger a fresh round of generate_questions() -- iterative,
+            |   not a single fixed question.
+            ├─ if no question is (or remains) pending: enrich()
+            |   (app/ingestion/enrichment.py), run exactly once, after
+            |   clarification is fully settled rather than before -- doing
+            |   it earlier would be wasted work, since an answer changes
+            |   the semantic representation anyway (see docs/DECISIONS.md).
+            |   LLM structured-output call -> meaning, aliases, entities,
+            |   topics, definitions, relations, event_date (never raises:
+            |   LLM failure -> unit still persists, just with
+            |   semantic={"enrichment_status": "unavailable"})
             ├─ build_retrieval_text(): deterministic (non-LLM) text
             |   combining original + clarifications + meaning + aliases +
             |   definitions + relations (spec section 11)
@@ -107,26 +125,33 @@ persists even if derived processing fails" (spec section 25): the
 authoritative text is committed *before* any LLM call in the derived
 stage runs, in a separate transaction.
 
-If `enrich()` surfaced a `clarification_question`, the unit's status
-becomes `"awaiting_clarification"` instead of `"ready"` -- **gated**: it
-is durably saved (survives a restart) but invisible to recall until
+If `generate_questions()` surfaces a question, the unit's status becomes
+`"awaiting_clarification"` instead of `"ready"` -- **gated**: it is
+durably saved (survives a restart) but invisible to recall until
 answered, because `hybrid_search()` only ever considers
 `status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`)
-appends the verbatim Q&A to `clarifications`, then re-runs the *entire*
-derived stage (enrichment, retrieval_text, searchable_text, embedding)
-with the new clarification as additional context -- this is what makes a
-clarified term's aliases actually searchable afterward, not just present
-in a one-off answer -- and flips status to `"ready"` once no further
-question is open. The user may also explicitly cancel an awaiting unit
-(`POST .../discard`, status becomes `"discarded"`) rather than answer it.
+appends the verbatim Q&A to `clarifications`, then calls `_advance_unit()`
+again: drain the next queued question if one exists, else -- if the round
+budget allows -- check whether the new answer reveals something else
+worth asking about, else run full enrichment (retrieval_text,
+searchable_text, embedding) with every clarification as context -- this
+is what makes a clarified term's aliases actually searchable afterward,
+not just present in a one-off answer -- and flips status to `"ready"`.
+The user may also explicitly cancel an awaiting unit (`POST .../discard`,
+status becomes `"discarded"`) rather than answer it.
 
-Clarification is bounded to `MAX_CLARIFICATION_ROUNDS = 1` per unit
-(`app/ingestion/pipeline.py`) -- after that, further clarification
-questions the model proposes are discarded rather than surfaced. A
+Clarification is bounded on two axes (`app/ingestion/pipeline.py`):
+`MAX_QUESTIONS_PER_ROUND = 3` candidate questions considered per check
+(asked one at a time, never as a batch), and `MAX_CLARIFICATION_ROUNDS =
+3` rounds of checking -- a "round" only counts if it actually surfaced a
+question, so an ordinary unit that never needed clarification stays at
+round 0 forever. After the round budget is exhausted, further questions
+the model proposes are discarded and enrichment proceeds regardless. A
 user-initiated correction (`POST /memory-units/{id}/correct`, spec
-section 30 -- free-text, re-runs the same enrichment mechanism) does
-*not* consume this budget: the bound exists to stop the system from
-interrogating the user, not to limit how often the user can proactively
+section 30 -- free-text, re-runs enrichment directly, bypassing the
+clarification check entirely) does *not* consume this budget: the bound
+exists to stop the system from interrogating the user, not to limit how
+often the user can proactively
 fix something.
 
 ## Segmentation
@@ -355,6 +380,11 @@ memory_units
   status                         text        -- draft | awaiting_clarification
                                                  | ready | failed | discarded
   pending_clarification          jsonb null  -- {question, field, round}
+  clarification_queue            jsonb       -- [{question, field}, ...]
+                                                 not-yet-asked candidates
+                                                 from the current round,
+                                                 internal only (not exposed
+                                                 via MemoryUnitOut)
   clarification_round            int
   semantic                       jsonb       -- meaning, aliases, people,
                                                  organizations, locations,
