@@ -16,6 +16,12 @@ class Chunk:
 
 
 def _split_long_text(text: str, max_chars: int = MAX_CHUNK_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
+    # Not reachable with the module's own constants (max_chars > overlap
+    # always holds there), but the sliding-window math below infinite-loops
+    # for any caller that passes overlap >= max_chars (each step would
+    # advance `start` by zero or backwards) -- fail fast instead.
+    if overlap >= max_chars:
+        raise ValueError(f"overlap ({overlap}) must be less than max_chars ({max_chars})")
     text = text.strip()
     if not text:
         return []

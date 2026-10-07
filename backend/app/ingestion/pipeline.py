@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 MAX_CLARIFICATION_ROUNDS = 3
 MAX_QUESTIONS_PER_ROUND = 3
 
+# Marker delimiting an attachment excerpt appended to a unit's
+# retrieval_text by add_attachment() -- used to strip a stale excerpt
+# before appending a fresh one, so repeated attachment adds don't
+# accumulate duplicate/outdated excerpts.
+_ATTACHMENT_EXCERPT_MARKER = "\n\nAttachment excerpt:\n"
+
 
 class IngestionError(ValueError):
     """Input-validation failure -- caller should turn this into a 4xx."""
@@ -137,9 +143,22 @@ async def _advance_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, attachm
         return
 
     if unit.clarification_round < MAX_CLARIFICATION_ROUNDS:
-        questions = await generate_questions(
-            llm, unit.authoritative_content, unit.clarifications, max_questions=MAX_QUESTIONS_PER_ROUND
-        )
+        try:
+            questions = await generate_questions(
+                llm, unit.authoritative_content, unit.clarifications, max_questions=MAX_QUESTIONS_PER_ROUND
+            )
+        except Exception:
+            # generate_questions() itself never raises (it catches
+            # LLMError internally) -- this is a genuinely unexpected bug,
+            # same class of failure _run_full_enrichment guards against.
+            # Without this, an unexpected exception here would propagate
+            # uncaught, leaving the unit's status wherever it was before
+            # (not "failed"), so retry_enrichment's "draft"/"failed"-only
+            # guard could never recover it.
+            logger.exception("Unexpected failure generating clarification questions for unit %s", unit.id)
+            unit.status = "failed"
+            db.commit()
+            return
         if questions:
             # Only a round that actually surfaces a question counts --
             # an ordinary unit that never needed clarification keeps
@@ -311,8 +330,20 @@ async def add_attachment(db: Session, llm: LLMProvider, capture: Capture, filena
     for unit in capture.units:
         if unit.status != "ready":
             continue
+        # Bug fix: this used to compute an excerpt-augmented text only
+        # for the embed() call below, without ever assigning it back to
+        # unit.retrieval_text -- so the stored embedding reflected the
+        # attachment excerpt but the "text this embedding represents"
+        # column didn't, and a later unrelated re-embed (e.g.
+        # scripts/reembed.py after a model change) would silently
+        # regress the embedding back to not knowing about the
+        # attachment. Strip any previously-appended excerpt before
+        # reappending so repeated attachment adds don't accumulate
+        # stale excerpts from earlier calls.
+        base_retrieval_text = unit.retrieval_text.split(_ATTACHMENT_EXCERPT_MARKER, 1)[0]
         excerpt = attachment_text[:1000]
-        retrieval_text = f"{unit.retrieval_text}\n\nAttachment excerpt:\n{excerpt}" if excerpt else unit.retrieval_text
+        retrieval_text = f"{base_retrieval_text}{_ATTACHMENT_EXCERPT_MARKER}{excerpt}" if excerpt else base_retrieval_text
+        unit.retrieval_text = retrieval_text
         unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
         try:
             embedding = await llm.embed([retrieval_text])

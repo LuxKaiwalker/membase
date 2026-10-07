@@ -149,61 +149,77 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
         if h not in [x["text"] for x in session.hypotheses]:
             session.hypotheses = [*session.hypotheses, {"text": h, "round": session.round_count, "created_at": _now()}]
 
-    negatives = _negative_cue_texts(session)
-    ranked = apply_negative_cues(result.ranked, negatives)
-    ranked = apply_positive_cue_boost(ranked, extra_queries)
-    ranked = sorted(ranked, key=lambda s: s.fused_score, reverse=True)
-    session.last_candidate_count = len(ranked) + len(result.ranked_chunks)
+    # Everything below is pure-Python candidate reasoning plus one more
+    # LLM call (generate_answer, which already degrades LLMError to
+    # grounded=False internally) -- wrapped broadly because an unexpected
+    # bug here must not propagate uncaught: that would leave the session
+    # in a non-terminal status with nothing committed, the same failure
+    # mode the ingestion pipeline's _run_full_enrichment already guards
+    # against (see docs/DECISIONS.md). Degrading to STATUS_ERROR keeps
+    # the session inspectable/retryable instead of a raw 500.
+    try:
+        negatives = _negative_cue_texts(session)
+        ranked = apply_negative_cues(result.ranked, negatives)
+        ranked = apply_positive_cue_boost(ranked, extra_queries)
+        ranked = sorted(ranked, key=lambda s: s.fused_score, reverse=True)
+        session.last_candidate_count = len(ranked) + len(result.ranked_chunks)
 
-    if not ranked and not result.ranked_chunks:
-        _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
-        db.commit()
-        return
+        if not ranked and not result.ranked_chunks:
+            _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
+            db.commit()
+            return
 
-    if is_ambiguous(ranked):
+        if is_ambiguous(ranked):
+            question = generate_discriminating_question(ranked, already_asked=session.asked_questions)
+            if question is not None:
+                session.status = STATUS_NEEDS_USER_CUE
+                session.current_question = question
+                session.asked_questions = [*session.asked_questions, question]
+                _append_message(session, "system", question)
+                db.commit()
+                return
+            # No remaining angle distinguishes the candidates -- fall
+            # through and answer with the best evidence available rather
+            # than loop.
+        else:
+            # A clear winner exists: don't let an unrelated, lower-scoring
+            # group that merely cleared the relevance bar keep cluttering
+            # the answer-generation evidence (spec section 12 governs the
+            # *ambiguous* case; once resolved, there's no decision left
+            # for the answering step to make between groups).
+            ranked = narrow_to_dominant_group(ranked)
+
+        context = sibling_context(db, ranked)
+        answer_text, grounded = await generate_answer(
+            llm, session.original_query, ranked, context, result.ranked_chunks
+        )
+        if grounded:
+            session.final_answer = answer_text
+            session.final_sources = _snapshot_sources(ranked)
+            session.final_chunk_sources = _snapshot_chunk_sources(result.ranked_chunks)
+            _finish(session, STATUS_SUCCESS, answer_text)
+            db.commit()
+            return
+
+        # Candidates exist but don't yet clearly answer the question (and
+        # either aren't ambiguous, or were ambiguous with no fresh angle
+        # left). Ask one more discriminating question if a new angle
+        # exists; otherwise this line of inquiry is genuinely exhausted
+        # (spec section 11: a weak match is not proof retrieval is
+        # impossible, but it isn't grounds to keep asking forever either).
         question = generate_discriminating_question(ranked, already_asked=session.asked_questions)
         if question is not None:
             session.status = STATUS_NEEDS_USER_CUE
             session.current_question = question
             session.asked_questions = [*session.asked_questions, question]
             _append_message(session, "system", question)
-            db.commit()
-            return
-        # No remaining angle distinguishes the candidates -- fall through
-        # and answer with the best evidence available rather than loop.
-    else:
-        # A clear winner exists: don't let an unrelated, lower-scoring
-        # group that merely cleared the relevance bar keep cluttering the
-        # answer-generation evidence (spec section 12 governs the
-        # *ambiguous* case; once resolved, there's no decision left for
-        # the answering step to make between groups).
-        ranked = narrow_to_dominant_group(ranked)
-
-    context = sibling_context(db, ranked)
-    answer_text, grounded = await generate_answer(llm, session.original_query, ranked, context, result.ranked_chunks)
-    if grounded:
-        session.final_answer = answer_text
-        session.final_sources = _snapshot_sources(ranked)
-        session.final_chunk_sources = _snapshot_chunk_sources(result.ranked_chunks)
-        _finish(session, STATUS_SUCCESS, answer_text)
+        else:
+            _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
         db.commit()
-        return
-
-    # Candidates exist but don't yet clearly answer the question (and
-    # either aren't ambiguous, or were ambiguous with no fresh angle
-    # left). Ask one more discriminating question if a new angle exists;
-    # otherwise this line of inquiry is genuinely exhausted (spec section
-    # 11: a weak match is not proof retrieval is impossible, but it isn't
-    # grounds to keep asking forever either).
-    question = generate_discriminating_question(ranked, already_asked=session.asked_questions)
-    if question is not None:
-        session.status = STATUS_NEEDS_USER_CUE
-        session.current_question = question
-        session.asked_questions = [*session.asked_questions, question]
-        _append_message(session, "system", question)
-    else:
-        _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
-    db.commit()
+    except Exception:
+        logger.exception("RecallSession %s: unexpected failure deciding round outcome", session.id)
+        _finish(session, STATUS_ERROR, "Something went wrong while searching. Please try again.")
+        db.commit()
 
 
 async def start_session(db: Session, llm: LLMProvider, query: str) -> RecallSession:

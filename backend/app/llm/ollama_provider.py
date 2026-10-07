@@ -40,10 +40,19 @@ class OllamaProvider(LLMProvider):
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             resp = await self._client.post(path, json=payload)
-        except httpx.ConnectError as exc:
-            raise LLMUnavailableError(f"Could not reach Ollama at {self._host}") from exc
         except httpx.TimeoutException as exc:
             raise LLMTimeoutError(f"Ollama timed out calling {path}") from exc
+        except httpx.TransportError as exc:
+            # Catches ConnectError plus everything else at the transport
+            # level (connection reset mid-response, protocol errors, ...)
+            # -- a bare `except httpx.ConnectError` here previously let
+            # other real failure modes (e.g. Ollama crashing/restarting
+            # mid-generation) propagate as a raw, unhandled httpx
+            # exception instead of the LLMError the rest of the app
+            # expects to always be able to catch (see LLMError's
+            # docstring in app/llm/base.py). TimeoutException is itself a
+            # TransportError subclass, so it's caught above, first.
+            raise LLMUnavailableError(f"Could not reach Ollama at {self._host}: {exc}") from exc
 
         if resp.status_code != 200:
             raise LLMUnavailableError(
