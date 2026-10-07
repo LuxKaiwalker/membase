@@ -65,6 +65,26 @@ async def test_clarification_answer_is_persisted(db):
 
 
 @pytest.mark.asyncio
+async def test_blank_clarification_answer_skips_without_recording(db):
+    """Answering is optional (soft-guarded client-side only, see
+    docs/DECISIONS.md) -- a blank/omitted answer must still unblock the
+    unit, but must not fabricate a clarification entry for an answer the
+    user never actually gave."""
+    llm = FakeLLMProvider(
+        question_response=[_ZORBLEX_QUESTION, _NO_QUESTIONS],
+        enrichment_response=dict(_GYM_SEMANTICS, aliases=[]),
+    )
+    capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
+    unit = capture.units[0]
+
+    unit = await resolve_clarification_and_finish(db, llm, unit, "")
+
+    assert unit.pending_clarification is None
+    assert unit.clarifications == []
+    assert unit.status == "ready"
+
+
+@pytest.mark.asyncio
 async def test_clarification_rounds_are_bounded(db):
     """The model keeps wanting to ask more questions every round, but
     MAX_CLARIFICATION_ROUNDS caps it -- see docs/DECISIONS.md. Each round

@@ -13,6 +13,18 @@
       <a href="/">Remember</a>
       <a href="/recall">Recall</a>
     </nav>
+    <div class="settings">
+      <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" title="Settings">&#9881;</button>
+      <div id="settings-menu" class="settings-menu hidden">
+        <label class="settings-row">
+          <input type="checkbox" id="setting-obligatory-questions" />
+          Follow-up questions are obligatory
+        </label>
+        <p class="muted settings-hint">
+          When off, you can skip a follow-up question without answering it.
+        </p>
+      </div>
+    </div>
   </header>
   <main>
     {% block content %}{% endblock %}

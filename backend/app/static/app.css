@@ -36,6 +36,48 @@ header {
   border-bottom: 1px solid var(--border);
 }
 
+.settings {
+  position: relative;
+  margin-left: auto;
+}
+
+.settings-toggle {
+  margin-top: 0;
+  padding: 0.3rem 0.6rem;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.1rem;
+}
+
+.settings-toggle:hover { color: var(--fg); opacity: 1; }
+
+.settings-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 0.5rem;
+  min-width: 240px;
+  padding: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card-bg);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  z-index: 10;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+  margin: 0;
+}
+
+.settings-hint {
+  margin: 0.5rem 0 0;
+}
+
 .brand { font-weight: 700; }
 
 nav a {

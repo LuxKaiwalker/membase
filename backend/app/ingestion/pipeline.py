@@ -268,21 +268,25 @@ async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: l
     return capture
 
 
-async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit, answer: str) -> MemoryUnit:
-    answer = answer.strip()
-    if not answer:
-        raise IngestionError("clarification answer must not be empty")
+async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit, answer: str | None) -> MemoryUnit:
+    """Answering is optional -- enforced only as a soft client-side guard
+    (see docs/DECISIONS.md "obligatory" setting), never here. A blank/
+    omitted answer skips this question: nothing is added to
+    `clarifications`, exactly as if enrich() never knew it was asked.
+    """
+    answer = (answer or "").strip()
     if unit.pending_clarification is None:
         raise IngestionError("unit has no pending clarification")
 
     pending = unit.pending_clarification
-    clarifications = [*unit.clarifications, {
-        "question": pending["question"],
-        "answer": answer,
-        "round": unit.clarification_round,
-        "created_at": dt.datetime.now(dt.UTC).isoformat(),
-    }]
-    unit.clarifications = clarifications
+    if answer:
+        clarifications = [*unit.clarifications, {
+            "question": pending["question"],
+            "answer": answer,
+            "round": unit.clarification_round,
+            "created_at": dt.datetime.now(dt.UTC).isoformat(),
+        }]
+        unit.clarifications = clarifications
     unit.pending_clarification = None
     # clarification_round itself advances in _advance_unit(), only when a
     # *new* round of questions is actually generated -- not here, so that

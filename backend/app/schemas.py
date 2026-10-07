@@ -38,7 +38,10 @@ class CaptureOut(BaseModel):
 
 
 class ClarifyRequest(BaseModel):
-    answer: str
+    # Answering is optional (see docs/DECISIONS.md "obligatory" setting) --
+    # omitted/blank means "skip this question", enforced only as a soft
+    # client-side guard, not here.
+    answer: str | None = None
 
 
 class CorrectRequest(BaseModel):

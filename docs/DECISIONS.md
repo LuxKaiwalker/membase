@@ -497,3 +497,36 @@ long as it's actually productive). 12 is large enough that no normal
 multi-round recall should ever hit it -- it exists purely so a
 pathological case (e.g. a bug that keeps regenerating "fresh" attribute
 values forever) can't spin forever, not to cap genuine back-and-forth.
+
+---
+
+**Decision:** Answering a storage-time clarification question
+(`POST /memory-units/{id}/clarify`) is optional, enforced only as a
+client-side preference (the "obligatory" toggle in the settings menu,
+`app.js`'s `isObligatory()`/`localStorage`), never on the API itself. A
+blank/omitted `answer` is accepted unconditionally by
+`resolve_clarification()` and treated as "skip this question": nothing
+is appended to `clarifications`, the unit just proceeds through
+`_advance_unit()` exactly as if the question had never surfaced. When
+the setting is "obligatory", the UI sets the answer input's HTML
+`required` attribute and hides "Discard this one" -- obligatory means no
+escape hatch at all (must answer), not just "discard is now the only
+way out" (which was the *old* implicit behavior, when answering was
+unconditionally required).
+
+**Reason:** User-requested. The server-side requirement that an answer
+be non-empty was never load-bearing for anything downstream -- enrich()
+already tolerates a unit with zero clarifications (same code path as
+"no question was ever asked"), so there was no correctness reason to
+keep rejecting a blank answer at the API layer. Making the preference
+purely client-side also means it's just UX, not a data-integrity rule;
+nothing about stored data depends on which mode was active when a
+question was skipped.
+
+**Alternatives considered:** Enforcing "obligatory" server-side too (e.g.
+a user-level setting persisted in Postgres, checked in
+`resolve_clarification()`) -- rejected: this is a single-user localhost
+MVP with no auth/user model to hang a server-side preference off of, and
+the setting has no bearing on data correctness, so adding persistence
+and a new guard clause for it would be solving a problem that doesn't
+exist yet.

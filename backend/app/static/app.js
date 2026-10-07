@@ -19,6 +19,52 @@ const membase = (() => {
     return div.innerHTML;
   }
 
+  // Whether follow-up (clarification) questions must be answered is a
+  // client-side-only preference -- the API always accepts a blank answer
+  // as "skip this question" (see docs/DECISIONS.md), there is no
+  // server-side enforcement to keep in sync with. Defaults to true so
+  // existing behavior (answer required) is unchanged for anyone who
+  // never opens the settings menu.
+  const OBLIGATORY_SETTING_KEY = "membase.obligatoryQuestions";
+
+  function isObligatory() {
+    return localStorage.getItem(OBLIGATORY_SETTING_KEY) !== "0";
+  }
+
+  function setObligatory(value) {
+    localStorage.setItem(OBLIGATORY_SETTING_KEY, value ? "1" : "0");
+  }
+
+  // Present in base.html on every page, so this runs unconditionally --
+  // no per-page init call needed.
+  function initSettingsMenu() {
+    const toggle = document.getElementById("settings-toggle");
+    const menu = document.getElementById("settings-menu");
+    const checkbox = document.getElementById("setting-obligatory-questions");
+    if (!toggle || !menu || !checkbox) return;
+
+    checkbox.checked = isObligatory();
+
+    toggle.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const isHidden = menu.classList.contains("hidden");
+      if (isHidden) show(menu);
+      else hide(menu);
+      toggle.setAttribute("aria-expanded", String(isHidden));
+    });
+
+    document.addEventListener("click", (ev) => {
+      if (!menu.contains(ev.target) && ev.target !== toggle) {
+        hide(menu);
+        toggle.setAttribute("aria-expanded", "false");
+      }
+    });
+
+    checkbox.addEventListener("change", () => setObligatory(checkbox.checked));
+  }
+
+  initSettingsMenu();
+
   // A hung request (e.g. a stuck DB transaction server-side) must never
   // leave the page silently spinning forever with no feedback -- that's
   // indistinguishable from a frozen UI. 420s is sized to the server's own
@@ -124,7 +170,7 @@ const membase = (() => {
         <p class="muted">This memory isn't saved as searchable yet until this is answered.</p>
         <p class="capture-clarification-question"></p>
         <form class="capture-clarification-form">
-          <input class="capture-clarification-answer" type="text" placeholder="Your answer" required />
+          <input class="capture-clarification-answer" type="text" placeholder="Your answer" />
           <button type="submit">Submit answer</button>
           <button type="button" class="capture-clarification-discard">Discard this one</button>
         </form>
@@ -206,6 +252,19 @@ const membase = (() => {
       }
       hide(processingEl);
       clarificationQuestion.textContent = pendingQueue[0].question;
+      // Soft guard only: the API always accepts a blank answer as "skip"
+      // (see docs/DECISIONS.md) -- this toggles the HTML `required`
+      // attribute and the discard button, nothing server-enforced.
+      // Re-read on every question, not just once, so a mid-flight
+      // settings change takes effect on the very next question.
+      const obligatory = isObligatory();
+      clarificationAnswer.required = obligatory;
+      // When questions are obligatory, "Discard this one" is the only
+      // escape hatch from answering; when they're optional, skipping
+      // (submitting blank) already covers that, so the button is
+      // redundant and hidden to keep the choice simple.
+      if (obligatory) hide(clarificationDiscard);
+      else show(clarificationDiscard);
       show(clarificationSection);
     }
 
