@@ -339,10 +339,23 @@ async def retry_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit) -> M
     LLM was down during ingestion). authoritative_content/clarifications
     are untouched; resumes from wherever it got stuck -- _advance_unit()
     drains any already-generated queue, otherwise re-evaluates from the
-    current clarification_round."""
-    await _advance_unit(db, llm, unit, _attachment_text_for(unit.capture))
-    db.refresh(unit)
-    return unit
+    current clarification_round.
+
+    Re-fetches under the same row lock finish_unit_processing() takes,
+    and re-checks status afterward: the API's own status guard (see
+    api/units.py) reads the unit before this call, which is stale if a
+    genuinely-running finish_unit_processing() is holding the lock for
+    the duration of its enrichment. Without this, a retry on a
+    "processing" unit that finishes normally while we're blocked on the
+    lock would stomp the fresh "ready"/"failed" result back to
+    "processing" and schedule a wasted re-run the instant the lock frees.
+    """
+    locked = db.get(MemoryUnit, unit.id, with_for_update=True)
+    if locked.status not in ("draft", "failed", "processing"):
+        return locked
+    await _advance_unit(db, llm, locked, _attachment_text_for(locked.capture))
+    db.refresh(locked)
+    return locked
 
 
 async def add_attachment(db: Session, llm: LLMProvider, capture: Capture, filename: str, data: bytes) -> Capture:

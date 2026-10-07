@@ -44,6 +44,29 @@ async def test_unexpected_enrichment_failure_marks_unit_failed_not_silently_read
 
 
 @pytest.mark.asyncio
+async def test_retry_on_an_already_ready_unit_is_a_noop(db, fake_llm):
+    """Regression for a race the status guard in api/units.py can't see:
+    that guard reads status before calling retry_enrichment(), so it's
+    stale if finish_unit_processing() was still genuinely running and
+    finished in between (it holds a row lock for its whole duration --
+    see finish_unit_processing's with_for_update). Without re-checking
+    status after acquiring that same lock, retry_enrichment would stomp
+    a freshly-"ready" unit back to "processing" and schedule a wasted
+    re-run the moment the lock freed. Simulated here directly (without
+    reproducing the actual lock-timing race) by just calling
+    retry_enrichment on a unit that is already "ready"."""
+    capture = await create_capture_and_finish(db, fake_llm, text="Already finished enrichment.")
+    unit = capture.units[0]
+    assert unit.status == "ready"
+    original_semantic = unit.semantic
+
+    result = await retry_enrichment(db, fake_llm, unit)
+
+    assert result.status == "ready"
+    assert result.semantic == original_semantic
+
+
+@pytest.mark.asyncio
 async def test_capture_and_units_survive_a_fresh_session_lookup(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="Durable across a restart")
     unit_id = capture.units[0].id
