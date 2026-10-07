@@ -80,23 +80,43 @@ also removes its files) — there's no automatic forgetting/expiry.
 
 ## How retrieval works
 
-`POST /api/recall` (or the web form at `/recall`) runs a small bounded
-retrieval agent (`backend/app/retrieval/agent.py`): it searches (hybrid
-vector + full-text over each unit's original text and derived semantic
-representation, *and* over chunked attachment text), decides if that's
-enough to answer, and if not, proposes up to 2 alternative search
-phrasings (bounded to 3 rounds total) before answering. The LLM is
-instructed to answer only from retrieved evidence and to mark the answer
-"grounded" only if it actually addresses the question; if not, the API
-returns the fixed string "I don't have a stored memory about this." and
-no sources — never a fabricated guess.
+Recall is a **session**, not a single request-response round trip: your
+first query may only be a weak or partial recollection, and the system
+is explicitly designed to narrow in on the right memory over several
+turns rather than require you to phrase the perfect query up front.
+
+`POST /api/recall/sessions` (or the web form at `/recall`) starts a
+`RecallSession` (`backend/app/retrieval/session.py`) and runs the first
+round immediately: a bounded search (hybrid vector + full-text over
+each unit's original text and derived semantic representation, *and*
+over chunked attachment text — `backend/app/retrieval/agent.py`'s
+`automatic_search`, ≤3 automatic iterations). If there's a single clear
+answer, it answers right away (`status: "success"`). If several stored
+memories are still plausible, it asks one concrete discriminating
+question (`status: "needs_user_cue"`, e.g. "Did this involve Anna?")
+instead of guessing — answer it (or add any other detail you remember,
+or correct something) via `POST /api/recall/sessions/{id}/messages`,
+and the session searches again with that accumulated context. This can
+repeat for as many rounds as actually useful (`POST .../cancel` to give
+up early); nothing said during this back-and-forth is ever written into
+a memory — see `docs/ARCHITECTURE.md`'s "Iterative recall" section for
+the full state machine and the memory-contamination safeguards.
+
+The LLM is instructed to answer only from retrieved evidence and to
+mark the answer "grounded" only if it actually addresses the question;
+if not, or if nothing is found at all, the session ends
+(`status: "exhausted"`) with the fixed string "I don't have a stored
+memory about this." and no sources — never a fabricated guess. The
+older stateless `POST /api/recall` (one query, one answer, no
+follow-up) still exists for simple direct lookups and the eval harness.
 
 ## Tests & evaluation
 
 ```sh
 pytest -q                      # fast unit tests (fakes) + real-LLM integration tests
 pytest -q -m "not integration" # skip the ones that need Ollama running
-scripts/run-eval.sh            # 30-case hand-written eval set
+scripts/run-eval.sh            # 30-case one-shot hand-written eval set
+scripts/run-session-eval.sh    # iterative-recall eval set (multi-round, ambiguity, correction)
 scripts/sweep-threshold.sh     # retrieval-threshold calibration experiment
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings
 ```

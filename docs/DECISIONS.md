@@ -209,3 +209,134 @@ each real additional systems to host and evaluate; for an MVP at
 dozens-to-hundreds-of-memories scale, a deterministic bounded loop with
 narrow structured LLM decisions gets most of the benefit at a fraction of
 the complexity and failure surface.
+
+---
+
+**Decision:** Recall is a persisted, multi-round `RecallSession`
+(`app/retrieval/session.py`), stored in Postgres as one row per session,
+not in-memory server state and not a new document store.
+
+**Reason:** The project's central premise is that a user's first
+recollection is often a weak, partial cue -- not a wording close enough
+for one search call to land on. A stateless one-shot endpoint has no way
+to ask a clarifying question and incorporate the answer. Postgres is
+already the app's only state store (see the pgvector/FTS decision
+above); a session is architecturally the same kind of thing a
+MemoryUnit's `pending_clarification` already is -- durable process state
+-- so reusing the same database, rather than adding Redis/in-memory
+session state, needed no new infrastructure and gets restart durability
+for free (verified: start a session, kill and restart the dev server,
+`GET /api/recall/sessions/{id}` returns identical state).
+
+**Alternatives considered:** In-memory server-side session dict keyed by
+id -- rejected because it doesn't survive a restart (this project treats
+that as a real property, not an edge case -- see the restart-durability
+bugs already fixed in CLAUDE.md) and would need its own expiry/cleanup
+logic for no benefit over a DB row. A dedicated `recall_messages` table
+(one row per turn) instead of a JSONB `messages` array on the session
+row -- rejected as unnecessary relational structure for data that's
+always read/written as a whole conversation, never queried turn-by-turn
+(same reasoning already applied to `MemoryUnit.clarifications`).
+
+---
+
+**Decision:** A `RecallSession`'s `cues`, `hypotheses`, and `messages`
+are stored *only* on the session row. Nothing in `app/retrieval/
+session.py` or `app/retrieval/cues.py` ever calls `create_capture` or
+writes to `MemoryUnit`/`Capture`.
+
+**Reason:** This is the load-bearing guarantee against an iterative
+retrieval system contaminating the memory store with its own guesses
+(spec section 5/29). An agent hypothesis ("maybe this was about tactile
+sensing") or an uncertain user cue ("maybe Anna") must stay exactly that
+-- search input and session bookkeeping -- never promoted to a stored
+fact just because a recall conversation touched on it. The only
+sanctioned way something discussed during recall becomes a durable
+memory is the user separately using the ordinary `POST /api/captures`
+flow with their own words.
+
+**Open question (deliberately unresolved, see docs/TODO.md):** whether
+the UI should ever offer an explicit "save this as a memory" action
+during recall. Not implemented this phase -- it's a real product
+decision (what exactly gets saved: the cue? the final answer? in whose
+words?) rather than an obvious engineering call, so it's recorded as
+open rather than decided by default.
+
+---
+
+**Decision:** Ambiguity between candidate memories is detected by a
+flat score-margin heuristic over origin-capture groups
+(`is_ambiguous`/`AMBIGUITY_SCORE_MARGIN = 0.15` in `app/retrieval/
+discriminate.py`), not a probabilistic/Bayesian model.
+
+**Reason:** Spec section 13 explicitly permits (and section 14 asks for)
+"a simple heuristic based on candidate attributes... sufficient for the
+MVP" rather than formal active-learning. Two candidates from different
+origin captures (likely different real-world events) whose top fused
+scores are close are treated as a real decision the user should make,
+not something to silently resolve by picking whichever ranked first --
+sibling units of the *same* capture are explicitly not "candidates" for
+this purpose (they're one episode, not competing answers).
+
+**Alternatives considered:** A fixed top-K cutoff ("always show the top
+2 as candidates") -- rejected because it would ask a discriminating
+question even when one memory massively outranks every other
+unit-that-happens-to-share-a-keyword, which is exactly the "don't ask
+when you don't need to" cost the project already treats as real (see
+the clarification-gating risk note in the prior report).
+
+**Caveat (known limitation, see docs/TODO.md):** 0.15 is hand-picked,
+not calibrated via a sweep the way `VECTOR_SIM_THRESHOLD` was -- there
+wasn't yet a large enough multi-round eval set to run that experiment
+against. Empirically, two topically-different candidates can end up with
+a *wider* score gap than two genuinely-plausible ones purely because of
+full-text-search asymmetry (one sentence happens to share more literal
+words with the query than the other, independent of which one is
+actually more plausible) -- observed directly during manual testing of
+this phase; see docs/TODO.md.
+
+---
+
+**Decision:** A confirmed positive cue boosts a candidate's effective
+score by a flat bonus (`apply_positive_cue_boost`,
+`POSITIVE_CUE_BOOST = 0.3`) when the cue text matches that candidate's
+own structured semantic metadata (people/organizations/locations/
+aliases/topics) -- it is not just added as another search query and
+left to the normal hybrid-search fusion to sort out.
+
+**Reason:** Discovered empirically, not anticipated in the original
+design: re-searching with a user's cue as its own short query (e.g. just
+"ETH") frequently produces a *lower* fused score for the correct
+candidate than the original full-sentence query already gave it -- a
+short, low-information query embeds and full-text-ranks differently
+than a full sentence, so merging per-query results via "keep the max
+score seen for this unit across any query tried" never moved the needle
+on disambiguation. Since `generate_discriminating_question` already
+asks about a specific attribute *value* (e.g. "Did this happen at
+ETH?"), a "yes" is structured confirmation of that exact value, not just
+another vague search term -- treating it as a direct metadata match and
+rewarding it accordingly is what actually closes the loop. Verified
+against the real local model: without this, a correct "yes, ETH"
+answer left the session still ambiguous indefinitely; with it, the
+session resolves in the next round.
+
+**Alternatives considered:** Re-weighting the vector/FTS fusion
+coefficients specifically for single-word queries -- rejected as a more
+invasive, harder-to-reason-about change to code shared with ordinary
+one-shot recall, for a problem that's specifically about *confirmed
+cues*, not search quality in general.
+
+---
+
+**Decision:** `MAX_SESSION_ROUNDS = 12` is a runaway-loop safeguard on a
+`RecallSession`, deliberately much larger than `MAX_AGENT_ITERATIONS = 3`
+(the bounded *automatic* search loop within one round) and not exposed
+as a user-facing "you get N questions" limit.
+
+**Reason:** Spec section 10 explicitly distinguishes bounding automatic,
+no-user-interaction iterations (latency/cost-sensitive, needs a small
+bound) from bounding a user-mediated conversation (should continue as
+long as it's actually productive). 12 is large enough that no normal
+multi-round recall should ever hit it -- it exists purely so a
+pathological case (e.g. a bug that keeps regenerating "fresh" attribute
+values forever) can't spin forever, not to cap genuine back-and-forth.

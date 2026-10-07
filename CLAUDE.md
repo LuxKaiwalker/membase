@@ -48,7 +48,8 @@ scripts/dev-db.sh start     # init/start project-local Postgres (port 5544)
 (cd backend && alembic upgrade head)   # first run / after a schema change
 scripts/run-dev.sh          # uvicorn --reload, --app-dir resolved from $MEMBASE_ROOT
 pytest -q                   # fast fakes + real-LLM integration tests
-scripts/run-eval.sh         # 30-case hand-written eval set, isolated DB (membase_eval)
+scripts/run-eval.sh         # 30-case one-shot eval set, isolated DB (membase_eval)
+scripts/run-session-eval.sh # iterative-recall eval set (multi-round/ambiguity), same isolated DB
 scripts/sweep-threshold.sh  # retrieval-threshold calibration experiment, same isolated DB
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings; drop --dry-run to fix
 scripts/dev-db.sh stop
@@ -118,4 +119,15 @@ elsewhere.
   machine (search -> evaluate -> reformulate, max 3 rounds), not a
   general tool-calling framework. Searches both memory units and
   attachment chunks every round. Grounding is enforced in exactly one
-  place in that file.
+  place in that file. `automatic_search()` is this loop extracted for
+  reuse by RecallSession below; `run_agent()` is the one-shot wrapper
+  (legacy `POST /api/recall`, eval harness).
+- **RecallSession** (`app/retrieval/session.py`): recall as a persisted,
+  multi-round process, not one request/response. Accumulates user cues
+  (`certain`/`likely`/`uncertain` × `positive`/`negative`) and agent
+  search hypotheses across rounds; asks one concrete discriminating
+  question (`app/retrieval/discriminate.py`) when several stored
+  memories are still plausible, instead of guessing. Cues/hypotheses
+  live only on the session row -- never written to MemoryUnit/Capture.
+  See docs/ARCHITECTURE.md "Iterative recall" for the full state
+  machine.

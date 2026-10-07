@@ -9,10 +9,14 @@ Browser (Jinja2-rendered HTML + vanilla JS)
 FastAPI app (backend/app)
   ├── api/captures.py   -- POST/GET/DELETE /api/captures/{id}, .../attachments
   ├── api/units.py      -- GET/clarify/correct/discard/retry on /api/memory-units/{id}
-  ├── api/recall.py     -- POST /api/recall
+  ├── api/recall.py     -- POST /api/recall (legacy one-shot);
+  |                        POST/GET /api/recall/sessions[/{id}],
+  |                        POST .../messages, POST .../cancel
   ├── web/routes.py     -- GET /, GET /recall (serves the HTML shell)
   ├── ingestion/        -- segmentation, enrichment, pipeline orchestration
-  ├── retrieval/        -- hybrid search, sibling expansion, answer generation, agent
+  ├── retrieval/        -- hybrid search, sibling expansion, answer
+  |                        generation, one-shot agent, RecallSession
+  |                        controller, cue extraction, ambiguity heuristics
   ├── llm/              -- LLMProvider abstraction + Ollama implementation
   └── models.py / db.py -- SQLAlchemy models, session management
         |
@@ -188,6 +192,127 @@ app/retrieval/agent.py: run_agent()  -- bounded deterministic state machine
       what text the model wrote
 ```
 
+## Iterative recall (RecallSession)
+
+`run_agent()` above answers in one shot: good for a direct/paraphrased
+query, but it has no way to ask the user anything. `app/retrieval/
+session.py`'s `RecallSession` builds the same bounded search primitives
+into a multi-round process, because a user's first recall attempt is
+often just a weak or partial cue, not a wording close enough for one
+`hybrid_search` call to land on. This is the architectural response to
+that: retrieval accumulates evidence and user-provided cues across
+rounds instead of treating every query as isolated.
+
+```
+POST /api/recall/sessions {query}
+  |
+  v
+start_session() -- persists a RecallSession row, then runs one round
+  |
+  v
+_run_round():
+  automatic_search(original_query, extra_queries=<all positive cues so far>)
+    -- the SAME bounded 3-iteration search/evaluate/reformulate loop
+       run_agent() uses (extracted as automatic_search(), shared by
+       both). The original query is *always* re-searched every round
+       (never replaced by a reformulation or a cue) -- the one thing
+       standing between this and the query-drift failure mode (spec
+       section 23).
+  |
+  v
+apply_negative_cues()        -- exclude a candidate the user explicitly
+                                 ruled out ("no, it wasn't Anna") by a
+                                 real metadata match, not a loose
+                                 substring guess
+  |
+  v
+apply_positive_cue_boost()   -- reward a candidate whose own semantic
+                                 metadata (people/orgs/locations/
+                                 aliases/topics) matches a cue the user
+                                 just confirmed. Necessary in practice:
+                                 re-searching with a bare one-or-two-word
+                                 cue as its own query often scores
+                                 *lower* on the fused metric than the
+                                 original full-sentence query already
+                                 did for every candidate (short queries
+                                 embed/rank differently), so merging via
+                                 max-across-queries alone never resolved
+                                 anything in testing -- see
+                                 docs/DECISIONS.md.
+  |
+  v
+is_ambiguous()?  -- two-or-more distinct origin-capture candidates
+                    (not sibling units of the same episode) whose top
+                    scores are within AMBIGUITY_SCORE_MARGIN (0.15)
+  |
+  +-- yes --> generate_discriminating_question()
+  |             picks the semantic attribute (people/locations/orgs/
+  |             topics/event_date) that best bisects the remaining
+  |             candidates, phrased as one concrete question ("Did
+  |             this happen at ETH?"), skipping any question already
+  |             asked this session
+  |             |
+  |             +-- found one  --> status=NEEDS_USER_CUE, ask it, STOP
+  |             +-- none left  --> fall through to answer anyway
+  |
+  +-- no  ---> narrow_to_dominant_group() -- drop the losing group
+               entirely from evidence (spec section 12 governs the
+               *ambiguous* case; once there's a clear winner there's no
+               decision left for answer-generation to make between
+               groups)
+  |
+  v
+generate_answer() (same grounding-enforcement function run_agent() uses)
+  |
+  +-- grounded   --> status=SUCCESS, snapshot sources, STOP
+  +-- ungrounded --> try one more discriminating question (same as
+                      above); if none, status=EXHAUSTED, STOP
+```
+
+`continue_session()` is what a user reply (an answer to the question,
+an unprompted extra recollection, or a correction) turns into: `app/
+retrieval/cues.py:extract_cues()` is a narrow structured-output call
+that pulls out `{text, confidence: certain|likely|uncertain, polarity:
+positive|negative}` cues from the free-text message (explicitly
+instructed to extract *every* concrete detail even if the message also
+answers yes/no -- a reply like "Yes, it was at ETH" must not lose the
+new "ETH" detail just because it also confirmed the question), appends
+them to the session, and runs another round. A **positive** cue, at any
+confidence level, is added to the search queries for every subsequent
+round -- never a hard filter, since an uncertain guess must not
+silently eliminate a candidate (spec section 39). A **negative** cue is
+never searched for; it only feeds `apply_negative_cues`.
+
+A session ends in exactly one of: `success` (grounded answer),
+`exhausted` (nothing found, or ambiguity never resolved and no further
+discriminating angle exists -- `MAX_SESSION_ROUNDS=12` is a runaway-loop
+safeguard, not a UX-facing turn limit; see spec section 10), `cancelled`
+(explicit `POST .../cancel`), or `error` (an LLM/infra failure mid-round).
+`needs_user_cue` and `active` are the only non-terminal statuses;
+`continue_session()`/`cancel_session()` raise `RecallSessionError` on
+any terminal session.
+
+**Memory-contamination safeguard** (spec section 5/29, the reason this
+needed its own data model rather than reusing MemoryUnit): `cues`,
+`hypotheses` (the reformulated queries `evaluate_sufficiency` proposes,
+kept on the session purely for transparency/testability -- spec section
+18), and `messages` all live *only* on the `RecallSession` row. Nothing
+in `app/retrieval/session.py` or `app/retrieval/cues.py` ever calls
+`create_capture` or writes to `MemoryUnit` -- the only way something
+discussed during recall becomes a durable memory is the user separately
+using the ordinary capture-creation flow. `final_sources`/
+`final_chunk_sources` are a snapshot (id + content + scores as of answer
+time), not a live reference, so a later correction or deletion of the
+underlying memory can't retroactively corrupt a past session's record of
+what it answered from.
+
+**Persistence**: one row per session in Postgres (the app's only state
+store already), not in-memory server state -- an in-progress multi-turn
+recall survives an application restart the same way everything else
+does (verified: start a session, restart the dev server, `GET
+/api/recall/sessions/{id}` returns identical state, `POST .../messages`
+continues it to completion).
+
 ## Failure model
 
 Four independent layers of tolerance, from most to least routine:
@@ -261,7 +386,32 @@ attachment_chunks
   embedding                        vector(768) null, HNSW/cosine index
   embedding_model, embedding_dim   text, int null
   created_at
+
+recall_sessions
+  id, original_query
+  status                          text       -- active | needs_user_cue |
+                                                 success | exhausted |
+                                                 cancelled | error
+  current_question                text null
+  messages                        jsonb      -- [{role, text, created_at}]
+  cues                             jsonb      -- [{text, confidence, polarity,
+                                                 round, created_at}]
+  hypotheses                      jsonb      -- [{text, round, created_at}]
+  tried_queries                   jsonb      -- [str, ...]
+  asked_questions                 jsonb      -- [str, ...]
+  round_count, last_candidate_count int
+  final_answer                    text null
+  final_sources, final_chunk_sources jsonb  -- evidence snapshots (id,
+                                                 content, scores as of
+                                                 answer time), not live refs
+  created_at, updated_at
 ```
+
+No foreign key from `recall_sessions` to `memory_units`/`attachment_chunks`:
+`final_sources`/`final_chunk_sources` are self-contained snapshots, so a
+session's record of what it once answered stays intact even if the
+underlying memory is later corrected or deleted (see "Iterative recall"
+above).
 
 Deleting a capture (`DELETE /api/captures/{id}`) cascades through
 `memory_units`, `attachments`, and `attachment_chunks` at the DB level,

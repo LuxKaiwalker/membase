@@ -1,173 +1,250 @@
-# Engineering report: clarification-gating and retrieval-hardening phase
+# Engineering report: iterative recall phase
 
-This supersedes the previous report. Scope: this phase corrected the
-single most important architectural gap identified in review --
-clarification was enriching memories but not gating their visibility --
-and hardened retrieval (attachment chunking, a calibrated threshold,
-deletion, correction) around the memory-unit architecture built in the
-prior phase. Verified against the real local LLM throughout, including
-all 6 of the spec's final acceptance tests.
+This supersedes the previous report. Scope: the previous phase
+corrected clarification-gating and hardened retrieval around the
+memory-unit architecture; this phase's task was different in kind --
+not another correctness gap, but a product-shape change to *how recall
+itself works*. Recall used to be `query -> search -> answer` in one
+HTTP request. It is now a persisted, multi-round `RecallSession`:
+a weak or partial first query can produce a clarifying question instead
+of a guess, the user's reply (an answer, a correction, or an unprompted
+extra detail) becomes a new search cue, and the session searches again
+-- repeating until it succeeds, genuinely runs out of options, or the
+user gives up. Verified against the real local LLM throughout,
+including a full session walked through `curl` against the live server
+across an actual process restart.
 
 ## Current architecture
 
+Ingestion (capture -> segmentation -> enrichment -> clarification gate
+-> embedding/fts) is unchanged from the previous report; see
+docs/ARCHITECTURE.md for the full picture. What's new sits entirely on
+the retrieval side:
+
 ```
-human capture
+user query (possibly just a weak cue)
       v
-one or more memory units (LLM-decided segmentation, verbatim-validated)
+RecallSession created, persisted in Postgres
       v
-semantic enrichment (meaning, aliases, entities, definitions, relations)
+round: automatic_search()            <- same bounded 3-iteration
+      (search -> evaluate ->             search/evaluate/reformulate
+       reformulate, shared with            loop the one-shot agent uses
+       the one-shot agent)
       v
-optional bounded clarification -- GATES recall until resolved/discarded
+apply_negative_cues() / apply_positive_cue_boost()   <- user corrections/
+      |                                                  confirmations
+      v                                                  reshape the
+is_ambiguous()?  (origin-capture groups,                 candidate set
+      |           close top scores)
+      +-- yes, and a question helps --> ASK, stop, wait for reply
+      +-- no / no more questions  ----> narrow_to_dominant_group()
       v
-durable authoritative memory (two-phase commit: text saved before any
-      LLM call in the derived stage runs)
-      v
-derived retrieval representations (retrieval_text, embedding, fts;
-      attachments additionally chunked + independently indexed)
-      v
-hybrid retrieval (vector + full-text, over units AND attachment chunks)
-      v
-bounded local retrieval agent (search -> evaluate -> reformulate, <=3 rounds)
-      v
-grounded answer (hard abstention override in exactly one place)
+generate_answer()  (same grounding-enforcement function as before)
+      |
+      +-- grounded   --> SUCCESS, snapshot evidence, stop
+      +-- ungrounded --> ask one more question, or EXHAUSTED
 ```
 
-User corrections (`POST /memory-units/{id}/correct`) and explicit
-deletion (`DELETE /api/captures/{id}`) are the two sanctioned ways a
-memory changes or disappears after creation; nothing else does either
-automatically.
+A user reply re-enters at "round": `extract_cues()` turns free text into
+structured `{text, confidence, polarity}` cues, appended to the session,
+and another round runs with the full accumulated cue set.
 
-## Architectural changes this phase
+## Retrieval-session design
 
-- **Clarification gate**: `status` gained `awaiting_clarification` and
-  `discarded`. A unit with an open question is durable but excluded from
-  `hybrid_search()`'s `status='ready'` filter until answered or
-  discarded. This reverses the prior phase's "enrich but don't gate"
-  decision -- see docs/DECISIONS.md for why, including why the prior
-  reasoning is kept rather than deleted.
-- **Attachment chunking**: new `attachment_chunks` table, page-based for
-  PDFs, fixed-window+overlap otherwise, each chunk independently
-  full-text and vector indexed. The agent now searches chunks alongside
-  memory units every round; answers can cite a specific attachment +
-  page rather than an undifferentiated excerpt.
-- **Post-hoc attachments now update semantic retrieval**, not just
-  full-text -- a real gap in the prior phase (spec section 28 is explicit
-  about this) fixed by re-embedding affected units from a retrieval_text
-  that includes a fresh attachment excerpt.
-- **Re-embedding/backfill tool** (`scripts/reembed.py`): finds
-  missing/stale-model embeddings across both units and chunks, backfills
-  idempotently, refuses to run if the configured embedding dimension
-  doesn't match the schema's fixed `vector(768)` column.
-- **Deletion and correction**: `DELETE /api/captures/{id}` (cascades DB
-  rows + removes files); `POST /memory-units/{id}/correct` (free-text,
-  reuses the clarification-enrichment mechanism, doesn't consume the
-  bounded clarification-round budget).
-- **Retrieval threshold calibration**: `scripts/sweep-threshold.sh`
-  swept `VECTOR_SIM_THRESHOLD` against the (now 30-case) eval set;
-  confirmed 0.55 as the highest value with 100% recall@10, see
-  docs/DECISIONS.md for the full numbers and caveats.
+`RecallSession` (`backend/app/models.py`) is one row per session:
+`original_query` (immutable -- the one thing that's never overwritten,
+protecting against query drift), `status`, `current_question`,
+`messages` (full transcript), `cues`, `hypotheses`, `tried_queries`,
+`asked_questions`, `round_count`, `last_candidate_count`, and
+`final_answer`/`final_sources`/`final_chunk_sources` (a snapshot, not a
+live reference, so a later correction or deletion of the underlying
+memory can't retroactively change what a past session recorded as its
+answer). No foreign key to `memory_units`/`attachment_chunks` -- the
+snapshot is deliberately self-contained.
 
-## Local LLM setup
+Three categories of information are kept structurally distinct, per the
+spec's data-flow concern about an iterative system contaminating its
+own memory store:
 
-Unchanged from the prior phase: Ollama system service at
-`127.0.0.1:11434`; `qwen2.5:14b-instruct-q4_K_M` for every
-generation/structured-output call; `nomic-embed-text` (768 dims) for
-embeddings. `scripts/model-doctor.sh` verifies both are present and
-working; safe to rerun.
+- **User-provided cues** (`cues`): confidence (`certain`/`likely`/
+  `uncertain`) and polarity (`positive`/`negative`), both tagged by
+  round. A positive cue is always searched, regardless of confidence --
+  confidence affects nothing about whether it's used, only (eventually)
+  how it should be weighed as evidence, which in practice means: it's
+  never treated as a hard filter. A negative cue is never searched; it
+  only excludes a candidate via `apply_negative_cues`.
+- **Retrieved evidence**: the `ScoredUnit`/`ScoredChunk` results from
+  `hybrid_search`/`hybrid_search_chunks` -- real stored content, scored.
+- **System hypotheses** (`hypotheses`): the reformulated queries
+  `evaluate_sufficiency` proposes along the way (itself unchanged from
+  the one-shot agent), kept on the session purely for transparency and
+  testability. Never passed into answer-generation evidence; never
+  becomes a memory.
 
-## Retrieval evaluation
+Two heuristics specific to this phase, both deliberately simple per the
+spec's own instruction not to build a formal active-learning system:
 
-`eval/cases.yaml` grew from 12 to 30 cases, adding categories the spec
-explicitly called out: alias/definition (direct, not just
-clarification-derived), entity-mediated ("what did Anna tell me"),
-ambiguous (two candidates, must ground in a real one rather than
-abstain or conflate), relation (forward and reverse), and more
-no-answer/distractor variants. **30/30 passing.**
+- `is_ambiguous`: candidates from ≥2 distinct origin captures with top
+  fused scores within `AMBIGUITY_SCORE_MARGIN` (0.15) are a real
+  decision, not something to silently resolve by picking whichever
+  ranked first.
+- `generate_discriminating_question`: picks the semantic attribute
+  (person/location/organization/topic/date) that best bisects the
+  remaining candidates and phrases one concrete question about it,
+  skipping anything already asked this session.
 
-`scripts/sweep-threshold.sh` ingested all 30 cases into one shared DB and
-swept `VECTOR_SIM_THRESHOLD` from 0.35 to 0.70:
+One thing discovered only by testing against the real model, not
+anticipated in the initial design: re-searching with a cue as its own
+short query (e.g. just "ETH") often scores *lower* on the fused metric
+than the original full-sentence query already did for every candidate,
+so naively merging per-query results via "keep the max score seen"
+never resolved ambiguity in practice. `apply_positive_cue_boost`
+addresses this directly: a confirmed cue that matches a candidate's own
+semantic metadata (the same metadata the question was generated from)
+gets a flat score bonus. Without it, a correct "yes, ETH" answer left a
+session stuck asking forever; with it, the session resolves in the next
+round -- verified live against the real model, see docs/DECISIONS.md.
 
-| threshold | recall@10 | precision* |
-|---|---|---|
-| 0.35-0.55 | 100% | 13-19% |
-| 0.60 | 96% | 25% |
-| 0.65 | 89% | 33% |
-| 0.70 | 78% | 34% |
+## Agent behavior
 
-*(precision here undercounts -- see docs/DECISIONS.md caveat on
-cross-case contamination in a shared corpus.)* 0.55 kept as the value
-that gives up no measured recall while maximizing precision among
-candidates that don't.
+- **Automatic iterations** (no user involved): `automatic_search()` in
+  `app/retrieval/agent.py`, extracted this phase so both the one-shot
+  agent and every `RecallSession` round share one implementation. Still
+  bounded to `MAX_AGENT_ITERATIONS = 3`, ≤2 reformulations per round --
+  unchanged from the previous phase.
+- **User-mediated iterations**: bounded only by `MAX_SESSION_ROUNDS = 12`
+  -- a runaway-loop safeguard, not a UX-facing turn limit (spec section
+  10 is explicit that these two kinds of bound shouldn't be conflated).
+- **Tools**: still just `hybrid_search`/`hybrid_search_chunks` (spec
+  section 19's minimal surface) -- no new tool was added for this phase;
+  cue extraction and the ambiguity heuristics are code the session
+  controller runs itself, not agent-invokable tools.
+- **Termination conditions**: `success` (grounded answer), `exhausted`
+  (nothing found, or ambiguity never resolved and no discriminating
+  angle remains), `cancelled` (explicit user action), `error` (LLM/infra
+  failure mid-round). `needs_user_cue` and `active` are the only
+  non-terminal statuses.
+- **Safeguards**: grounding enforcement is unchanged -- still exactly
+  one override point, now reached from both `run_agent()` and
+  `_run_round()`, both calling the same `generate_answer()`. Original
+  query never replaced. Repeated-question avoidance via
+  `asked_questions`. Negative cues demote by structured-metadata match,
+  not loose substring guessing.
 
-Representative failure found and fixed during the *previous* phase's
-eval work (not reintroduced here): a coherent-episode segmentation split
-left a dangling pronoun ("she recommended a paper") whose antecedent was
-in a sibling unit; fixed by instructing the answer-generation prompt to
-resolve references using sibling context. No new unfixed failures
-surfaced in this phase's 30-case run.
+## Memory-safety model
+
+`app/retrieval/session.py` and `app/retrieval/cues.py` never call
+`create_capture` and never write to `MemoryUnit`/`Capture` -- there is
+no code path from "something said during a recall conversation" to
+"durable memory" other than the user separately using the ordinary
+`POST /api/captures` flow with their own words. This was verified
+directly, not just by code inspection: `test_recall_session.py` asserts
+`MemoryUnit` row counts are unchanged before/after sessions that
+generate hypotheses, uncertain cues, and negative corrections.
+Storage-time clarification (`MemoryUnit.pending_clarification`, gates
+*searchability* of a memory) and retrieval-time clarification
+(`RecallSession.current_question`, gates *continuing the search*) are
+separate fields on separate models -- answering one never touches the
+other.
+
+## UI
+
+`/recall` is now a lightweight conversation, not a single form: a
+transcript of user/system turns, a reply box that stays open while
+`status` is `needs_user_cue`, a "Give up" button (cancel), and a "Start
+a new recall" button once the session reaches a terminal state. A
+one-line progress indicator ("Found 2 related memories so far...")
+surfaces `last_candidate_count` without exposing any internal
+scores/reasoning. No browser automation tool was available in this
+environment (same limitation noted in the previous report's TODO) --
+validated instead via direct HTTP calls against the live running
+server, including rendering the HTML and walking a full multi-turn
+session through `curl`, across an actual `kill`+restart of the dev
+server to confirm session persistence.
+
+## Evaluation
+
+- **One-shot set** (`eval/cases.yaml`, unchanged, 30 cases): 29/30 on
+  this run. The one failure (`ambiguous_two_rome_trips`) is pre-existing
+  eval-case brittleness unrelated to this phase -- the model's answer
+  ("You ate pasta... Additionally, you enjoyed gelato...") is actually a
+  reasonable grounded merge of both ambiguous Rome trips, it just never
+  echoes the literal word "Rome" that `expect_contains` checks for.
+  `automatic_search`'s logic is byte-for-byte unchanged from the
+  previous phase's `run_agent` (confirmed by the full existing test
+  suite passing before any new code was added), so this is real-LLM
+  phrasing variance, not a regression.
+- **New iterative-recall set** (`eval/session_cases.yaml` +
+  `eval/run_session_eval.py`, run via `scripts/run-session-eval.sh`): 6
+  cases, **6/6 passing**, covering: ambiguous candidates resolved by a
+  location cue, resolved by a negative correction ("no, it wasn't
+  Markus"), an irrelevant cue that must not force a wrong answer, no
+  evidence at all (immediate abstention), an exact-match case answered
+  in one round, and original-query preservation across rounds with no
+  useful new cue.
+- Both sets run against the real configured models
+  (`qwen2.5:14b-instruct-q4_K_M` / `nomic-embed-text`), isolated in the
+  `membase_eval` database.
 
 ## Tests
 
-55 pytest tests (up from 40), all passing: the prior phase's 40 plus new
-coverage for the clarification gate (awaiting-state durability, discard,
-gated->searchable transition), chunking (pagination, plain-text
-splitting, embedding, post-hoc indexing), deletion (DB row + file
-removal), correction (semantic representation actually changes, doesn't
-consume the clarification budget), and the backfill tool (run as a real
-subprocess against a live DB, since it deliberately always uses the real
-configured LLM provider -- marked `integration`, skipped if Ollama is
-unreachable like the other real-model tests).
+66 pytest tests total (up from the previous phase's 55; +11 new), all
+passing: `test_recall_session.py` (session state machine, ambiguity ->
+question -> resolution, negative-cue exclusion, uncertain-cue-as-search-
+signal-not-filter, hypothesis non-contamination, exhaustion, cancel/
+reject-continue, original-query preservation, repeated-question
+avoidance, pure-function tests of the discriminate heuristics, cue-
+extraction degradation on malformed LLM output, restart-durability via
+`db.expire_all()` + re-fetch). The prior phase's 55 tests pass unchanged
+-- `automatic_search`/`evaluate_sufficiency` were extracted, not
+rewritten, and the extraction was verified behavior-preserving against
+the full suite before any new logic was added on top.
 
 ## Remaining limitations
 
-- Segmentation's verbatim check has no linguistic awareness of pronoun/
-  reference chains (see docs/TODO.md) -- mitigated, not eliminated.
-- Clarification triggering is still inconsistent for borderline terms,
-  and now that clarification gates recall, a spurious question has a
-  real UX cost (the memory is invisible until answered/discarded).
-- Chunk size (1200 chars) is untuned against a genuinely large document;
-  the eval set's attachments are all short.
-- Agent worst-case latency roughly doubled (chunks searched alongside
-  units every round) -- not measured under load, only observed to
-  resolve in round 1 for all 30 eval cases in practice.
-- Retrieval threshold calibration used 30 cases in one shared corpus;
-  real per-user data at larger scale could shift the picture.
+- Ambiguity detection (`AMBIGUITY_SCORE_MARGIN = 0.15`) is a hand-picked
+  constant, not calibrated via a sweep the way `VECTOR_SIM_THRESHOLD`
+  was -- there wasn't yet a large enough multi-round eval set. It's also
+  sensitive to full-text-search score asymmetry: two equally-plausible
+  candidates can get different scores purely from literal keyword
+  overlap with the query, independent of actual relevance (see
+  docs/TODO.md).
+- `apply_negative_cues`/`apply_positive_cue_boost` match cue text against
+  structured semantic metadata exactly (case-insensitive), not fuzzily --
+  "Anna" won't match "Annalisa" or a misspelling.
+- Cue extraction's handling of a reply that both answers yes/no *and*
+  adds new information required a prompt fix mid-phase after the real
+  model initially dropped the new detail (see docs/DECISIONS.md/TODO.md)
+  -- now correct in testing, but still model judgment, not a hard
+  guarantee, same caveat as the enrichment clarification-triggering gap
+  already documented.
+- A session round re-searches the original query plus every accumulated
+  positive cue from scratch (by design, to avoid "forgetting" earlier
+  candidates between rounds) -- not measured under load at a large
+  personal-memory-store scale.
+- No way to list/browse past recall sessions; only fetchable by id.
 
-## Deferred work
+## Major open design questions
 
-Multi-turn conversation, autonomous background agents, general
-knowledge-graph storage, memory consolidation/forgetting, multimodal
-understanding, multi-user auth, a trained/learned reranker, a web UI
-for browsing/deleting individual captures (API supports it, UI doesn't
-expose it yet).
-
-## Open product questions
-
-Whether the retrieval threshold should become a relative/adaptive rule
-instead of a fixed scalar as the corpus grows; whether
-`MAX_CLARIFICATION_ROUNDS` should ever exceed 1 given `correct_unit()`
-already offers an unbounded user-initiated path to the same effect. See
-docs/TODO.md for the full list.
-
-## Architectural risks
-
-1. **Clarification gating raises the stakes of a bad question.** Before,
-   a spurious clarification was just noise appended to a log; now it
-   makes a memory temporarily unsearchable. The system's bias toward
-   *not* asking (see enrichment prompt) is doing more load-bearing work
-   than before.
-2. **Chunking + per-round dual search (units + chunks) is the most
-   latency-sensitive part of the system** and the least load-tested --
-   fine at 30 eval cases, unverified at real personal-memory-store scale
-   (hundreds of memories, dozens of attachments).
-3. **Single generation model dependency** (unchanged risk from the prior
-   phase): all judgment quality rests on one 14B local model.
+- **Should a user be able to promote something said during recall into
+  a permanent memory?** Deliberately left open (spec section 46) --
+  not an obvious engineering call (what exactly gets saved, in whose
+  words, with what provenance). Current behavior: nothing from a
+  session is ever saved automatically or via any UI action.
+- **Should recall-session history become searchable memory itself**
+  (e.g. "what did I ask about last week")? Not implemented; sessions are
+  fetchable by id but there's no search/list surface over them.
+- **Should the ambiguity margin and positive-cue-boost constants be
+  probabilistic/learned rather than fixed heuristics** as real usage
+  accumulates? Spec explicitly permits deferring this for the MVP.
 
 ## Recommended next experiment
 
-Load-test the agent's latency with a synthetic corpus of ~200 memory
-units and ~20 chunked attachments (vs. today's ~30-unit eval corpus) to
-see whether the dual unit+chunk search per round, times up to 3 rounds,
-stays within an acceptable interactive latency budget -- this is the
-risk most likely to surface as "feels slow" before it surfaces as an
-accuracy problem.
+Build a larger, more varied iterative-recall eval set (the current one
+is 6 hand-picked cases, deliberately phrased for score symmetry where
+ambiguity is the point) and run a sweep over `AMBIGUITY_SCORE_MARGIN`
+and `POSITIVE_CUE_BOOST` the same way `VECTOR_SIM_THRESHOLD` was
+calibrated last phase -- this phase's manual testing already found one
+real gap (the positive-cue-boost mechanism itself, absent from the
+initial design) that a systematic sweep would likely surface others
+like it faster than one-off manual probing did.

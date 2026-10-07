@@ -1,6 +1,25 @@
 # TODO / open questions
 
-## Resolved this phase (spec section 44 decisions)
+## Resolved this phase (iterative recall)
+
+- **Recall is a persisted multi-round session**, not a single
+  stateless request. See docs/ARCHITECTURE.md "Iterative recall" and
+  docs/DECISIONS.md.
+- **Storage-time clarification and retrieval-time clarification are
+  separate mechanisms** with separate data models (`MemoryUnit.
+  pending_clarification` vs. `RecallSession.current_question`) --
+  answering a recall-session question never mutates a MemoryUnit.
+- **Whether recall sessions persist**: yes, in Postgres, one row per
+  session (see docs/DECISIONS.md) -- verified to survive an app restart.
+- **Whether a recall-session fact can be manually promoted to a
+  memory**: not implemented. Left genuinely open (see "Open product
+  questions" below), not defaulted silently.
+- **Ambiguity/discriminating-question heuristic**: a flat score-margin
+  check over origin-capture groups, plus attribute-bisection for the
+  question itself -- not a probabilistic/Bayesian model (see
+  docs/DECISIONS.md; spec explicitly permits this).
+
+## Resolved previous phase (spec section 44 decisions)
 
 - **Clarification gates recall availability.** `status="awaiting_clarification"`
   is excluded from search until answered or discarded. See docs/DECISIONS.md.
@@ -19,6 +38,22 @@
 
 ## Open product questions
 
+- **Should a user be able to promote something said during recall into
+  a permanent memory** ("save this as a memory")? Deliberately
+  unresolved (spec section 46) -- it's a real product decision (what
+  exactly gets saved, in whose words, with what provenance) rather than
+  an obvious engineering call. Current behavior: nothing said during
+  recall is ever saved; the user must separately use the ordinary
+  capture-creation flow in their own words.
+- **Should recall-session history itself become searchable memory**
+  (e.g. "what did I ask about last week")? Not implemented. Sessions
+  are currently fetchable by id (`GET /api/recall/sessions/{id}`) but
+  there's no list/search endpoint over past sessions.
+- **Should `AMBIGUITY_SCORE_MARGIN`/`POSITIVE_CUE_BOOST` be calibrated
+  via a sweep** the way `VECTOR_SIM_THRESHOLD` was? Not done this phase
+  -- there wasn't yet a large enough multi-round eval set (6 cases vs.
+  the one-shot set's 30) to make a sweep meaningful. See "Known
+  technical gaps" below for the specific failure mode observed.
 - **Should the retrieval threshold be relative/adaptive rather than a
   fixed scalar?** The sweep in docs/DECISIONS.md picked 0.55 as the
   highest value with 100% recall@10 on 30 cases, but a margin-below-top-
@@ -34,6 +69,33 @@
 
 ## Known technical gaps
 
+- **Ambiguity detection is sensitive to full-text-search score
+  asymmetry.** Observed directly during manual testing: two candidates
+  that are equally plausible to a human can get very different fused
+  scores purely because one sentence happens to share more literal
+  words with the query (`websearch_to_tsquery` AND-matching), not
+  because it's actually the better answer; conversely two candidates
+  with genuinely different relevance can end up close by coincidence.
+  The eval cases in `eval/session_cases.yaml` were deliberately phrased
+  to produce symmetric FTS matches where ambiguity is the point of the
+  case -- real stored memories won't always cooperate this way.
+- **Cue-to-candidate matching (`apply_negative_cues`/
+  `apply_positive_cue_boost`) is an exact-ish metadata match**, not
+  fuzzy. "Anna" matches a candidate whose `semantic.people` contains
+  exactly "Anna" (case-insensitive); it won't match "Annalisa" or a
+  misspelling. Works in testing because the same enrichment call that
+  populates `semantic.people` is reasonably consistent, but isn't
+  linguistically robust.
+- **Cue extraction's "bare confirmation" fallback is a judgment call
+  the model doesn't always make correctly.** Observed during manual
+  testing: a reply that both confirms/denies the question *and* adds a
+  genuinely new detail ("Yes, it was at ETH") initially caused the
+  model to extract only the confirmation and drop the new detail,
+  silently stalling disambiguation. The prompt was strengthened
+  (`app/retrieval/cues.py`) to explicitly require extracting new
+  information even when a yes/no is also present, and this now works
+  correctly in testing -- but like the enrichment clarification-
+  triggering gap below, it's model judgment, not a hard guarantee.
 - **Re-embedding is whole-row, not incremental.** `scripts/reembed.py`
   re-embeds a unit/chunk entirely if its embedding is missing or
   stale-model; it has no concept of "only the aliases changed, reuse the
@@ -59,22 +121,28 @@
 - **Chunk size (1200 chars, 150 overlap) is a fixed, untuned default.**
   Works for the eval set's short attached notes; untested against a
   genuinely large (50+ page) PDF.
-- **Agent latency is unbounded-ish in the worst case.** 3 rounds, each
-  now searching both units and chunks for every query in play, means up
-  to ~14 search calls plus up to 3 evaluate calls plus 1 answer call per
-  recall request in the worst case. Observed in practice to resolve in
-  1 round for most queries (30/30 eval cases), but a pathological query
-  could take tens of seconds.
+- **A RecallSession round can be more expensive than the one-shot
+  agent's**, since `automatic_search` re-searches the original query
+  plus every accumulated positive cue from scratch each round (by
+  design -- see docs/DECISIONS.md on why candidates must not be
+  "forgotten" between rounds), on top of the same per-round ≤3-iteration
+  bound the one-shot agent already has. Not measured under load; only
+  observed to resolve within 1-2 rounds for the 6-case iterative eval
+  set.
 - **No rate limiting / request size limits** beyond the per-file size
   cap. Not a concern for a single-user localhost MVP.
-- **UI was validated via rendered-HTML inspection and direct API calls,
-  not a live browser session** (no browser automation tool was available
-  in the environment this was built in).
+- **UI was validated via direct HTTP calls against the running server
+  (including a real restart) and rendered-HTML inspection, not a live
+  browser session** -- no browser automation tool was available in the
+  environment this was built in, same limitation as the previous phase.
 
 ## Explicitly deferred (not evaluated as gaps, just out of scope)
 
-- Multi-turn conversational memory, autonomous background agents,
-  general knowledge-graph storage, memory consolidation, human-like
-  forgetting, multi-agent systems, advanced temporal reasoning,
-  multimodal (image) understanding, cloud deployment, mobile apps,
-  multi-user auth, a learned/trained reranker.
+- Autonomous background agents, general knowledge-graph storage, memory
+  consolidation, human-like forgetting, multi-agent systems, advanced
+  temporal reasoning, multimodal (image) understanding, cloud
+  deployment, mobile apps, multi-user auth, a learned/trained reranker.
+  (Multi-turn *recall* is now implemented -- see "Resolved this phase"
+  above; general open-ended multi-turn chat about anything is still out
+  of scope, since the conversational surface here exists specifically
+  for narrowing down a memory, not as a chat assistant.)
