@@ -356,6 +356,58 @@ this project doesn't use.
 
 ---
 
+**Decision:** `enrich()` itself (full semantic enrichment, run once
+clarification is settled) is further split into three independent calls
+-- narrative (`meaning`, `event_date`), entities (`people`,
+`organizations`, `locations`), and retrieval aids (`aliases`, `topics`,
+`definitions`, `relations`) -- instead of one combined 9-field schema.
+Each degrades independently on LLM failure (a failed slice doesn't
+discard what the other slices already extracted).
+
+**Reason:** A single call asking for nine fields at once spreads the
+model's attention and output budget across all of them regardless of how
+much any one actually warrants; three narrower, single-purpose prompts
+let each slice get the model's full attention. Explicitly requested as a
+direction to try, on top of (not in place of) the clarify/enrich split
+above -- an empirical A/B comparison of the *old* single-call prompt
+against the *trimmed* single-call prompt (done when the clarify/enrich
+split landed) found no quality regression for either, but neither of
+those tested this specific question (multi-prompt vs. single-prompt
+extraction), which is a different axis.
+
+**Cost:** Two extra sequential LLM calls per unit (~3x enrichment
+latency instead of ~1x) -- see the ingestion-timing documentation for
+what that costs in wall-clock terms. Accepted as the explicit trade-off
+of this decision.
+
+**Caveat, observed directly while verifying this change:** one existing
+real-LLM integration test
+(`test_paraphrased_query_retrieves_relevant_memory`) went from reliably
+passing to failing more often than not (3 of 4 runs) after this change.
+Traced to its root cause, not just observed: `segment_capture()`
+deterministically splits "My trip to Japan last year was amazing,
+especially the food in Osaka." into two verbatim-valid units, "My trip
+to Japan last year was amazing" and "the food in Osaka" -- the second
+fragment loses the elided "amazing" it grammatically depended on in the
+original sentence (an *elided-qualifier* case, the same underlying class
+of bug as the already-documented pronoun-reference segmentation gap, see
+docs/TODO.md, just without a pronoun). This segmentation behavior is
+unrelated to and unchanged by this decision -- confirmed deterministic
+(3/3) in isolation -- but the *different* semantic content the new
+multi-prompt enrichment produces for the orphaned fragment apparently
+shifts the downstream grounding call's already-borderline judgment for
+this specific case from usually-grounded to usually-not. Not fixed here:
+the actual bug is in segmentation/grounding's handling of elided
+references, which is pre-existing, separately scoped work -- see
+docs/TODO.md.
+
+**Alternatives considered:** Reverting to single-call enrichment --
+rejected; this was an explicit direction to try, and the one observed
+regression traces to a pre-existing, different-layer bug this change
+merely made more visible, not one this change itself introduced.
+
+---
+
 **Decision:** Clarification now supports multiple questions per round
 (`MAX_QUESTIONS_PER_ROUND = 3`, asked one at a time via
 `MemoryUnit.clarification_queue`, never shown as a batch) and multiple

@@ -65,9 +65,14 @@ POST (or use the web form at `/`) some text and optional files to
 independently retrievable memory units** — the system decides this via
 segmentation, not the user (see `docs/ARCHITECTURE.md`).
 
-A unit may surface at most one bounded clarification question if
-something is genuinely unclear (an unfamiliar term, an unresolvable
-relative date). **A unit with an open question is durably saved but not
+A unit may surface a clarification question if something is genuinely
+unclear (an unfamiliar term, an unresolvable relative date) — a fast,
+narrow check that runs *before* the heavier semantic-extraction step, so
+you see the question without waiting on it (see `docs/ARCHITECTURE.md`).
+Up to 3 relevant questions can come out of one check (asked one at a
+time, never as a batch), and up to 3 rounds total if an answer reveals
+something new worth asking — bounded so the system can't turn into an
+interrogation. **A unit with an open question is durably saved but not
 yet searchable** — it only becomes visible to recall once answered (via
 `POST /api/memory-units/{id}/clarify`) or explicitly discarded (`POST
 .../discard`). The answer becomes part of that unit's permanent semantic
@@ -80,35 +85,28 @@ also removes its files) — there's no automatic forgetting/expiry.
 
 ## How retrieval works
 
-Recall is a **session**, not a single request-response round trip: your
-first query may only be a weak or partial recollection, and the system
-is explicitly designed to narrow in on the right memory over several
-turns rather than require you to phrase the perfect query up front.
+`POST /api/recall` (used by the web form at `/recall`) runs a bounded
+retrieval agent (`backend/app/retrieval/agent.py:run_agent`): hybrid
+search (vector + full-text, over each unit's original text and derived
+semantic representation, *and* over chunked attachment text), up to 3
+rounds of "is this enough, or should I try different phrasing" before
+answering. The LLM is instructed to answer only from retrieved evidence
+and to mark the answer "grounded" only if it actually addresses the
+question; if not, or if nothing is found at all, you get the fixed
+string "I don't have a stored memory about this." and no sources — never
+a fabricated guess.
 
-`POST /api/recall/sessions` (or the web form at `/recall`) starts a
-`RecallSession` (`backend/app/retrieval/session.py`) and runs the first
-round immediately: a bounded search (hybrid vector + full-text over
-each unit's original text and derived semantic representation, *and*
-over chunked attachment text — `backend/app/retrieval/agent.py`'s
-`automatic_search`, ≤3 automatic iterations). If there's a single clear
-answer, it answers right away (`status: "success"`). If several stored
-memories are still plausible, it asks one concrete discriminating
-question (`status: "needs_user_cue"`, e.g. "Did this involve Anna?")
-instead of guessing — answer it (or add any other detail you remember,
-or correct something) via `POST /api/recall/sessions/{id}/messages`,
-and the session searches again with that accumulated context. This can
-repeat for as many rounds as actually useful (`POST .../cancel` to give
-up early); nothing said during this back-and-forth is ever written into
-a memory — see `docs/ARCHITECTURE.md`'s "Iterative recall" section for
-the full state machine and the memory-contamination safeguards.
-
-The LLM is instructed to answer only from retrieved evidence and to
-mark the answer "grounded" only if it actually addresses the question;
-if not, or if nothing is found at all, the session ends
-(`status: "exhausted"`) with the fixed string "I don't have a stored
-memory about this." and no sources — never a fabricated guess. The
-older stateless `POST /api/recall` (one query, one answer, no
-follow-up) still exists for simple direct lookups and the eval harness.
+There's also a multi-round **interactive** mode
+(`POST /api/recall/sessions`, `backend/app/retrieval/session.py`) that
+can ask a clarifying question when several stored memories are
+plausible, instead of guessing, and accumulate your replies across
+rounds. It's fully implemented, tested, and reachable via the API — it's
+just not what the `/recall` page uses by default right now. A benchmark
+(`eval/run_interactive_benchmark.py`) found it underperforming the
+simpler one-shot agent overall on a deliberately ambiguous test corpus;
+see `docs/DECISIONS.md` for the result and the root cause, and
+`docs/ARCHITECTURE.md`'s "Iterative recall" section for the full
+mechanics.
 
 ## Tests & evaluation
 
@@ -117,6 +115,7 @@ pytest -q                      # fast unit tests (fakes) + real-LLM integration 
 pytest -q -m "not integration" # skip the ones that need Ollama running
 scripts/run-eval.sh            # 30-case one-shot hand-written eval set
 scripts/run-session-eval.sh    # iterative-recall eval set (multi-round, ambiguity, correction)
+scripts/run-interactive-benchmark.sh  # one-shot vs. LLM-assisted vs. interactive A/B/C comparison
 scripts/sweep-threshold.sh     # retrieval-threshold calibration experiment
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings
 ```

@@ -133,6 +133,18 @@
   pronouns using sibling "related context" evidence, confirmed fixing
   the one eval failure this caused), but segmentation itself has no
   linguistic awareness of reference chains.
+  - **Same bug, different shape, newly observed:** segmentation
+    deterministically (3/3) splits "My trip to Japan last year was
+    amazing, especially the food in Osaka." into "My trip to Japan last
+    year was amazing" / "the food in Osaka" -- the second fragment loses
+    the elided "amazing" it depended on, no pronoun involved at all. This
+    made `test_paraphrased_query_retrieves_relevant_memory` flip from
+    reliably passing to failing more often than not after the
+    multi-prompt enrichment change (see docs/DECISIONS.md) shifted an
+    already-borderline grounding judgment for this exact evidence
+    combination. Not fixed -- same root class of problem as the pronoun
+    case, this time an elided qualifier instead of a referent; the
+    sibling-context mitigation only targets explicit pronouns today.
 - **Clarification question targeting/triggering is inconsistent** across
   model calls for borderline cases. Bounded to 1 round per unit, so the
   blast radius is small, but not fully reliable -- and now that it

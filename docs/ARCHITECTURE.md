@@ -66,6 +66,46 @@ trustworthy than something above it. In particular: an LLM's guess about
 what a term means never overwrites or outranks what the user actually
 said, including in a clarification answer.
 
+## Design principles
+
+A handful of ideas recur across both ingestion and retrieval; worth
+naming once instead of re-deriving from each section below:
+
+- **Never let derived data outrank what the user actually said.** The
+  authority hierarchy above isn't just a schema note -- it's the reason
+  clarification *answers* get folded back into the searchable
+  representation (so a clarified alias is actually findable) while
+  clarification *questions* and retrieval-time *hypotheses* never are
+  (they're reasoning aids, not facts).
+- **Decompose before you index.** A single capture may describe several
+  unrelated things; cramming them into one embedding blurs every
+  retrieval target it touches. Segmentation (below) exists specifically
+  so "my AHV number is X, Anna studies robotics, and I need to renew my
+  passport" doesn't become one noisy vector.
+- **Resolve ambiguity before committing to a representation, not after.**
+  Both the storage side (clarification gates full enrichment) and the
+  retrieval side (RecallSession can ask a discriminating question before
+  answering) follow the same shape: when the system isn't confident what
+  something means or which candidate is right, it asks rather than
+  guesses -- and in storage's case, it doesn't even do the expensive
+  semantic-extraction work until the ambiguity is settled, because that
+  work would just be redone once it is.
+- **Abstain rather than fabricate.** Every answer-generation path has
+  exactly one grounding-override point that can force an abstention
+  regardless of what text the model produced. This override is
+  deliberately centralized (not re-implemented per call site) so it
+  can't be silently weakened by a future change to one path and not
+  the other.
+- **Bound every LLM-driven loop, explicitly and for a stated reason.**
+  Segmentation caps unit count (`MAX_SEGMENT_UNITS`); storage-time
+  clarification caps rounds and questions-per-round
+  (`MAX_CLARIFICATION_ROUNDS`, `MAX_QUESTIONS_PER_ROUND`); the one-shot
+  agent caps search iterations (`MAX_AGENT_ITERATIONS`); RecallSession
+  caps rounds (`MAX_SESSION_ROUNDS`). None of these are the same kind of
+  bound -- see each section for what specifically each one prevents --
+  but the pattern itself (never let an LLM-driven loop run unbounded) is
+  deliberate throughout, not incidental to any one of them.
+
 ## Data flow: ingestion
 
 ```
@@ -151,8 +191,7 @@ user-initiated correction (`POST /memory-units/{id}/correct`, spec
 section 30 -- free-text, re-runs enrichment directly, bypassing the
 clarification check entirely) does *not* consume this budget: the bound
 exists to stop the system from interrogating the user, not to limit how
-often the user can proactively
-fix something.
+often the user can proactively fix something.
 
 ## Segmentation
 
@@ -217,10 +256,23 @@ app/retrieval/agent.py: run_agent()  -- bounded deterministic state machine
       what text the model wrote
 ```
 
-## Iterative recall (RecallSession)
+## Iterative recall (RecallSession) -- implemented, not the default
 
-`run_agent()` above answers in one shot: good for a direct/paraphrased
-query, but it has no way to ask the user anything. `app/retrieval/
+**Current status up front, since this matters for reading the rest of
+this section:** `run_agent()` above is what the `/recall` page and
+`POST /api/recall` actually use today. `RecallSession` (`POST
+/api/recall/sessions`, below) is fully implemented, tested, and
+reachable via the API, but is *not* wired into the default UI. A
+dedicated benchmark (`eval/run_interactive_benchmark.py`) measured it
+underperforming `run_agent()` overall on a deliberately ambiguous
+synthetic corpus -- see docs/DECISIONS.md for the result and the
+specific root cause that was traced and fixed in `discriminate.py`
+(entity names landing in `relations`/`definitions`, which the cue
+heuristics didn't originally check). The mechanics below describe real,
+working code; they just aren't what a user hits by default right now.
+
+`run_agent()` answers in one shot: good for a direct/paraphrased query,
+but it has no way to ask the user anything. `app/retrieval/
 session.py`'s `RecallSession` builds the same bounded search primitives
 into a multi-round process, because a user's first recall attempt is
 often just a weak or partial cue, not a wording close enough for one
@@ -342,16 +394,21 @@ continues it to completion).
 
 Four independent layers of tolerance, from most to least routine:
 
-1. **LLM down/timeout/malformed output** during enrichment, embedding, or
-   answer generation: caught by `LLMError` handling at the point of the
-   call, degrades gracefully (empty semantics / null embedding / fall
-   back to full-text-only search / abstain), never raises further.
+1. **LLM down/timeout/malformed output** during clarification-question
+   generation, enrichment, embedding, or answer generation: caught by
+   `LLMError` handling at the point of the call, degrades gracefully
+   (no question raised / empty semantics / null embedding / fall back to
+   full-text-only search / abstain), never raises further.
 2. **An actually unexpected exception** during the derived-processing
    stage (a real bug, not an LLM hiccup): caught by a broad `except` in
-   `_enrich_and_index()`, sets `status="failed"`. The unit's
+   `_advance_unit()` (the clarification-check step) or
+   `_run_full_enrichment()` (the enrichment step) in
+   `app/ingestion/pipeline.py`, sets `status="failed"`. The unit's
    `authoritative_content` (committed in an earlier, separate
-   transaction) is untouched. `POST /memory-units/{id}/retry` re-runs
-   just the derived stage.
+   transaction) is untouched. `POST /memory-units/{id}/retry` calls
+   `_advance_unit()` again, resuming from wherever it got stuck -- it
+   doesn't blindly restart from enrichment, since the unit might have
+   failed mid-clarification-check instead.
 3. **An open clarification question**: `status="awaiting_clarification"`
    -- not a failure at all, but deliberately excluded from recall until
    resolved (see "clarification" above).
@@ -454,11 +511,24 @@ deletion anywhere in this codebase.
 `app/llm/base.py` defines `LLMProvider` (`generate`, `generate_structured`,
 `embed`) and three exception types (`LLMUnavailableError`,
 `LLMTimeoutError`, `LLMMalformedOutputError`). `app/llm/ollama_provider.py`
-is the only implementation. Every structured-output caller in the app
-(segmentation, enrichment, agent evaluation, answer generation) goes
-through the same `generate_structured()` method with a JSON-schema
-`format` -- there's no separate prompt-chaining framework, just four
-distinct, independently testable call sites.
+is the only implementation, with a configurable request timeout
+(`Settings.llm_timeout_seconds`, default 90s -- see `app/config.py`).
+Every structured-output caller in the app goes through the same
+`generate_structured()` method with a JSON-schema `format` -- there's no
+separate prompt-chaining framework, just independently testable call
+sites, one per narrow decision:
+
+| Call site | Module | Decides |
+|---|---|---|
+| `segment_capture()` | `ingestion/segmentation.py` | how many memory units this capture contains |
+| `generate_questions()` | `ingestion/clarify.py` | whether to ask a clarification question, and about what |
+| `enrich()` | `ingestion/enrichment.py` | the full semantic representation |
+| `evaluate_sufficiency()` | `retrieval/pipeline.py` | whether retrieved evidence is enough to answer, and what to search next |
+| `generate_answer()` | `retrieval/pipeline.py` | the final answer text and whether it's grounded |
+| `extract_cues()` | `retrieval/cues.py` | structured cues from a RecallSession user reply (RecallSession only) |
+
+Each is a narrow, single-purpose structured-output call -- none of them
+chain multiple LLM calls internally or call each other.
 
 ## File handling, persistence, security
 
