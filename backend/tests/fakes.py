@@ -26,6 +26,7 @@ _EMPTY_SEMANTICS = {
 _DEFAULT_SEGMENTATION = {"units": []}  # empty -> pipeline falls back to no-split
 _DEFAULT_EVALUATE = {"sufficient": True, "reformulated_queries": []}
 _DEFAULT_ANSWER = {"answer": "stub answer", "grounded": True}
+_DEFAULT_CUES = {"cues": []}
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
@@ -68,13 +69,14 @@ class FakeLLMProvider(LLMProvider):
     """Fast, deterministic stand-in for LLMProvider used by unit tests.
 
     `fail` simulates backend failure modes: None | "unavailable" | "timeout"
-    | "malformed" (applies to every call). The four `*_response` params let
+    | "malformed" (applies to every call). The five `*_response` params let
     a test pin exactly what generate_structured() returns for each of the
-    four structured-output shapes the app uses, dispatched by a
+    five structured-output shapes the app uses, dispatched by a
     distinguishing key in the schema's properties:
       - "units"               -> segmentation
       - "sufficient"          -> agent's evaluate-sufficiency step
       - "grounded"            -> final answer generation
+      - "cues"                -> recall-session cue extraction
       - (none of the above)   -> semantic enrichment
 
     Each may be a single dict (returned every time) or a list (consumed in
@@ -91,6 +93,7 @@ class FakeLLMProvider(LLMProvider):
         enrichment_response: Any = None,
         evaluate_response: Any = None,
         answer_response: Any = None,
+        cue_response: Any = None,
     ) -> None:
         self._dim = dim
         self.fail = fail
@@ -98,6 +101,7 @@ class FakeLLMProvider(LLMProvider):
         self._enrichment = _ResponseQueue(enrichment_response, dict(_EMPTY_SEMANTICS))
         self._evaluate = _ResponseQueue(evaluate_response, _DEFAULT_EVALUATE)
         self._answer = _ResponseQueue(answer_response, _DEFAULT_ANSWER)
+        self._cues = _ResponseQueue(cue_response, dict(_DEFAULT_CUES))
         self.calls: list[str] = []  # schema "kind" per generate_structured call, for tests that assert call counts
 
     @property
@@ -135,6 +139,9 @@ class FakeLLMProvider(LLMProvider):
         if "grounded" in props:
             self.calls.append("answer")
             return self._answer.next()
+        if "cues" in props:
+            self.calls.append("cues")
+            return self._cues.next()
         self.calls.append("enrichment")
         return self._enrichment.next()
 
