@@ -54,9 +54,39 @@ const membase = (() => {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      throw new Error(data.detail ? JSON.stringify(data.detail) : `Request failed (${resp.status})`);
+      const err = new Error(data.detail ? JSON.stringify(data.detail) : `Request failed (${resp.status})`);
+      // Marks this as "the server responded, just with an error status" --
+      // distinct from a timeout or a connection that never got a response
+      // at all. See describeError().
+      err.apiStatus = resp.status;
+      throw err;
     }
     return data;
+  }
+
+  function formatElapsed(ms) {
+    return (ms / 1000).toFixed(1) + "s";
+  }
+
+  // Three failure modes that look identical to a user staring at a spinner
+  // but mean very different things: the client gave up waiting (backend
+  // is likely still working -- large recall queries can genuinely take a
+  // while), the request never reached the server at all (connectivity),
+  // or the server answered with an error status (an actual API problem,
+  // not a timing issue). Distinguishing them is the point -- see the
+  // recall-page transparency work in docs/DECISIONS.md.
+  function describeError(err, elapsedMs) {
+    const elapsed = formatElapsed(elapsedMs);
+    if (err.name === "AbortError" || /timed out/i.test(err.message)) {
+      return `Timed out after ${elapsed} -- the backend is likely still processing. Try again shortly.`;
+    }
+    if (typeof err.apiStatus === "number") {
+      return `The server returned an error after ${elapsed} (HTTP ${err.apiStatus}): ${err.message}`;
+    }
+    if (err instanceof TypeError || /Failed to fetch|NetworkError/i.test(err.message)) {
+      return `Couldn't reach the server after ${elapsed} -- check your connection and that the backend is running.`;
+    }
+    return `${err.message} (after ${elapsed})`;
   }
 
   function renderUnits(derivedEl, units) {
@@ -288,11 +318,17 @@ const membase = (() => {
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       hide(resultCard);
-      showStatus(statusEl, "Recalling...");
       const query = document.getElementById("query").value;
+
+      const startedAt = performance.now();
+      showStatus(statusEl, "Recalling...");
+      const ticker = setInterval(() => {
+        showStatus(statusEl, `Recalling... (${formatElapsed(performance.now() - startedAt)} elapsed)`);
+      }, 200);
 
       try {
         const data = await postJSON("/api/recall", { query });
+        clearInterval(ticker);
         hide(statusEl);
         answerEl.textContent = data.answer;
         answerEl.classList.toggle("abstained", data.abstained);
@@ -304,7 +340,8 @@ const membase = (() => {
         }
         show(resultCard);
       } catch (err) {
-        showStatus(statusEl, err.message, true);
+        clearInterval(ticker);
+        showStatus(statusEl, describeError(err, performance.now() - startedAt), true);
       }
     });
   }
