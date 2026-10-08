@@ -48,7 +48,7 @@ automatically by `nix develop`'s shellHook):
 | Var | Default | Meaning |
 |---|---|---|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama endpoint |
-| `MEMBASE_GENERATION_MODEL` | `qwen2.5:14b-instruct-q4_K_M` | segmentation, enrichment, agent decisions, answers — one model for everything, see `docs/DECISIONS.md` |
+| `MEMBASE_GENERATION_MODEL` | `gemma4:12b` | segmentation, enrichment, agent decisions, answers, image captioning — one multimodal model for everything, see `docs/DECISIONS.md` |
 | `MEMBASE_EMBED_MODEL` | `nomic-embed-text` | embeddings (768 dims) |
 
 Changing `MEMBASE_EMBED_MODEL` to a model with a different dimension needs
@@ -132,8 +132,12 @@ python3 scripts/reembed.py --dry-run   # report stale/missing embeddings
 
 ## Known limitations
 
-See `docs/REPORT.md` for the full list; the short version: no image
-understanding, no chunking-aware re-embedding backfill granularity beyond
-whole-row staleness, and the relevance threshold for vector search is
-calibrated against a 30-case eval set rather than a large production
-corpus (see `docs/DECISIONS.md` for the sweep that picked it).
+See `docs/REPORT.md` for the (phase-dated) full list and `docs/TODO.md`
+for the current one; the short version today: uploaded images are
+captioned by the generation model itself rather than a dedicated
+OCR/vision model (not independently quality-evaluated yet, see
+`docs/TODO.md`), there's no chunking-aware re-embedding backfill
+granularity beyond whole-row staleness, and the relevance threshold for
+vector search is calibrated against a 30-case eval set rather than a
+large production corpus (see `docs/DECISIONS.md` for the sweep that
+picked it).

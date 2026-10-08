@@ -31,7 +31,11 @@
   independent top-level memories.
 - **No automatic deletion/expiry.** Explicit user deletion
   (`DELETE /api/captures/{id}`) is supported and removes files too.
-- **Image understanding: deferred** (unchanged from the previous phase).
+- **Resolved: image understanding**, via the gemma4:12b migration (see
+  docs/DECISIONS.md) -- an uploaded image is captioned by the
+  generation model's native multimodal understanding and becomes
+  full-text/chunk-searchable through the same path PDF/text extraction
+  already used. No separate OCR/vision model.
 - **Knowledge graph: deferred** -- `semantic.relations` stays a flat list
   of subject/predicate/object triples, not a queryable graph.
 - **Multi-agent architecture: deferred** -- one bounded retrieval agent.
@@ -192,11 +196,22 @@
   blast radius is small, but not fully reliable -- and now that it
   gates recall, an unnecessary question has a bigger UX cost than before
   (the memory is invisible to recall until answered or discarded).
-- **No image understanding.** Images are validated and stored but never
-  captioned/OCR'd.
 - **Chunk size (1200 chars, 150 overlap) is a fixed, untuned default.**
-  Works for the eval set's short attached notes; untested against a
-  genuinely large (50+ page) PDF.
+  Works for the eval set's short attached notes. A genuinely large
+  (50+ page) PDF's total *processing cost* is now bounded
+  (`membase_max_chunks_per_attachment`, see docs/DECISIONS.md "Large
+  attachments") -- but the 1200/150 split itself, and whether 300 is
+  the right chunk-count ceiling, remain untuned against a real large
+  document, just no longer unbounded.
+- **Image captions are not empirically quality-tested the way
+  segmentation/enrichment prompts were** (see docs/DECISIONS.md "Gemma 4
+  migration" -- qwen's choice was validated by direct manual A/B testing
+  before being trusted; the image-captioning prompt in
+  `app/ingestion/pipeline.py`'s `_IMAGE_CAPTION_PROMPT` has not had the
+  same treatment yet). Functionally wired up and covered by fast tests
+  with a fake model, but caption *quality* against real images (does it
+  reliably transcribe visible text? describe enough detail to be
+  findable later?) hasn't been evaluated the way the text pipeline was.
 - **A RecallSession round can be more expensive than the one-shot
   agent's**, since `automatic_search` re-searches the original query
   plus every accumulated positive cue from scratch each round (by

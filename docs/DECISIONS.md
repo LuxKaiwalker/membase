@@ -530,3 +530,154 @@ MVP with no auth/user model to hang a server-side preference off of, and
 the setting has no bearing on data correctness, so adding persistence
 and a new guard clause for it would be solving a problem that doesn't
 exist yet.
+
+---
+
+**Decision:** Migrated the single generation model from
+`qwen2.5:14b-instruct-q4_K_M` to `gemma4:12b` (Google, released June
+2026), used for every generation/structured-output call exactly as qwen
+was -- segmentation, the enrichment sub-calls, clarification-question
+generation, agent decisions, answer generation, and now also image
+captioning (see the next decision). `nomic-embed-text` is unchanged.
+
+**Reason:** User-requested, specifically to gain native multimodal
+(image/audio) understanding without a separate vision model -- gemma4
+has an encoder-free architecture that understands images directly
+through the same generation path already used for everything else,
+rather than bolting on OCR/captioning as a third model. The user
+explicitly considered and rejected pairing it with a second, smaller
+Gemma 4 variant (e.g. `gemma4:e2b`) for "faster" sub-calls, discarding
+that idea themselves before this was implemented.
+
+**Alternatives considered / measured:** A dual-model setup (`gemma4:12b`
+for heavy calls + a smaller `gemma4:e2b`/`e4b` for lighter ones) was
+evaluated on paper before being discarded -- see the next bullet, VRAM
+measurement makes this moot anyway. Published quantized-size estimates
+for `gemma4:12b` suggested ~6.7GB VRAM, which looked like it might leave
+room for a second small model alongside it; **measured directly**
+(`nvidia-smi` while the model was loaded and actively serving a real
+request, not just `ollama list`'s on-disk size) it actually uses ~8.7GB
+-- the published estimate undercounted real usage by ~2GB, consistent
+with this project's standing rule to trust direct measurement over
+documentation (same lesson as the original qwen 7b/14b VRAM call). That
+leaves only ~1GB of headroom on this 11GB card, confirming a second
+generation model was never viable here regardless of the user's
+decision to drop the idea -- it's now also an empirically closed
+question, not just a judgment call.
+
+---
+
+**Decision:** Uploaded images are described by the generation model
+itself (`app/ingestion/pipeline.py`'s `_describe_image`, via a new
+`images: list[bytes]` parameter added to `LLMProvider.generate()`/
+`generate_structured()`) immediately after the attachment is durably
+stored, writing the caption into the same `Attachment.extracted_text`/
+`extraction_status` fields PDF/text extraction already use. No new
+schema, no new search code path -- an image becomes full-text and
+chunk-searchable exactly the way a PDF page already is, as soon as it
+has a caption instead of `extraction_status="unsupported"`.
+
+**Reason:** This is the smallest change that makes images genuinely
+searchable (closing the "No image understanding" gap in docs/TODO.md)
+precisely because every downstream consumer of `extracted_text`
+(`_attachment_text_for`, `chunk_attachment`, `_build_searchable_text`,
+`hybrid_search_chunks`) is already format-agnostic -- it was written to
+not care *how* the text arrived, so an image caption slots in with zero
+changes to retrieval code.
+
+**Large attachments -- how processing time is bounded:** Two independent
+caps, both configurable in `app/config.py`, both only ever bound
+*derived* processing cost, never the original file or its full
+extracted text:
+- `membase_max_images_captioned_per_capture` (default 8): one captioning
+  call already costs O(1) regardless of an image's resolution (the
+  vision path's own fixed tiling handles that internally) -- this instead
+  bounds how many *images in a single capture* get that call made at
+  all, so attaching dozens of images in one request can't turn into
+  dozens of sequential vision calls with no visible limit. Images beyond
+  the cap are stored normally, just without a caption (`extraction_
+  status` stays `"unsupported"`) -- the same "best-effort, never lose
+  the original" tolerance as every other derived step in this pipeline,
+  not a new failure mode.
+- `membase_max_chunks_per_attachment` (default 300): bounds how many
+  `AttachmentChunk` rows one attachment's text gets split into and
+  embedded as, so a single enormous document (a 1000-page PDF, say)
+  can't turn into an unbounded-size `embed()` batch call. Critically,
+  this never truncates the attachment's own full extracted text --
+  `_attachment_text_for()` and therefore each memory unit's
+  `searchable_text` still carry *all* of it, so coarse full-text search
+  against the whole document is never diminished. Only the fine-grained,
+  independently-chunk-embedded search granularity is capped -- content
+  past the cap is still findable via the parent unit's full-text match,
+  just not as its own standalone chunk hit.
+
+Both are per-attachment/per-capture bounds, not global or time-based --
+deliberately simple limits rather than a token-budget or wall-clock
+timeout, since those would need the kind of empirical tuning (how long
+is "too long"?) this project prefers to do only once there's a real
+workload to tune against (same reasoning as the untuned chunk-size
+constants already in `app/ingestion/chunking.py`).
+
+**Alternatives considered:** Resizing/downsampling images client- or
+server-side before sending them to the model -- rejected for now, since
+`membase_max_upload_mb` (25MB) already bounds worst-case payload size
+and the model's own vision pipeline handles arbitrary input resolution
+internally; revisit only if a real file is observed to cause a
+problem. A wall-clock timeout on the whole captioning/chunking phase --
+rejected in favor of the simpler count-based caps above, consistent
+with not reaching for time-based tuning without a real workload yet.
+
+---
+
+**Decision:** `OllamaProvider` calls Ollama's `/api/chat` endpoint
+(a `messages` list, one role per entry) for both `generate()` and
+`generate_structured()`, not `/api/generate` (a flat `system` +
+`prompt` pair) -- a change made specifically for the gemma4 migration,
+not carried over from the qwen setup.
+
+**Reason:** Found by direct empirical testing, not assumed -- the first
+full integration-test run after switching to gemma4:12b failed
+`test_segmentation_acceptance_compound_vs_coherent`: three unrelated
+facts that qwen reliably split into 3 units came back as 1, *despite*
+the segmentation prompt containing a few-shot example using that exact
+input text mapped to the correct 3-unit output. Reproduced directly
+against the live model outside the app entirely: the identical
+system+prompt+schema sent to `/api/generate` truncated an array-typed
+structured output (a 3-item array collapsed to 1 item; a simplified
+array-of-strings schema came back empty) -- but the same system
+message, user message, and schema sent to `/api/chat` instead
+reliably returned the full, correct array every time. This is
+specific to how Ollama's chat-template substitution interacts with
+gemma4's Modelfile template combined with grammar-constrained (JSON
+schema) decoding via `/api/generate`'s flat fields -- `/api/chat`'s
+explicit message roles sidestep whatever that interaction is. After
+switching, the full integration suite (7 tests, all against the real
+model) passed cleanly, including the originally-failing case.
+
+This matters beyond segmentation: every structured-output call in this
+app (`enrich()`'s three sub-calls, `generate_questions()`, the agent's
+evaluate/answer steps, cue extraction) uses `generate_structured()`
+with a JSON schema, and several of those schemas have array-typed
+fields (aliases, people, topics, relations, definitions, questions) --
+had this not been caught by running the real integration suite (not
+just the fast suite's fakes, which can't exhibit this at all), the
+migration would have shipped with a silent, pervasive quality
+regression across most of the app's actual output, not just
+segmentation.
+
+**Alternatives considered:** Working around it by restructuring the
+segmentation schema (e.g. a single delimited string instead of a JSON
+array) -- rejected once `/api/chat` was confirmed to fix the root
+cause cleanly for every schema shape, not just this one; patching
+around a single call site would have left the same latent bug waiting
+in every other array-typed schema in the app.
+
+**Lesson for future model migrations on this project:** the fast
+test suite's `FakeLLMProvider` cannot catch this class of bug by
+construction -- it never talks to Ollama at all. Only the real-model
+integration suite (`pytest -m integration`) can, and it must be run to
+completion (and alone -- see the "shared dev database" caution in
+`backend/tests/conftest.py`'s `db` fixture, which `TRUNCATE`s on every
+test and will corrupt a concurrently-running suite sharing the same
+Postgres instance) before trusting a generation-model swap, no matter
+how plausible the plumbing looks.

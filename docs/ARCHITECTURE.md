@@ -115,8 +115,25 @@ capture text + files
       |
       ├─ process each file (app/ingestion/files.py): sniff real mime type,
       |   reject unsupported, save original, best-effort text extraction
+      |   (images are stored but not captioned here -- no LLM call before
+      |   phase 0 commits, same rule as everything else derived)
       |
       ├─ COMMIT (phase 0): capture + attachments durably saved
+      |
+      ├─ _caption_new_images() (app/ingestion/pipeline.py): any image
+      |   attachment gets described by the generation model's native
+      |   multimodal understanding (gemma4:12b -- see docs/DECISIONS.md),
+      |   written into the same extracted_text/extraction_status fields
+      |   PDF/text extraction use. Bounded per capture
+      |   (membase_max_images_captioned_per_capture); a caption failure
+      |   or a skipped-for-budget image just stays uncaptioned, same
+      |   best-effort tolerance as every other derived step here.
+      |
+      ├─ _index_attachment_chunks() (app/ingestion/pipeline.py): chunks
+      |   each attachment's extracted text (app/ingestion/chunking.py,
+      |   capped at membase_max_chunks_per_attachment -- see
+      |   docs/DECISIONS.md "Large attachments") and best-effort embeds
+      |   each chunk into attachment_chunks
       |
       ├─ segment_capture() (app/ingestion/segmentation.py): LLM decides
       |   how many units, each unit's content must be a verbatim excerpt

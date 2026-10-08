@@ -15,19 +15,29 @@ becomes obvious from the code or from `docs/`.
   listening on `127.0.0.1:11434`.
 - The app uses exactly two models, both via Ollama, chosen after testing
   (not the spec's suggested default) -- see docs/DECISIONS.md:
-  - `qwen2.5:14b-instruct-q4_K_M` for *every* generation/structured-output
-    call (segmentation, semantic enrichment, agent decisions, answers).
-    `qwen2.5:7b-instruct` visibly under-performed on segmentation and
-    clarification judgment in manual testing (over-split coherent
-    episodes; never recognized an unfamiliar term as worth asking about).
-  - `nomic-embed-text` (768 dims) for embeddings.
-  - **Don't mix in a third generation model.** This GPU has 11GB VRAM;
-    14b-q4 (~9GB) + nomic-embed (~0.3GB) coexist without being swapped out
-    of VRAM between calls. Adding a second *generation* model (e.g. also
-    using 7b somewhere) means Ollama evicts/reloads between calls,
-    costing ~7-14s *per call* -- confirmed empirically, see git history
-    for the measurement. `scripts/model-doctor.sh` checks the two models
-    actually configured are present and working; it does not pull extras.
+  - `gemma4:12b` for *every* generation/structured-output call
+    (segmentation, semantic enrichment, agent decisions, answers) --
+    migrated from `qwen2.5:14b-instruct-q4_K_M`, see docs/DECISIONS.md.
+    Natively multimodal (text/image/audio, no separate vision encoder),
+    which is what `app/ingestion/pipeline.py`'s `_describe_image` uses to
+    make uploaded images searchable.
+  - `nomic-embed-text` (768 dims) for embeddings -- unchanged by the
+    gemma4 migration, embeddings are a separate concern from generation.
+  - `OllamaProvider` talks to Ollama's `/api/chat` endpoint, not
+    `/api/generate` -- required for gemma4, whose grammar-constrained
+    (JSON schema) output via `/api/generate` was measured to silently
+    truncate array-typed fields; `/api/chat` doesn't have this problem.
+    See docs/DECISIONS.md "Gemma 4 migration" before ever touching
+    `app/llm/ollama_provider.py`'s endpoint choice.
+  - **Don't mix in a second generation model.** This GPU has 11GB VRAM;
+    measured (`nvidia-smi`, not just the published quantized size):
+    `gemma4:12b` alone uses ~8.7GB, `nomic-embed-text` ~0.25GB, leaving
+    only ~1GB of headroom -- less than qwen's setup had. There is no
+    realistic room for a second generation model here; adding one would
+    risk the same eviction/reload thrashing previously confirmed
+    empirically with qwen's 7b/14b combination (~7-14s per call, see git
+    history). `scripts/model-doctor.sh` checks the two models actually
+    configured are present and working; it does not pull extras.
 - No docker/podman available. No system-wide Postgres. Everything the app
   needs beyond Ollama is provided by `flake.nix`.
 - All Python dependencies come from `nixpkgs.python313Packages` via
@@ -87,6 +97,18 @@ elsewhere.
    see git history. `git rev-parse --show-toplevel` is correct regardless
    of invocation directory.
 8. The web server binds `127.0.0.1` only, never `0.0.0.0`.
+9. **`pytest`'s `db` fixture `TRUNCATE`s the whole dev database before
+   every single test** (see `backend/tests/conftest.py`) -- there is no
+   separate test database. Running two `pytest` invocations concurrently
+   (or `pytest` alongside manual testing against a running dev server)
+   against this same Postgres instance causes real, confusing failures
+   (a capture inserted by one process vanishing mid-transaction because
+   an unrelated test in the other process truncated it) that look like
+   application bugs but aren't -- hit this for real while validating the
+   gemma4 migration, see docs/DECISIONS.md. Run one DB-touching thing at
+   a time; `scripts/run-eval.sh`/`run-session-eval.sh`/
+   `sweep-threshold.sh` avoid this by using an isolated `membase_eval`
+   database instead, but the default `pytest` run does not.
 
 ## Key architecture terms (see docs/ARCHITECTURE.md for the full picture)
 
