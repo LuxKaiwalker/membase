@@ -31,9 +31,10 @@ scripts/dev-db.sh start     # inits/starts a project-local Postgres
 scripts/run-dev.sh          # starts uvicorn with --reload
 ```
 
-Open http://127.0.0.1:8000/ to store a memory, and
-http://127.0.0.1:8000/recall to query it. The server binds to localhost
-only, by design (see `docs/DECISIONS.md`).
+Open http://127.0.0.1:8000/ to store a memory,
+http://127.0.0.1:8000/recall to query it, and
+http://127.0.0.1:8000/captures to browse or delete what's stored. The
+server binds to localhost only, by design (see `docs/DECISIONS.md`).
 
 To stop Postgres: `scripts/dev-db.sh stop`.
 
@@ -75,8 +76,17 @@ something new worth asking — bounded so the system can't turn into an
 interrogation. **A unit with an open question is durably saved but not
 yet searchable** — it only becomes visible to recall once answered (via
 `POST /api/memory-units/{id}/clarify`) or explicitly discarded (`POST
-.../discard`). The answer becomes part of that unit's permanent semantic
-representation (aliases, definitions), not a transient chat turn.
+.../discard`). Answering is optional — a blank answer just skips the
+question, enforced only as a client-side preference (the settings menu's
+"obligatory" toggle), never by the API. A real answer becomes part of
+that unit's permanent semantic representation (aliases, definitions),
+not a transient chat turn.
+
+Once no question is left pending, the heavier semantic-extraction step
+(enrichment + embedding) runs as a background task rather than blocking
+the save request — the unit sits briefly in `status="processing"` and
+the web UI polls until it's `"ready"` (see `docs/ARCHITECTURE.md`), so
+submitting a second memory never waits on the first one's enrichment.
 
 The original text and files are never modified by any of this. A
 committed memory can be corrected later in natural language (`POST

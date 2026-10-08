@@ -7,12 +7,14 @@ Browser (Jinja2-rendered HTML + vanilla JS)
         |  fetch() -- JSON over HTTP, same origin
         v
 FastAPI app (backend/app)
-  ├── api/captures.py   -- POST/GET/DELETE /api/captures/{id}, .../attachments
+  ├── api/captures.py   -- POST /api/captures, GET /api/captures (list),
+  |                        GET/DELETE /api/captures/{id}, .../attachments
   ├── api/units.py      -- GET/clarify/correct/discard/retry on /api/memory-units/{id}
   ├── api/recall.py     -- POST /api/recall (legacy one-shot);
   |                        POST/GET /api/recall/sessions[/{id}],
   |                        POST .../messages, POST .../cancel
-  ├── web/routes.py     -- GET /, GET /recall (serves the HTML shell)
+  ├── web/routes.py     -- GET / (Remember), GET /recall (Recall),
+  |                        GET /captures (Browse) -- serves the HTML shell
   ├── ingestion/        -- segmentation, enrichment, pipeline orchestration
   ├── retrieval/        -- hybrid search, sibling expansion, answer
   |                        generation, one-shot agent, RecallSession
@@ -139,26 +141,51 @@ capture text + files
             |   (MAX_CLARIFICATION_ROUNDS) isn't exhausted, answering can
             |   trigger a fresh round of generate_questions() -- iterative,
             |   not a single fixed question.
-            ├─ if no question is (or remains) pending: enrich()
-            |   (app/ingestion/enrichment.py), run exactly once, after
-            |   clarification is fully settled rather than before -- doing
-            |   it earlier would be wasted work, since an answer changes
-            |   the semantic representation anyway (see docs/DECISIONS.md).
-            |   LLM structured-output call -> meaning, aliases, entities,
-            |   topics, definitions, relations, event_date (never raises:
-            |   LLM failure -> unit still persists, just with
-            |   semantic={"enrichment_status": "unavailable"})
-            ├─ build_retrieval_text(): deterministic (non-LLM) text
-            |   combining original + clarifications + meaning + aliases +
-            |   definitions + relations (spec section 11)
-            ├─ searchable_text = authoritative_content + attachment text
-            |   + retrieval_text  (feeds the GIN full-text index)
-            ├─ embed(retrieval_text) -> pgvector column (best-effort;
-            |   failure leaves embedding NULL, unit still full-text
-            |   searchable)
-            └─ status = "ready" (or "failed" on a genuinely unexpected
-                exception -- see "Failure model" below), COMMIT
+            └─ if no question is (or remains) pending: status="processing",
+                COMMIT -- the HTTP response returns here. Full enrichment
+                (below) runs as a scheduled FastAPI BackgroundTask
+                (finish_unit_processing(), app/ingestion/pipeline.py),
+                *after* the request/response cycle, so the client is
+                never blocked waiting for it and a second capture can be
+                submitted (or a second clarification answered) while the
+                first is still enriching -- see docs/DECISIONS.md.
 ```
+
+```
+finish_unit_processing() (background task, own DB session + row lock)
+      |
+      ├─ enrich() (app/ingestion/enrichment.py): three independent LLM
+      |   structured-output sub-calls -- narrative (meaning/aliases/
+      |   event_date), entities (people/organizations/locations),
+      |   retrieval-aids (topics/definitions/relations) -- each degrades
+      |   independently on LLMError rather than all-or-nothing (never
+      |   raises: a failed sub-call's fields just come back empty, with
+      |   semantic["enrichment_status"] reflecting "ok" vs "unavailable")
+      ├─ build_retrieval_text(): deterministic (non-LLM) text combining
+      |   original + clarifications + meaning + aliases + definitions +
+      |   relations (spec section 11)
+      ├─ searchable_text = authoritative_content + attachment text
+      |   + retrieval_text  (feeds the GIN full-text index)
+      ├─ embed(retrieval_text) -> pgvector column (best-effort; failure
+      |   leaves embedding NULL, unit still full-text searchable)
+      └─ status = "ready" (or "failed" on a genuinely unexpected
+          exception -- see "Failure model" below), COMMIT
+```
+
+The unit row is locked (`SELECT ... FOR UPDATE`, i.e. SQLAlchemy's
+`with_for_update=True`) for the *entire* duration of
+`finish_unit_processing()`, not just the final commit. This matters
+because `POST /memory-units/{id}/retry` is deliberately allowed on a
+unit that's still `"processing"` (the recovery path for a server
+restart that drops an in-flight `BackgroundTask` -- FastAPI doesn't
+persist or resume these across a restart). Without the lock, a retry
+racing a genuinely-still-running enrichment pass could either duplicate
+the LLM work or -- worse -- block on the row, then stomp the enrichment's
+freshly-committed `"ready"`/`"failed"` result back to `"processing"` the
+instant it unblocks, and schedule a wasted re-run. `retry_enrichment()`
+re-acquires the same lock and re-checks status immediately after, so a
+unit that finished while the retry was blocked is returned as-is instead
+of being clobbered.
 
 This two-phase-commit structure is what guarantees "authoritative content
 persists even if derived processing fails" (spec section 25): the
@@ -169,16 +196,23 @@ If `generate_questions()` surfaces a question, the unit's status becomes
 `"awaiting_clarification"` instead of `"ready"` -- **gated**: it is
 durably saved (survives a restart) but invisible to recall until
 answered, because `hybrid_search()` only ever considers
-`status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`)
-appends the verbatim Q&A to `clarifications`, then calls `_advance_unit()`
-again: drain the next queued question if one exists, else -- if the round
-budget allows -- check whether the new answer reveals something else
-worth asking about, else run full enrichment (retrieval_text,
-searchable_text, embedding) with every clarification as context -- this
-is what makes a clarified term's aliases actually searchable afterward,
-not just present in a one-off answer -- and flips status to `"ready"`.
-The user may also explicitly cancel an awaiting unit (`POST .../discard`,
-status becomes `"discarded"`) rather than answer it.
+`status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`) appends the verbatim
+Q&A to `clarifications`, then calls `_advance_unit()` again: drain the
+next queued question if one exists, else -- if the round budget allows
+-- check whether the new answer reveals something else worth asking
+about, else move to `status="processing"` and schedule background
+enrichment (above) with every clarification as context -- this is what
+makes a clarified term's aliases actually searchable afterward, not
+just present in a one-off answer.
+
+Answering is optional, enforced only as a client-side preference (the
+settings menu's "obligatory" toggle, `app/static/app.js`), never by the
+API: `ClarifyRequest.answer` is `str | None`, and a blank/omitted answer
+skips the question -- nothing is appended to `clarifications`, the unit
+just proceeds through `_advance_unit()` exactly as if the question had
+never been asked. The user may also explicitly cancel an awaiting unit
+(`POST .../discard`, status becomes `"discarded"`) rather than answer
+or skip it.
 
 Clarification is bounded on two axes (`app/ingestion/pipeline.py`):
 `MAX_QUESTIONS_PER_ROUND = 3` candidate questions considered per check
@@ -408,7 +442,12 @@ Four independent layers of tolerance, from most to least routine:
    transaction) is untouched. `POST /memory-units/{id}/retry` calls
    `_advance_unit()` again, resuming from wherever it got stuck -- it
    doesn't blindly restart from enrichment, since the unit might have
-   failed mid-clarification-check instead.
+   failed mid-clarification-check instead. `retry` is also the recovery
+   path for a unit stuck in `"processing"` because a server restart
+   dropped its `BackgroundTask`; it re-acquires the same row lock
+   `finish_unit_processing()` holds and re-checks status afterward, so
+   racing a genuinely-still-running enrichment pass can't stomp its
+   result (see "Data flow: ingestion" above).
 3. **An open clarification question**: `status="awaiting_clarification"`
    -- not a failure at all, but deliberately excluded from recall until
    resolved (see "clarification" above).
@@ -417,9 +456,16 @@ Four independent layers of tolerance, from most to least routine:
 
 A unit is only ever searchable (`status="ready"`) after its derived
 stage ran to completion with no open question -- `"draft"` (crash before
-phase 1 finished), `"awaiting_clarification"`, `"failed"`, and
+phase 1 finished), `"awaiting_clarification"`, `"processing"` (background
+enrichment scheduled but not yet finished), `"failed"`, and
 `"discarded"` (user-cancelled) all never appear in `hybrid_search()`
-results, filtered out by its `status = 'ready'` SQL clause.
+results, filtered out by its `status = 'ready'` SQL clause. The same
+gate applies to `attachment_chunks` via `hybrid_search_chunks()`, even
+though chunks have no status column of their own -- they're indexed as
+soon as an attachment is uploaded, before segmentation or clarification
+even run, so an EXISTS check requiring at least one `status='ready'`
+sibling `MemoryUnit` in the same capture closes that gap at the
+granularity chunks actually have.
 
 ## Memory unit schema
 
@@ -435,7 +481,8 @@ memory_units
                                                  source="user_correction"
                                                  for a correct_unit() entry
   status                         text        -- draft | awaiting_clarification
-                                                 | ready | failed | discarded
+                                                 | processing | ready | failed
+                                                 | discarded
   pending_clarification          jsonb null  -- {question, field, round}
   clarification_queue            jsonb       -- [{question, field}, ...]
                                                  not-yet-asked candidates
@@ -522,13 +569,21 @@ sites, one per narrow decision:
 |---|---|---|
 | `segment_capture()` | `ingestion/segmentation.py` | how many memory units this capture contains |
 | `generate_questions()` | `ingestion/clarify.py` | whether to ask a clarification question, and about what |
-| `enrich()` | `ingestion/enrichment.py` | the full semantic representation |
+| `enrich()` | `ingestion/enrichment.py` | the full semantic representation -- itself three independent sub-calls (narrative/entities/retrieval-aids) |
 | `evaluate_sufficiency()` | `retrieval/pipeline.py` | whether retrieved evidence is enough to answer, and what to search next |
 | `generate_answer()` | `retrieval/pipeline.py` | the final answer text and whether it's grounded |
 | `extract_cues()` | `retrieval/cues.py` | structured cues from a RecallSession user reply (RecallSession only) |
 
-Each is a narrow, single-purpose structured-output call -- none of them
-chain multiple LLM calls internally or call each other.
+Every row except `enrich()` is a single narrow structured-output call.
+`enrich()` is the one exception: it internally makes three independent
+calls (narrative: meaning/aliases/event_date; entities: people/
+organizations/locations; retrieval-aids: topics/definitions/relations),
+each schema-scoped to only the fields it's responsible for, and each
+degrades independently on `LLMError` rather than the whole thing
+failing together -- a prior single 9-field schema was split this way
+after a benchmark found the combined call under-using some fields (see
+docs/DECISIONS.md). No call site, including `enrich()`, calls back into
+another call site.
 
 ## File handling, persistence, security
 
