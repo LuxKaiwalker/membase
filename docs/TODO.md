@@ -143,6 +143,52 @@
 
 ## Known technical gaps
 
+- **To fix: a terse, context-free capture (one or two words, no stated
+  intent) is stored but not retrievable under any query describing the
+  *purpose* those words were captured for.** Verified live: storing
+  "Bananas.", "Pepper.", and "Garlic." as three separate captures (each
+  correctly reaches "ready" with no clarification question, since
+  they're common real words, not invented/ambiguous ones -- see the
+  `generate_questions()` gap above for why that mechanism doesn't help
+  here either) produces semantic enrichment like "A brief mention of
+  bananas." with topics like "produce"/"healthy snacks" -- accurate,
+  but with zero connection to "buying," "shopping," or "a list."
+  Querying "What do I need to buy?" afterward **abstained entirely**
+  (0 sources) -- and a differently-phrased query that happened to
+  score well against *other*, unrelated stored memories (which
+  literally contained the words "buy"/"need" in fuller sentences)
+  returned a confident but completely wrong answer, with none of the
+  three grocery items mentioned at all. The items remain findable via
+  their own literal words ("bananas pepper garlic" finds all three
+  correctly) -- the gap is specifically that nothing links them to the
+  *intent* behind writing them down.
+
+  **Root cause:** segmentation/clarification/enrichment only ever see
+  each capture's own words; a bare noun carries no "this is something
+  I need to buy" signal for the model to work with, and -- separately
+  -- storing each item as its *own* capture means they don't even share
+  a `capture_id` for `sibling_context()` (the same mechanism that lets
+  "related context" from one unit help interpret another) to stitch
+  them together at answer time.
+
+  **Verified fix, already supported, no code change:** writing it as
+  *one* capture with the intent stated once --
+  `"Need to buy: bananas, pepper, and garlic."` -- segments into one
+  coherent unit and is correctly found by "What do I need to buy?"
+  afterward, listed alongside (not instead of) the other genuinely
+  "need to buy" memories. This is a real, usable workaround today, not
+  a hypothetical fix.
+
+  **Open question this raises, not yet designed:** should the app ever
+  intervene when a capture is this terse -- e.g. a clarifying question
+  along the lines of "what's this for?" even for an ordinary real word,
+  specifically when the capture is very short and carries no stated
+  purpose? That would be a deliberate carve-out from the existing
+  "don't ask about well-known real-world words" rule
+  (`app/ingestion/clarify.py`'s system prompt), traded against the
+  spec's explicit goal of *not* turning storage into an interrogation
+  -- a product call, not an obvious engineering one.
+
 - **To fix: ingestion-time clarification/enrichment never checks what's
   already stored.** Confirmed directly in code: `generate_questions()`
   (`app/ingestion/clarify.py`) and `enrich()`
