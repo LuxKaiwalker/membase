@@ -46,6 +46,28 @@ async def test_non_verbatim_unit_falls_back_to_no_split():
 
 
 @pytest.mark.asyncio
+async def test_word_boundary_violating_unit_rejected_as_non_verbatim():
+    """A candidate that only matches by crossing word boundaries (e.g.
+    chopped mid-word) is a character-substring of the source but not an
+    actual excerpt of it -- the verbatim check must reject it, not just
+    check for "in" at the character level."""
+    text = "my dog ate food happily"
+    llm = FakeLLMProvider(
+        segmentation_response={
+            "units": [
+                # "y dog ate foo" is a substring of "my dog ate food" at
+                # the character level, but chops both "my" and "food"
+                # mid-word -- not a real excerpt.
+                {"content": "y dog ate foo", "reason": "x", "independence": "independent"},
+            ]
+        }
+    )
+    units = await segment_capture(llm, text)
+    assert len(units) == 1
+    assert units[0].content == text
+
+
+@pytest.mark.asyncio
 async def test_segmentation_unavailable_falls_back_to_whole_text():
     text = "Some memory text."
     llm = FakeLLMProvider(fail="unavailable")

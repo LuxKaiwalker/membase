@@ -58,7 +58,18 @@ class OllamaProvider(LLMProvider):
             raise LLMUnavailableError(
                 f"Ollama returned HTTP {resp.status_code} for {path}: {resp.text[:500]}"
             )
-        return resp.json()
+        try:
+            return resp.json()
+        except json.JSONDecodeError as exc:
+            # A 200 with a non-JSON body is a different failure mode than
+            # a malformed *inner* "response" field (handled by each
+            # caller) -- without this, it would propagate as a raw
+            # json.JSONDecodeError instead of the LLMError every caller
+            # in this app is written to catch, same class of gap as the
+            # malformed-inner-field case just below each call site.
+            raise LLMMalformedOutputError(
+                f"Ollama returned a non-JSON response for {path}: {resp.text[:500]}"
+            ) from exc
 
     async def generate(
         self, prompt: str, *, system: str | None = None, temperature: float = 0.2

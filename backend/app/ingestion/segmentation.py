@@ -64,7 +64,21 @@ def _normalize(text: str) -> str:
 
 
 def _is_verbatim(candidate: str, source: str) -> bool:
-    return _normalize(candidate) in _normalize(source)
+    """Word-boundary-aware verbatim check: candidate must appear as a
+    contiguous run of whole words in source, not merely as a character
+    substring. A plain `in` check on normalized strings would wrongly
+    accept a candidate that only matches by crossing word boundaries
+    (e.g. "y dog ate foo" is a character-substring of "my dog ate food"
+    but is not an actual excerpt of it) -- exactly the kind of
+    boundary-chopped fragment an LLM's tokenization can occasionally
+    produce, which this check exists specifically to catch.
+    """
+    candidate_words = _normalize(candidate).split()
+    source_words = _normalize(source).split()
+    n = len(candidate_words)
+    if n == 0:
+        return False
+    return any(source_words[i : i + n] == candidate_words for i in range(len(source_words) - n + 1))
 
 
 async def segment_capture(llm: LLMProvider, raw_text: str) -> list[ProposedUnit]:

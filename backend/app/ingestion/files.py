@@ -6,7 +6,7 @@ from pathlib import Path
 
 import magic
 from pypdf import PdfReader
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 
 from app.config import get_settings
 
@@ -86,7 +86,14 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
     if kind == "image":
         try:
             _validate_image(data)
-        except UnidentifiedImageError as exc:
+        except OSError as exc:
+            # Covers both an unrecognizable format (UnidentifiedImageError,
+            # itself an OSError subclass) and a recognized-but-corrupt/
+            # truncated file (a plain OSError, e.g. "Truncated File Read"
+            # from a PNG cut off mid-stream) -- confirmed by direct testing
+            # that PIL raises the latter as a bare OSError, not
+            # UnidentifiedImageError, so catching only the subclass let a
+            # truncated image 500 instead of cleanly 400ing.
             raise UnsupportedFileError(f"File claims to be an image but isn't: {filename}") from exc
 
     dest_dir = settings.uploads_dir / str(memory_id)

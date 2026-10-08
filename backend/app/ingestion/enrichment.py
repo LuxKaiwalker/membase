@@ -152,8 +152,17 @@ def _as_definitions(value: Any) -> list[Definition]:
         return []
     out = []
     for item in value:
-        if isinstance(item, dict) and item.get("term") and item.get("definition"):
-            out.append(Definition(term=_as_str(item["term"]), definition=_as_str(item["definition"])))
+        if not isinstance(item, dict):
+            continue
+        term = _as_str(item.get("term"))
+        definition = _as_str(item.get("definition"))
+        # Check the *stripped* values, not just key presence/truthiness --
+        # a non-string or whitespace-only field would otherwise slip
+        # through as a degenerate empty-string entry instead of being
+        # filtered out, same class of defensiveness _as_str_list already
+        # applies to flat lists.
+        if term and definition:
+            out.append(Definition(term=term, definition=definition))
     return out
 
 
@@ -162,14 +171,13 @@ def _as_relations(value: Any) -> list[Relation]:
         return []
     out = []
     for item in value:
-        if isinstance(item, dict) and all(k in item for k in ("subject", "predicate", "object")):
-            out.append(
-                Relation(
-                    subject=_as_str(item["subject"]),
-                    predicate=_as_str(item["predicate"]),
-                    object=_as_str(item["object"]),
-                )
-            )
+        if not isinstance(item, dict):
+            continue
+        subject = _as_str(item.get("subject"))
+        predicate = _as_str(item.get("predicate"))
+        obj = _as_str(item.get("object"))
+        if subject and predicate and obj:
+            out.append(Relation(subject=subject, predicate=predicate, object=obj))
     return out
 
 
