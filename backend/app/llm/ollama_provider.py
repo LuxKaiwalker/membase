@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 from typing import Any
@@ -71,39 +72,70 @@ class OllamaProvider(LLMProvider):
                 f"Ollama returned a non-JSON response for {path}: {resp.text[:500]}"
             ) from exc
 
+    @staticmethod
+    def _encode_images(images: list[bytes] | None) -> list[str] | None:
+        if not images:
+            return None
+        return [base64.b64encode(data).decode("ascii") for data in images]
+
+    def _build_messages(
+        self, prompt: str, *, system: str | None, images: list[str] | None
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        user_message: dict[str, Any] = {"role": "user", "content": prompt}
+        if images:
+            user_message["images"] = images
+        messages.append(user_message)
+        return messages
+
     async def generate(
-        self, prompt: str, *, system: str | None = None, temperature: float = 0.2
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.2,
+        images: list[bytes] | None = None,
     ) -> str:
         payload: dict[str, Any] = {
             "model": self._generation_model,
-            "prompt": prompt,
+            "messages": self._build_messages(prompt, system=system, images=self._encode_images(images)),
             "stream": False,
             "options": {"temperature": temperature},
         }
-        if system:
-            payload["system"] = system
-        data = await self._post("/api/generate", payload)
-        response = data.get("response")
-        if not isinstance(response, str):
-            raise LLMMalformedOutputError("Ollama /api/generate response missing 'response' field")
-        return response
+        data = await self._post("/api/chat", payload)
+        content = data.get("message", {}).get("content")
+        if not isinstance(content, str):
+            raise LLMMalformedOutputError("Ollama /api/chat response missing 'message.content' field")
+        return content
 
     async def generate_structured(
-        self, prompt: str, *, schema: dict[str, Any], system: str | None = None
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        system: str | None = None,
+        images: list[bytes] | None = None,
     ) -> dict[str, Any]:
+        # /api/generate's flat system+prompt fields were measured to
+        # truncate array-typed structured output for this model (gemma4)
+        # -- e.g. a 3-item "units" array collapsed to 1 item, or an
+        # array-of-strings schema came back empty -- while /api/chat's
+        # proper messages list, same schema, same content, reliably
+        # returns the full array. Confirmed directly against the live
+        # model, not assumed; see docs/DECISIONS.md "Gemma 4 migration".
         payload: dict[str, Any] = {
             "model": self._generation_model,
-            "prompt": prompt,
+            "messages": self._build_messages(prompt, system=system, images=self._encode_images(images)),
             "stream": False,
             "format": schema,
             "options": {"temperature": 0.0},
         }
-        if system:
-            payload["system"] = system
-        data = await self._post("/api/generate", payload)
-        raw = data.get("response")
+        data = await self._post("/api/chat", payload)
+        raw = data.get("message", {}).get("content")
         if not isinstance(raw, str):
-            raise LLMMalformedOutputError("Ollama /api/generate response missing 'response' field")
+            raise LLMMalformedOutputError("Ollama /api/chat response missing 'message.content' field")
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:

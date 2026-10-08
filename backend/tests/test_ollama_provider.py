@@ -1,3 +1,6 @@
+import base64
+import json
+
 import httpx
 import pytest
 
@@ -64,7 +67,49 @@ async def test_connection_failure_raises_unavailable_error():
 @pytest.mark.asyncio
 async def test_well_formed_response_still_works():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": "hello back"})
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "hello back"}})
 
     provider = _provider_with_transport(handler)
     assert await provider.generate("hello") == "hello back"
+
+
+@pytest.mark.asyncio
+async def test_generate_calls_chat_endpoint_with_system_and_user_messages():
+    """Regression: /api/generate's flat system+prompt fields were measured
+    to truncate array-typed structured output for gemma4 (a 3-item array
+    collapsed to 1 item; an array-of-strings schema came back empty) --
+    /api/chat's proper messages list does not have this problem, confirmed
+    directly against the live model (see docs/DECISIONS.md "Gemma 4
+    migration"). This locks in that /api/chat is actually what gets
+    called, not /api/generate."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "ok"}})
+
+    provider = _provider_with_transport(handler)
+    await provider.generate("do the thing", system="be helpful")
+
+    assert captured["path"] == "/api/chat"
+    assert captured["body"]["messages"] == [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "do the thing"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_attaches_images_to_the_user_message():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "a photo"}})
+
+    provider = _provider_with_transport(handler)
+    await provider.generate("describe this", images=[b"fake-image-bytes"])
+
+    user_message = captured["body"]["messages"][-1]
+    assert user_message["role"] == "user"
+    assert user_message["images"] == [base64.b64encode(b"fake-image-bytes").decode("ascii")]

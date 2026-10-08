@@ -30,13 +30,28 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def generate(
-        self, prompt: str, *, system: str | None = None, temperature: float = 0.2
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.2,
+        images: list[bytes] | None = None,
     ) -> str:
-        """Free-text completion."""
+        """Free-text completion. `images` (raw bytes, any format the
+        backend's vision encoder accepts) is for a natively multimodal
+        model -- passing it to a backend/model that doesn't support image
+        input is a programming error, not a degrade-gracefully case,
+        since this app now uses exactly one generation model everywhere
+        and that model is always multimodal (see docs/DECISIONS.md)."""
 
     @abstractmethod
     async def generate_structured(
-        self, prompt: str, *, schema: dict[str, Any], system: str | None = None
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        system: str | None = None,
+        images: list[bytes] | None = None,
     ) -> dict[str, Any]:
         """Completion constrained to a JSON schema, returned as a parsed dict.
 

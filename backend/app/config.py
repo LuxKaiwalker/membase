@@ -9,18 +9,35 @@ class Settings(BaseSettings):
 
     database_url: str
     ollama_host: str = "http://127.0.0.1:11434"
-    # qwen2.5:14b-instruct-q4_K_M, not the 7b variant: segmentation and
-    # enrichment need real judgment (see docs/DECISIONS.md) and 7b visibly
-    # under-performs on them. Deliberately the *only* generation model used
-    # anywhere in the app -- mixing it with another generation model would
-    # exceed this GPU's 11GB VRAM alongside nomic-embed-text and cause a
-    # ~7-14s reload stall on every alternating call (see CLAUDE.md).
-    membase_generation_model: str = "qwen2.5:14b-instruct-q4_K_M"
+    # gemma4:12b -- natively multimodal (text/image/audio, no separate
+    # vision encoder to wire up), used for *every* generation/structured-
+    # output call, including describing an uploaded image (see
+    # app/ingestion/pipeline.py's _describe_image). Migrated from
+    # qwen2.5:14b-instruct-q4_K_M; see docs/DECISIONS.md for why, and for
+    # the measured VRAM cost. Deliberately the *only* generation model
+    # used anywhere in the app -- this GPU has 11GB VRAM and gemma4:12b
+    # alone already measures ~8.7GB alongside nomic-embed-text's ~0.25GB,
+    # leaving no realistic headroom for a second generation model without
+    # risking the eviction/reload thrashing CLAUDE.md documents.
+    membase_generation_model: str = "gemma4:12b"
     membase_embed_model: str = "nomic-embed-text"
     membase_embed_dim: int = 768
     uploads_dir: Path = Path(".data/uploads")
     membase_max_upload_mb: int = 25
     llm_timeout_seconds: float = 90.0
+    # Bounds on how much of one attachment gets expensive per-chunk LLM/
+    # embedding treatment -- see docs/DECISIONS.md "Large attachments".
+    # The *original* file and its full extracted text are never truncated
+    # by this; only how many AttachmentChunk rows get embedded for deep
+    # chunk-level search into a single huge document.
+    membase_max_chunks_per_attachment: int = 300
+    # One captioning call per image already bounds per-image cost to O(1)
+    # regardless of resolution (the vision encoder's own fixed tiling
+    # handles that) -- this instead bounds the number of images in a
+    # *single* capture that get captioned, so attaching dozens of images
+    # at once doesn't turn one request into dozens of sequential vision
+    # calls with no visible bound.
+    membase_max_images_captioned_per_capture: int = 8
 
 
 @lru_cache
