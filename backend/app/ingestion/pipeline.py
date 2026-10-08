@@ -172,7 +172,7 @@ async def _run_full_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit, 
     the LLM being up).
     """
     try:
-        semantic = await enrich(llm, unit.authoritative_content, unit.clarifications)
+        semantic = await enrich(llm, unit.authoritative_content, unit.clarifications, attachment_text)
         unit.semantic = semantic
         unit.retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
         unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
@@ -217,7 +217,11 @@ async def _advance_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, attachm
     if unit.clarification_round < MAX_CLARIFICATION_ROUNDS:
         try:
             questions = await generate_questions(
-                llm, unit.authoritative_content, unit.clarifications, max_questions=MAX_QUESTIONS_PER_ROUND
+                llm,
+                unit.authoritative_content,
+                unit.clarifications,
+                attachment_text,
+                max_questions=MAX_QUESTIONS_PER_ROUND,
             )
         except Exception:
             # generate_questions() itself never raises (it catches

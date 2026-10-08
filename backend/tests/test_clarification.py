@@ -1,6 +1,8 @@
 import pytest
 
+from app.ingestion.clarify import generate_questions
 from app.ingestion.pipeline import MAX_CLARIFICATION_ROUNDS, create_capture, resolve_clarification
+from app.llm.base import LLMProvider
 from app.retrieval.pipeline import hybrid_search
 from tests.fakes import FakeLLMProvider
 from tests.helpers import resolve_clarification_and_finish
@@ -207,3 +209,53 @@ async def test_unit_awaiting_clarification_is_not_searchable(db):
     fetched = db.get(type(unit), unit.id)
     assert fetched is not None
     assert fetched.authoritative_content == "My Zorblex code is 42."
+
+
+class _PromptCapturingLLM(LLMProvider):
+    """Records the prompt it's asked to complete -- the only reliable way
+    to verify attachment context actually reaches generate_questions()'s
+    prompt, since FakeLLMProvider dispatches purely by schema shape and
+    never looks at prompt content."""
+
+    def __init__(self, response: dict) -> None:
+        self._response = response
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt, *, system=None, temperature=0.2, images=None):
+        raise NotImplementedError
+
+    async def generate_structured(self, prompt, *, schema, system=None, images=None):
+        self.prompts.append(prompt)
+        return self._response
+
+    async def embed(self, texts):
+        raise NotImplementedError
+
+    @property
+    def embedding_model_name(self) -> str:
+        return "fake"
+
+    @property
+    def embedding_dim(self) -> int:
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_generate_questions_includes_attachment_text_in_prompt():
+    """An attached image's caption (or any attachment's extracted text)
+    must reach the clarification-question prompt -- a vague reference
+    the attachment already resolves (e.g. "this colour" + a red-shoe
+    photo) must not be flagged as needing a question. The guarantee this
+    relies on is the required `attachment_text` parameter and pipeline.py's
+    call order (captioning always finishes before this is ever called),
+    not prompt wording -- see docs/DECISIONS.md."""
+    llm = _PromptCapturingLLM({"questions": []})
+    await generate_questions(
+        llm,
+        "I like shoes of this colour.",
+        [],
+        "a photograph of a red running shoe",
+        max_questions=3,
+    )
+    assert len(llm.prompts) == 1
+    assert "a photograph of a red running shoe" in llm.prompts[0]

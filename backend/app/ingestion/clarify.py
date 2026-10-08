@@ -67,6 +67,10 @@ _SYSTEM = (
     "well-known university; nothing here is actually unclear)\n\n"
     "Example where NO question is warranted (ordinary text, nothing "
     'uncertain):\nText: "I had lunch today."\n-> questions: []\n\n'
+    "If attached file content is given below the text, treat it as "
+    "already-known information, not something to ask about -- a vague "
+    "reference in the text that the attachment already answers is not "
+    "ambiguous.\n\n"
     "Return an empty list whenever nothing qualifies -- most memories "
     "need no questions at all. Be terse."
 )
@@ -85,16 +89,35 @@ _RELEVANCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 async def generate_questions(
-    llm: LLMProvider, content: str, clarifications: list[dict], *, max_questions: int
+    llm: LLMProvider,
+    content: str,
+    clarifications: list[dict],
+    attachment_text: str,
+    *,
+    max_questions: int,
 ) -> list[dict]:
     """Returns up to `max_questions` candidate clarification questions,
     each `{"question": str, "field": str}`, highest-relevance first.
     Never raises: an LLM failure here just means no question is asked
     this round (full enrichment still runs best-effort, same tolerance
     as the rest of the ingestion pipeline).
+
+    `attachment_text` is a required positional parameter, not an
+    afterthought kwarg -- every caller must pass whatever's already
+    known about attached files (including an uploaded image's caption,
+    see app/ingestion/pipeline.py's _describe_image), so a vague
+    reference the attachment already resolves is never asked about.
+    The guarantee this relies on is call-order, enforced in code, not
+    prompt wording: pipeline.py always finishes image captioning before
+    this is ever called, so `attachment_text` is complete by the time it
+    gets here (see docs/DECISIONS.md).
     """
     clar_block = _format_clarifications(clarifications)
-    prompt = f"Memory text:\n{content}\n{clar_block}\n\nWhat, if anything, is worth asking about?"
+    attachment_block = f"\nAttached file content:\n{attachment_text}\n" if attachment_text else ""
+    prompt = (
+        f"Memory text:\n{content}\n{attachment_block}{clar_block}\n\n"
+        "What, if anything, is worth asking about?"
+    )
 
     try:
         raw = await llm.generate_structured(prompt, schema=_SCHEMA, system=_SYSTEM)

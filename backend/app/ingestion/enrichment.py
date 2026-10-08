@@ -204,6 +204,7 @@ async def enrich(
     llm: LLMProvider,
     content: str,
     clarifications: list[dict],
+    attachment_text: str,
     *,
     now: dt.datetime | None = None,
 ) -> Semantics:
@@ -216,10 +217,16 @@ async def enrich(
     Deliberately does not decide clarification questions -- that's
     app/ingestion/clarify.py, run and fully resolved before this is ever
     called (see docs/DECISIONS.md for why these are separate calls).
+
+    `attachment_text` is required, not an afterthought kwarg -- an
+    attached file (including an uploaded image's caption) is real
+    content about the memory, so meaning/entities/aliases extraction
+    must see it, the same way clarify.generate_questions() does.
     """
     today = (now or dt.datetime.now(dt.UTC)).date().isoformat()
     clar_block = _format_clarifications(clarifications)
-    header = f"Today's date is {today}.\nMemory text:\n{content}\n{clar_block}\n\n"
+    attachment_block = f"Attached file content:\n{attachment_text}\n" if attachment_text else ""
+    header = f"Today's date is {today}.\nMemory text:\n{content}\n{attachment_block}{clar_block}\n\n"
 
     narrative = await _call(
         llm, header + "Extract the core meaning and, if present, the event date.",

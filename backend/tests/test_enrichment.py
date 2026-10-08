@@ -47,7 +47,7 @@ class _SelectiveFailureLLM(LLMProvider):
 @pytest.mark.asyncio
 async def test_enrich_degrades_to_unavailable_only_when_every_sub_call_fails():
     llm = FakeLLMProvider(fail="unavailable")
-    result = await enrich(llm, "Some memory text.", [])
+    result = await enrich(llm, "Some memory text.", [], "")
     assert result["enrichment_status"] == "unavailable"
     assert result["meaning"] == ""
     assert result["people"] == []
@@ -66,7 +66,7 @@ async def test_enrich_partial_failure_keeps_successful_slices():
         fail_schema_key="people",
         response={"meaning": "A thing happened.", "event_date": "", "aliases": ["a thing"], "topics": [], "definitions": [], "relations": []},
     )
-    result = await enrich(llm, "Some memory text.", [])
+    result = await enrich(llm, "Some memory text.", [], "")
     assert result["enrichment_status"] == "ok"
     assert result["meaning"] == "A thing happened."
     assert result["aliases"] == ["a thing"]
@@ -92,9 +92,56 @@ async def test_enrich_filters_malformed_definitions_and_relations():
             ],
         }
     )
-    result = await enrich(llm, "I met Anna.", [])
+    result = await enrich(llm, "I met Anna.", [], "")
     assert result["definitions"] == [{"term": "real term", "definition": "real definition"}]
     assert result["relations"] == [{"subject": "I", "predicate": "met", "object": "Anna"}]
+
+
+class _PromptCapturingLLM(LLMProvider):
+    """Records every prompt it's asked to complete, so a test can assert
+    on the exact text sent to the model -- the only reliable way to
+    verify attachment context actually reaches a prompt, since
+    FakeLLMProvider dispatches purely by schema shape and never looks at
+    prompt content."""
+
+    def __init__(self, response: dict) -> None:
+        self._response = response
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt, *, system=None, temperature=0.2, images=None):
+        self.prompts.append(prompt)
+        return "ok"
+
+    async def generate_structured(self, prompt, *, schema, system=None, images=None):
+        self.prompts.append(prompt)
+        return self._response
+
+    async def embed(self, texts):
+        raise NotImplementedError
+
+    @property
+    def embedding_model_name(self) -> str:
+        return "fake"
+
+    @property
+    def embedding_dim(self) -> int:
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_enrich_includes_attachment_text_in_every_sub_call_prompt():
+    """An attached image's caption (or any attachment's extracted text)
+    is real content about the memory -- meaning/entities/aliases
+    extraction must see it, not just full-text search (see
+    docs/DECISIONS.md "Gemma 4 migration" / attachment-context fix)."""
+    llm = _PromptCapturingLLM(
+        {"meaning": "x", "event_date": "", "people": [], "organizations": [], "locations": [],
+         "aliases": [], "topics": [], "definitions": [], "relations": []}
+    )
+    await enrich(llm, "I like shoes of this colour.", [], "a photograph of a red running shoe")
+    assert len(llm.prompts) == 3, "all three sub-calls (narrative/entities/retrieval-aids) must run"
+    for prompt in llm.prompts:
+        assert "a photograph of a red running shoe" in prompt
 
 
 def test_build_retrieval_text_includes_all_present_fields():
