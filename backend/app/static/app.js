@@ -164,13 +164,28 @@ const membase = (() => {
   // response).
   const POLL_INTERVAL_MS = 1500;
 
+  // An unbounded poll loop would spin forever if the background task
+  // never finishes -- e.g. the server restarted mid-task and dropped it
+  // (a scenario docs/DECISIONS.md explicitly documents, recoverable via
+  // POST /retry). Bounded generously above the worst *legitimate* case
+  // (up to 4 sequential LLM calls in _run_full_enrichment, each up to
+  // the server's 90s llm_timeout_seconds -- see app/db.py) so this only
+  // ever fires for a genuinely stuck unit, not a slow-but-working one.
+  const MAX_POLL_MS = 600_000;
+
+  class PollTimeoutError extends Error {}
+
   async function pollUnitUntilDone(unitId) {
+    const deadline = Date.now() + MAX_POLL_MS;
     while (true) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       const resp = await fetchWithTimeout(`/api/memory-units/${unitId}`);
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(data.detail || "Couldn't check memory status");
       if (data.status !== "processing") return data;
+      if (Date.now() > deadline) {
+        throw new PollTimeoutError(`Still processing after ${formatElapsed(MAX_POLL_MS)}`);
+      }
     }
   }
 
@@ -189,7 +204,14 @@ const membase = (() => {
           <button type="button" class="capture-clarification-discard">Discard this one</button>
         </form>
       </div>
-      <p class="capture-processing muted hidden">The memory is being processed...</p>
+      <div class="capture-processing hidden">
+        <p class="muted">The memory is being processed...</p>
+        <p class="capture-stuck hidden status error">
+          Still processing after 10 minutes -- the server may have
+          restarted mid-task.
+          <button type="button" class="capture-retry">Retry processing</button>
+        </p>
+      </div>
       <div class="capture-result hidden">
         <h2 class="capture-result-heading">Saved.</h2>
         <p class="muted">Derived information (automatically extracted; your original text above is never changed by it):</p>
@@ -212,6 +234,8 @@ const membase = (() => {
     const clarificationAnswer = card.querySelector(".capture-clarification-answer");
     const clarificationDiscard = card.querySelector(".capture-clarification-discard");
     const processingEl = card.querySelector(".capture-processing");
+    const stuckEl = card.querySelector(".capture-stuck");
+    const retryButton = card.querySelector(".capture-retry");
     const resultSection = card.querySelector(".capture-result");
     const resultHeading = card.querySelector(".capture-result-heading");
     const derivedEl = card.querySelector(".derived");
@@ -245,6 +269,7 @@ const membase = (() => {
 
     async function waitForProcessing() {
       hide(clarificationSection);
+      hide(stuckEl);
       show(processingEl);
       const inFlight = allUnits.filter((u) => u.status === "processing");
       try {
@@ -253,11 +278,33 @@ const membase = (() => {
           allUnits = allUnits.map((u) => (u.id === unit.id ? unit : u));
         }
       } catch (err) {
+        if (err instanceof PollTimeoutError) {
+          // Still "processing" as far as the unit itself is concerned --
+          // offer a retry instead of a dead-end error, since POST /retry
+          // is exactly the documented recovery path for this.
+          show(stuckEl);
+          return;
+        }
         showError(err.message);
         return;
       }
       showResult();
     }
+
+    retryButton.addEventListener("click", async () => {
+      hide(stuckEl);
+      try {
+        await Promise.all(
+          allUnits
+            .filter((u) => u.status === "processing")
+            .map((u) => postJSON(`/api/memory-units/${u.id}/retry`, {}))
+        );
+      } catch (err) {
+        showError(err.message);
+        return;
+      }
+      await waitForProcessing();
+    });
 
     function askNextClarification() {
       if (pendingQueue.length === 0) {
