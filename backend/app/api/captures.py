@@ -1,6 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -48,6 +49,14 @@ async def create(
         if unit.status == "processing":
             background_tasks.add_task(finish_unit_processing, unit.id)
     return capture
+
+
+@router.get("", response_model=list[CaptureOut])
+async def list_captures(db: Session = Depends(get_db)):
+    """Newest first, no pagination -- a single-user localhost MVP's
+    capture volume doesn't warrant it yet (see docs/TODO.md)."""
+    captures = db.scalars(select(Capture).order_by(Capture.created_at.desc())).all()
+    return list(captures)
 
 
 @router.get("/{capture_id}", response_model=CaptureOut)

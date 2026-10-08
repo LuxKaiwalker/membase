@@ -156,3 +156,24 @@ button:hover { opacity: 0.9; }
   border-top: 1px solid var(--border);
 }
 #sources li .caption { font-size: 0.9rem; }
+
+.capture-row .capture-delete {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.capture-row .capture-delete:hover { color: #d6336c; border-color: #d6336c; opacity: 1; }
+
+.status-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.status-badge-ready { color: #2b8a3e; border-color: #2b8a3e; }
+.status-badge-failed { color: #d6336c; border-color: #d6336c; }
+.status-badge-awaiting_clarification,
+.status-badge-processing { color: var(--accent); border-color: var(--accent); }

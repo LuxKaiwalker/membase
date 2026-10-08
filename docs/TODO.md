@@ -59,9 +59,15 @@
   highest value with 100% recall@10 on 30 cases, but a margin-below-top-
   score rule might generalize better as the corpus grows. Needs a larger
   eval set to tell the two apart.
-- **Should there be a UI affordance for browsing/deleting individual
-  captures**, not just creating and recalling? The API supports it
-  (`GET`/`DELETE /api/captures/{id}`); the web UI doesn't expose it yet.
+- **Resolved: a Browse page (`/captures`) lists every capture newest-
+  first with a delete button per capture**, backed by a new
+  `GET /api/captures` list endpoint (`GET /api/captures/{id}` already
+  existed for a single capture). No pagination -- not warranted yet at
+  this MVP's expected capture volume. Deletion asks for confirmation
+  client-side (a plain `confirm()`) before calling the existing
+  `DELETE /api/captures/{id}`; there was no product ambiguity left here
+  once the question was "should this exist", the engineering approach
+  was evident.
 - **Resolved: `MAX_CLARIFICATION_ROUNDS` is now 3** (was 1), with up to
   `MAX_QUESTIONS_PER_ROUND = 3` candidate questions surfaced per round
   (asked one at a time) -- see docs/DECISIONS.md. Still a judgment call,

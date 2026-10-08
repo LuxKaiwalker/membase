@@ -466,5 +466,64 @@ const membase = (() => {
     });
   }
 
-  return { initCreatePage, initRecallPage };
+  function renderCaptureList(listEl, captures) {
+    listEl.innerHTML = "";
+    if (captures.length === 0) {
+      listEl.innerHTML = '<p class="muted">Nothing saved yet.</p>';
+      return;
+    }
+    for (const capture of captures) {
+      const card = document.createElement("div");
+      card.className = "card capture-row";
+      const when = new Date(capture.created_at).toLocaleString();
+      const unitBadges = capture.units
+        .map((u) => `<span class="status-badge status-badge-${escapeHtml(u.status)}">${escapeHtml(u.status)}</span>`)
+        .join(" ");
+      const attachmentList = capture.attachments.length
+        ? `<p class="muted">Attachments: ${capture.attachments.map((a) => escapeHtml(a.original_filename)).join(", ")}</p>`
+        : "";
+      card.innerHTML = `
+        <p class="muted">${escapeHtml(when)}</p>
+        <p>${escapeHtml(capture.raw_text)}</p>
+        <p>${unitBadges}</p>
+        ${attachmentList}
+        <button type="button" class="capture-delete">Delete</button>
+      `;
+      card.querySelector(".capture-delete").addEventListener("click", async () => {
+        if (!confirm("Delete this memory for good? This can't be undone.")) return;
+        try {
+          const resp = await fetchWithTimeout(`/api/captures/${capture.id}`, { method: "DELETE" });
+          if (!resp.ok) {
+            const data = await resp.json().catch(() => ({}));
+            throw new Error(data.detail || `Failed to delete (${resp.status})`);
+          }
+          card.remove();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+      listEl.appendChild(card);
+    }
+  }
+
+  function initCapturesPage() {
+    const statusEl = document.getElementById("status");
+    const listEl = document.getElementById("capture-list");
+
+    (async () => {
+      const startedAt = performance.now();
+      showStatus(statusEl, "Loading...");
+      try {
+        const resp = await fetchWithTimeout("/api/captures");
+        const captures = await resp.json().catch(() => ([]));
+        if (!resp.ok) throw new Error(captures.detail || "Failed to load captures");
+        hide(statusEl);
+        renderCaptureList(listEl, captures);
+      } catch (err) {
+        showStatus(statusEl, describeError(err, performance.now() - startedAt), true);
+      }
+    })();
+  }
+
+  return { initCreatePage, initRecallPage, initCapturesPage };
 })();

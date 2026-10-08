@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}membase — Browse{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Browse your memories</h1>
+  <p class="muted">Every capture you've saved, newest first. Deleting one removes its units and attachments for good.</p>
+
+  <div id="status" class="status hidden"></div>
+  <div id="capture-list"></div>
+</section>
+
+<script src="/static/app.js"></script>
+<script>membase.initCapturesPage();</script>
+{% endblock %}
