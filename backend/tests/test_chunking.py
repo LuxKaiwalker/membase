@@ -146,3 +146,23 @@ async def test_image_captioning_is_capped_per_capture(db, monkeypatch):
     statuses = {a.original_filename: a.extraction_status for a in attachments}
     assert statuses == {"one.png": "ok", "two.png": "unsupported"}
     assert len(llm.images_received) == 1
+
+
+@pytest.mark.asyncio
+async def test_image_caption_response_accepts_a_list_for_per_image_captions(db):
+    """Regression: unlike every other FakeLLMProvider *_response param,
+    image_caption_response previously only wrapped a plain string into
+    the {"caption": ...} shape _ResponseQueue needs -- passing a list
+    (the documented convention every other param supports, for a
+    different response per call) left raw strings in the queue, and
+    next()["caption"] would crash with a TypeError on a plain string."""
+    llm = FakeLLMProvider(image_caption_response=["first caption", "second caption"])
+    capture = await create_capture(
+        db,
+        llm,
+        text="Two photos.",
+        uploads=[("one.png", _png_bytes()), ("two.png", _png_bytes())],
+    )
+    attachments = db.query(Attachment).filter(Attachment.capture_id == capture.id).order_by(Attachment.original_filename).all()
+    captions = {a.original_filename: a.extracted_text for a in attachments}
+    assert captions == {"one.png": "first caption", "two.png": "second caption"}

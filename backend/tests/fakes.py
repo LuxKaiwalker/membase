@@ -116,10 +116,18 @@ class FakeLLMProvider(LLMProvider):
         self._answer = _ResponseQueue(answer_response, _DEFAULT_ANSWER)
         self._cues = _ResponseQueue(cue_response, dict(_DEFAULT_CUES))
         self._questions = _ResponseQueue(question_response, dict(_DEFAULT_QUESTIONS))
-        self._image_caption = _ResponseQueue(
-            {"caption": image_caption_response} if isinstance(image_caption_response, str) else image_caption_response,
-            {"caption": "a fake image"},
-        )
+        # Unlike every other *_response param, a caption is naturally a
+        # plain string rather than a dict -- wrap it (and each item, if a
+        # list of per-call captions was passed, same "list is popped in
+        # order" convention as every other param here) so _ResponseQueue
+        # always holds dicts internally.
+        if isinstance(image_caption_response, list):
+            wrapped_caption_response = [{"caption": c} for c in image_caption_response]
+        elif isinstance(image_caption_response, str):
+            wrapped_caption_response = {"caption": image_caption_response}
+        else:
+            wrapped_caption_response = image_caption_response
+        self._image_caption = _ResponseQueue(wrapped_caption_response, {"caption": "a fake image"})
         self.calls: list[str] = []  # schema "kind" per generate_structured call, for tests that assert call counts
         # Raw bytes passed via `images=` on each generate() call, in order --
         # lets a test assert the real image bytes actually reached the
