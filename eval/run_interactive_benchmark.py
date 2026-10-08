@@ -33,6 +33,7 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
+from _helpers import finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.ingestion.pipeline import create_capture  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
@@ -214,6 +215,10 @@ async def ingest_corpus(db, llm: LLMProvider, memories: list[dict]) -> tuple[dic
     semantics: dict[str, dict] = {}
     for mem in memories:
         capture = await create_capture(db, llm, text=mem["text"], uploads=[])
+        # Full enrichment is now a backgrounded step (see
+        # docs/DECISIONS.md) -- unit.semantic below would otherwise
+        # still be empty ({}), since enrichment hasn't run yet.
+        await finish_processing(db, llm, capture)
         capture_to_memory[str(capture.id)] = mem["id"]
         # A short atomic sentence should segment into exactly one unit;
         # fall back to merging all units' semantic fields just in case.

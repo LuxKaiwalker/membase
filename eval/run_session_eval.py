@@ -15,6 +15,7 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
+from _helpers import finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.ingestion.pipeline import create_capture  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
@@ -27,8 +28,12 @@ async def run_case(db, llm, case: dict) -> tuple[bool, list[str]]:
     db.execute(sql_text(TRUNCATE))
     db.commit()
 
-    for text in case.get("memories", []):
-        await create_capture(db, llm, text=text, uploads=[])
+    # Full enrichment is now a backgrounded step (see docs/DECISIONS.md)
+    # with no FastAPI BackgroundTasks machinery here to run it
+    # automatically -- without this, every unit stays status="processing"
+    # and is invisible to hybrid_search(), which only returns "ready".
+    captures = [await create_capture(db, llm, text=text, uploads=[]) for text in case.get("memories", [])]
+    await finish_processing(db, llm, *captures)
 
     turns = case["turns"]
     notes: list[str] = []
