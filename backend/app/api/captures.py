@@ -10,6 +10,7 @@ from app.ingestion.pipeline import (
     add_attachment,
     create_capture,
     delete_capture,
+    finish_attachment_chunking,
     finish_unit_processing,
 )
 from app.llm import get_llm_provider
@@ -48,6 +49,13 @@ async def create(
     for unit in capture.units:
         if unit.status == "processing":
             background_tasks.add_task(finish_unit_processing, unit.id)
+    # Chunk-level indexing (full-text/vector search granularity *within*
+    # an attachment) has no bearing on segmentation/clarification, so it
+    # was never run inline during create_capture() -- scheduled here,
+    # same reasoning as unit enrichment above, see docs/DECISIONS.md
+    # "offloading to background processing".
+    for attachment in capture.attachments:
+        background_tasks.add_task(finish_attachment_chunking, attachment.id)
     return capture
 
 

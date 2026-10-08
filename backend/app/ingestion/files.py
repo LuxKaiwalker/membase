@@ -54,7 +54,7 @@ def _detect_kind(data: bytes, filename: str) -> tuple[str, str]:
     return mime, kind
 
 
-def _extract_pdf_pages(data: bytes) -> list[str]:
+def extract_pdf_pages(data: bytes) -> list[str]:
     reader = PdfReader(io.BytesIO(data))
     return [(page.extract_text() or "").strip() for page in reader.pages]
 
@@ -107,7 +107,7 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
     extraction_status = "unsupported"
     if kind == "pdf":
         try:
-            pages = _extract_pdf_pages(data)
+            pages = extract_pdf_pages(data)
             extracted_text = "\n".join(pages).strip()
             extraction_status = "ok" if extracted_text else "unsupported"
         except Exception:

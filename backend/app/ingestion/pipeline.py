@@ -10,7 +10,7 @@ from app.db import get_sessionmaker
 from app.ingestion.chunking import chunk_attachment
 from app.ingestion.clarify import generate_questions
 from app.ingestion.enrichment import build_retrieval_text, enrich
-from app.ingestion.files import ProcessedFile, UnsupportedFileError, process_upload
+from app.ingestion.files import ProcessedFile, UnsupportedFileError, extract_pdf_pages, process_upload
 from app.ingestion.segmentation import segment_capture
 from app.llm import get_llm_provider
 from app.llm.base import LLMError, LLMProvider
@@ -149,6 +149,54 @@ async def _index_attachment_chunks(db: Session, llm: LLMProvider, attachment: At
             )
         )
     db.commit()
+
+
+async def finish_attachment_chunking(attachment_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
+    """Background-task entry point for _index_attachment_chunks(),
+    scheduled by the API layer (api/captures.py) right after an
+    attachment is created -- see docs/DECISIONS.md "offloading to
+    background processing". Chunk-level indexing has no bearing on
+    segmentation or clarification decisions (unlike image captioning,
+    which stays foreground -- see _caption_new_images), so it never
+    needs to block the request that created the attachment.
+
+    Re-derives `pages`/`extracted_text` from the already-persisted
+    Attachment row (and, for a PDF, a cheap local re-extraction -- no
+    LLM call) rather than requiring the caller to thread the original
+    in-memory ProcessedFile across the background-task boundary.
+
+    `llm` defaults to the production singleton; tests pass a
+    FakeLLMProvider explicitly so this never hits the real Ollama
+    service -- same pattern as finish_unit_processing.
+    """
+    db = get_sessionmaker()()
+    try:
+        if llm is None:
+            llm = get_llm_provider()
+        attachment = db.get(Attachment, attachment_id)
+        if attachment is None:
+            return
+        pages = None
+        if attachment.content_type == "application/pdf":
+            try:
+                data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+                pages = extract_pdf_pages(data)
+            except Exception:
+                logger.exception(
+                    "Could not re-extract PDF pages for attachment %s; chunking without page numbers",
+                    attachment.id,
+                )
+        processed = ProcessedFile(
+            stored_path=attachment.stored_path,
+            content_type=attachment.content_type,
+            size_bytes=attachment.size_bytes,
+            extracted_text=attachment.extracted_text,
+            extraction_status=attachment.extraction_status,
+            pages=pages,
+        )
+        await _index_attachment_chunks(db, llm, attachment, processed)
+    finally:
+        db.close()
 
 
 async def _run_full_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit, attachment_text: str) -> None:
@@ -322,9 +370,15 @@ async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: l
         new_attachments.append((attachment, processed))
     db.commit()  # Phase 0: capture + attachments durably saved, no LLM call yet
 
+    # Image captioning stays foreground: clarify.generate_questions() and
+    # enrich() both need the caption as context (see docs/DECISIONS.md),
+    # so it must finish before segmentation/clarification ever runs.
+    # Chunk-level indexing has no bearing on those decisions, so it's
+    # deliberately NOT run here -- the caller schedules
+    # finish_attachment_chunking() per attachment as a background task
+    # instead, to keep this request's latency down to what's actually
+    # needed before the user can see a question or a "processing" state.
     await _caption_new_images(db, llm, new_attachments)
-    for attachment, processed in new_attachments:
-        await _index_attachment_chunks(db, llm, attachment, processed)
 
     proposed_units = await segment_capture(llm, text)
     units = [

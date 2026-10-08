@@ -1,7 +1,7 @@
 import pytest
 
 from app.ingestion.chunking import chunk_attachment
-from app.ingestion.pipeline import add_attachment, create_capture
+from app.ingestion.pipeline import add_attachment, create_capture, finish_attachment_chunking
 from app.models import Attachment, AttachmentChunk
 from app.retrieval.pipeline import hybrid_search_chunks
 from tests.fakes import FakeLLMProvider
@@ -44,7 +44,11 @@ def test_chunk_attachment_max_chunks_bounds_plain_text():
 
 @pytest.mark.asyncio
 async def test_chunks_are_created_and_embedded_on_ingestion(db, fake_llm):
-    capture = await create_capture(
+    """Chunk-indexing is backgrounded (see docs/DECISIONS.md "offloading
+    to background processing") -- create_capture_and_finish() drives it
+    to completion, the test equivalent of "wait for that background
+    task"."""
+    capture = await create_capture_and_finish(
         db, fake_llm, text="Notes attached.", uploads=[("notes.txt", b"the secret launch date is March 3rd")]
     )
     chunks = db.query(AttachmentChunk).filter(AttachmentChunk.capture_id == capture.id).all()
@@ -84,6 +88,14 @@ async def test_chunk_search_is_gated_until_a_sibling_unit_is_ready(db):
     )
     unit = capture.units[0]
     assert unit.status == "awaiting_clarification"
+    # Chunking is backgrounded (see docs/DECISIONS.md) and has no
+    # dependency on the unit's clarification state -- drive it to
+    # completion explicitly so this test genuinely exercises the gate
+    # (a chunk that exists but is excluded), not just "no chunks were
+    # ever created, so naturally nothing is found."
+    for attachment in capture.attachments:
+        await finish_attachment_chunking(attachment.id, llm=llm)
+    assert db.query(AttachmentChunk).filter(AttachmentChunk.capture_id == capture.id).count() > 0
 
     scored = await hybrid_search_chunks(db, llm, "launch code")
     assert scored == [], "a chunk must not be searchable while every sibling unit is still gated"
