@@ -200,9 +200,10 @@
   Works for the eval set's short attached notes. A genuinely large
   (50+ page) PDF's total *processing cost* is now bounded
   (`membase_max_chunks_per_attachment`, see docs/DECISIONS.md "Large
-  attachments") -- but the 1200/150 split itself, and whether 300 is
-  the right chunk-count ceiling, remain untuned against a real large
-  document, just no longer unbounded.
+  attachments") -- but the 1200/150 split itself, and whether 600
+  (raised from 300 by user request) is the right chunk-count ceiling,
+  remain untuned against a real large document, just no longer
+  unbounded.
 - **Image captions are not empirically quality-tested the way
   segmentation/enrichment prompts were** (see docs/DECISIONS.md "Gemma 4
   migration" -- qwen's choice was validated by direct manual A/B testing

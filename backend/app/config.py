@@ -23,14 +23,14 @@ class Settings(BaseSettings):
     membase_embed_model: str = "nomic-embed-text"
     membase_embed_dim: int = 768
     uploads_dir: Path = Path(".data/uploads")
-    membase_max_upload_mb: int = 25
+    membase_max_upload_mb: int = 50
     llm_timeout_seconds: float = 90.0
     # Bounds on how much of one attachment gets expensive per-chunk LLM/
     # embedding treatment -- see docs/DECISIONS.md "Large attachments".
     # The *original* file and its full extracted text are never truncated
     # by this; only how many AttachmentChunk rows get embedded for deep
     # chunk-level search into a single huge document.
-    membase_max_chunks_per_attachment: int = 300
+    membase_max_chunks_per_attachment: int = 600
     # One captioning call per image already bounds per-image cost to O(1)
     # regardless of resolution (the vision encoder's own fixed tiling
     # handles that) -- this instead bounds the number of images in a

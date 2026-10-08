@@ -604,7 +604,8 @@ extracted text:
   attaching images one at a time via repeated `add_attachment()` calls
   each gets its own fresh budget. The risk this exists for (many images
   in one request) is covered either way.
-- `membase_max_chunks_per_attachment` (default 300): bounds how many
+- `membase_max_chunks_per_attachment` (default 600, raised from 300 by
+  user request): bounds how many
   `AttachmentChunk` rows one attachment's text gets split into and
   embedded as, so a single enormous document (a 1000-page PDF, say)
   can't turn into an unbounded-size `embed()` batch call. Critically,
@@ -625,7 +626,8 @@ constants already in `app/ingestion/chunking.py`).
 
 **Alternatives considered:** Resizing/downsampling images client- or
 server-side before sending them to the model -- rejected for now, since
-`membase_max_upload_mb` (25MB) already bounds worst-case payload size
+`membase_max_upload_mb` (50MB, raised from 25MB by user request) already
+bounds worst-case payload size
 and the model's own vision pipeline handles arbitrary input resolution
 internally; revisit only if a real file is observed to cause a
 problem. A wall-clock timeout on the whole captioning/chunking phase --
