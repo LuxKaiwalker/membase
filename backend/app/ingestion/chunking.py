@@ -40,17 +40,34 @@ def _split_long_text(text: str, max_chars: int = MAX_CHUNK_CHARS, overlap: int =
     return pieces
 
 
-def chunk_attachment(pages: list[str] | None, extracted_text: str | None) -> list[Chunk]:
+def chunk_attachment(
+    pages: list[str] | None, extracted_text: str | None, max_chunks: int | None = None
+) -> list[Chunk]:
     """`pages` (per-page text) takes priority when available -- gives a
     real page_number per chunk. Falls back to chunking `extracted_text`
     as one undifferentiated stream (page_number=None) for non-paginated
-    formats (txt/md)."""
+    formats (txt/md).
+
+    `max_chunks` bounds the *embedding* cost of a single huge attachment
+    (see docs/DECISIONS.md "Large attachments") -- it truncates how many
+    chunks get built, never the original file or its full extracted
+    text, which stay completely intact and fully available to plain
+    full-text search regardless. A chunk beyond the cap just never gets
+    its own fine-grained, independently-embedded search entry.
+    """
     if pages:
         chunks = []
         for page_index, page_text in enumerate(pages, start=1):
             for piece in _split_long_text(page_text):
+                if max_chunks is not None and len(chunks) >= max_chunks:
+                    return chunks
                 chunks.append(Chunk(text=piece, page_number=page_index))
         return chunks
     if extracted_text:
-        return [Chunk(text=piece, page_number=None) for piece in _split_long_text(extracted_text)]
+        chunks = []
+        for piece in _split_long_text(extracted_text):
+            if max_chunks is not None and len(chunks) >= max_chunks:
+                break
+            chunks.append(Chunk(text=piece, page_number=None))
+        return chunks
     return []

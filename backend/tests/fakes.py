@@ -106,6 +106,7 @@ class FakeLLMProvider(LLMProvider):
         answer_response: Any = None,
         cue_response: Any = None,
         question_response: Any = None,
+        image_caption_response: Any = None,
     ) -> None:
         self._dim = dim
         self.fail = fail
@@ -115,7 +116,15 @@ class FakeLLMProvider(LLMProvider):
         self._answer = _ResponseQueue(answer_response, _DEFAULT_ANSWER)
         self._cues = _ResponseQueue(cue_response, dict(_DEFAULT_CUES))
         self._questions = _ResponseQueue(question_response, dict(_DEFAULT_QUESTIONS))
+        self._image_caption = _ResponseQueue(
+            {"caption": image_caption_response} if isinstance(image_caption_response, str) else image_caption_response,
+            {"caption": "a fake image"},
+        )
         self.calls: list[str] = []  # schema "kind" per generate_structured call, for tests that assert call counts
+        # Raw bytes passed via `images=` on each generate() call, in order --
+        # lets a test assert the real image bytes actually reached the
+        # "LLM" rather than just that captioning ran at all.
+        self.images_received: list[list[bytes]] = []
 
     @property
     def embedding_model_name(self) -> str:
@@ -131,12 +140,28 @@ class FakeLLMProvider(LLMProvider):
         if self.fail == "timeout":
             raise LLMTimeoutError("fake: backend timed out")
 
-    async def generate(self, prompt: str, *, system: str | None = None, temperature: float = 0.2) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.2,
+        images: list[bytes] | None = None,
+    ) -> str:
         self._maybe_fail_connectivity()
+        if images:
+            self.images_received.append(images)
+            self.calls.append("image_caption")
+            return self._image_caption.next()["caption"]
         return "ok"
 
     async def generate_structured(
-        self, prompt: str, *, schema: dict[str, Any], system: str | None = None
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any],
+        system: str | None = None,
+        images: list[bytes] | None = None,
     ) -> dict[str, Any]:
         self._maybe_fail_connectivity()
         if self.fail == "malformed":

@@ -2,10 +2,11 @@ import pytest
 
 from app.ingestion.chunking import chunk_attachment
 from app.ingestion.pipeline import add_attachment, create_capture
-from app.models import AttachmentChunk
+from app.models import Attachment, AttachmentChunk
 from app.retrieval.pipeline import hybrid_search_chunks
 from tests.fakes import FakeLLMProvider
 from tests.helpers import create_capture_and_finish
+from tests.test_files import _png_bytes
 
 
 def test_chunk_attachment_paginates_pdfs():
@@ -28,6 +29,17 @@ def test_chunk_attachment_splits_plain_text_without_pages():
 def test_chunk_attachment_empty_input_yields_no_chunks():
     assert chunk_attachment(None, None) == []
     assert chunk_attachment(None, "   ") == []
+
+
+def test_chunk_attachment_max_chunks_bounds_pages():
+    pages = [f"page {i}" for i in range(10)]
+    chunks = chunk_attachment(pages, None, max_chunks=3)
+    assert len(chunks) == 3
+
+
+def test_chunk_attachment_max_chunks_bounds_plain_text():
+    chunks = chunk_attachment(None, "z" * 10_000, max_chunks=2)
+    assert len(chunks) == 2
 
 
 @pytest.mark.asyncio
@@ -84,3 +96,53 @@ async def test_posthoc_attachment_chunks_are_also_indexed(db, fake_llm):
     chunks = db.query(AttachmentChunk).filter(AttachmentChunk.capture_id == capture.id).all()
     assert len(chunks) == 1
     assert chunks[0].embedding is not None
+
+
+@pytest.mark.asyncio
+async def test_uploaded_image_is_captioned_and_becomes_searchable(db):
+    """No OCR/vision model exists separately -- the generation model's
+    native multimodal understanding (see docs/DECISIONS.md "Gemma 4
+    migration") is what makes an uploaded image searchable at all."""
+    llm = FakeLLMProvider(image_caption_response="a red square on a white background")
+    capture = await create_capture_and_finish(
+        db, llm, text="Photo from the trip.", uploads=[("photo.png", _png_bytes())]
+    )
+
+    attachment = db.query(Attachment).filter(Attachment.capture_id == capture.id).one()
+    assert attachment.extraction_status == "ok"
+    assert attachment.extracted_text == "a red square on a white background"
+    assert len(llm.images_received) == 1
+    assert llm.images_received[0] == [_png_bytes()]
+
+    scored = await hybrid_search_chunks(db, llm, "red square")
+    assert scored and "red square" in scored[0].chunk.text
+
+
+@pytest.mark.asyncio
+async def test_image_captioning_failure_leaves_image_stored_but_uncaptioned(db):
+    """Best-effort, same tolerance as every other derived LLM step in
+    this pipeline: a captioning failure must not lose the original image
+    or block the rest of ingestion."""
+    llm = FakeLLMProvider(fail="unavailable")
+    capture = await create_capture(db, llm, text="Photo.", uploads=[("photo.png", _png_bytes())])
+    attachment = db.query(Attachment).filter(Attachment.capture_id == capture.id).one()
+    assert attachment.extraction_status == "unsupported"
+    assert attachment.extracted_text is None
+
+
+@pytest.mark.asyncio
+async def test_image_captioning_is_capped_per_capture(db, monkeypatch):
+    from app import config as config_module
+
+    monkeypatch.setattr(config_module.get_settings(), "membase_max_images_captioned_per_capture", 1)
+    llm = FakeLLMProvider(image_caption_response="a photo")
+    capture = await create_capture(
+        db,
+        llm,
+        text="Two photos.",
+        uploads=[("one.png", _png_bytes()), ("two.png", _png_bytes())],
+    )
+    attachments = db.query(Attachment).filter(Attachment.capture_id == capture.id).order_by(Attachment.original_filename).all()
+    statuses = {a.original_filename: a.extraction_status for a in attachments}
+    assert statuses == {"one.png": "ok", "two.png": "unsupported"}
+    assert len(llm.images_received) == 1

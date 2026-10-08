@@ -51,13 +51,82 @@ def _attachment_text_for(capture: Capture) -> str:
     return "\n\n".join(a.extracted_text for a in capture.attachments if a.extracted_text)
 
 
+_IMAGE_CAPTION_PROMPT = (
+    "Describe this image factually and in detail, as if writing a caption "
+    "for someone who can't see it: people, objects, scene, setting, colors, "
+    "and anything notable. Transcribe any visible text verbatim. This "
+    "description becomes the image's only searchable representation, so "
+    "include anything someone might later search for."
+)
+
+
+async def _describe_image(llm: LLMProvider, data: bytes) -> str | None:
+    """Caption an image via the generation model's native multimodal
+    understanding (see docs/DECISIONS.md "Gemma 4 migration") -- this is
+    what makes an uploaded image full-text/semantically searchable at
+    all, since there's no separate OCR/vision model in this app.
+
+    Best-effort, like every other derived step in this pipeline: an
+    LLMError leaves the image stored (already committed before this
+    runs) but without a textual description, rather than blocking
+    ingestion or losing the original file.
+    """
+    try:
+        description = await llm.generate(_IMAGE_CAPTION_PROMPT, images=[data], temperature=0.2)
+    except LLMError:
+        logger.warning("Image captioning failed; image stored but not text-searchable")
+        return None
+    description = description.strip()
+    return description or None
+
+
+def _is_uncaptioned_image(processed: ProcessedFile) -> bool:
+    return processed.content_type.startswith("image/") and processed.extraction_status == "unsupported"
+
+
+async def _caption_new_images(
+    db: Session, llm: LLMProvider, new_attachments: list[tuple[Attachment, ProcessedFile]]
+) -> None:
+    """Captions up to membase_max_images_captioned_per_capture images from
+    one batch of newly-uploaded attachments (see docs/DECISIONS.md "Large
+    attachments") -- one captioning call is already O(1) in image
+    resolution, but attaching many images in a single request would
+    otherwise mean an unbounded number of sequential vision calls with no
+    visible limit. Images beyond the cap are stored normally, just
+    without a caption -- exactly like any other best-effort extraction
+    failure elsewhere in this pipeline.
+    """
+    budget = get_settings().membase_max_images_captioned_per_capture
+    for attachment, processed in new_attachments:
+        if not _is_uncaptioned_image(processed):
+            continue
+        if budget <= 0:
+            logger.info("Image-captioning budget exhausted for this capture; %s left uncaptioned", attachment.original_filename)
+            continue
+        budget -= 1
+        data = (get_settings().uploads_dir / processed.stored_path).read_bytes()
+        description = await _describe_image(llm, data)
+        if description:
+            attachment.extracted_text = description
+            attachment.extraction_status = "ok"
+            processed.extracted_text = description
+            db.commit()
+
+
 async def _index_attachment_chunks(db: Session, llm: LLMProvider, attachment: Attachment, processed: ProcessedFile) -> None:
     """Deterministically chunk an attachment's extracted text (spec
     section 27) and best-effort embed each chunk. Never raises: a chunk
     embedding failure just leaves that chunk full-text-only searchable,
     same tolerance as everywhere else LLM calls happen in this pipeline.
+
+    Chunk count is capped (see docs/DECISIONS.md "Large attachments") so
+    one huge document can't turn into an unbounded-size embed() batch --
+    the full extracted text stays intact and fully full-text-searchable
+    regardless; only the number of independently chunk-embedded entries
+    is bounded.
     """
-    chunks = chunk_attachment(processed.pages, processed.extracted_text)
+    max_chunks = get_settings().membase_max_chunks_per_attachment
+    chunks = chunk_attachment(processed.pages, processed.extracted_text, max_chunks=max_chunks)
     if not chunks:
         return
     try:
@@ -249,6 +318,7 @@ async def create_capture(db: Session, llm: LLMProvider, *, text: str, uploads: l
         new_attachments.append((attachment, processed))
     db.commit()  # Phase 0: capture + attachments durably saved, no LLM call yet
 
+    await _caption_new_images(db, llm, new_attachments)
     for attachment, processed in new_attachments:
         await _index_attachment_chunks(db, llm, attachment, processed)
 
@@ -388,6 +458,7 @@ async def add_attachment(db: Session, llm: LLMProvider, capture: Capture, filena
     db.add(attachment)
     db.commit()
 
+    await _caption_new_images(db, llm, [(attachment, processed)])
     await _index_attachment_chunks(db, llm, attachment, processed)
 
     attachment_text = _attachment_text_for(capture)
