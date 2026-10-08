@@ -200,12 +200,14 @@ const membase = (() => {
         <p class="capture-clarification-question"></p>
         <form class="capture-clarification-form">
           <input class="capture-clarification-answer" type="text" placeholder="Your answer" />
-          <button type="submit">Submit answer</button>
+          <button type="submit" class="capture-clarification-submit">Submit answer</button>
           <button type="button" class="capture-clarification-discard">Discard this one</button>
         </form>
+        <p class="capture-clarification-stage muted hidden"></p>
+        <p class="capture-clarification-error status error hidden"></p>
       </div>
       <div class="capture-processing hidden">
-        <p class="muted">The memory is being processed...</p>
+        <p class="capture-processing-status muted">The memory is being processed...</p>
         <p class="capture-stuck hidden status error">
           Still processing after 10 minutes -- the server may have
           restarted mid-task.
@@ -232,8 +234,12 @@ const membase = (() => {
     const clarificationQuestion = card.querySelector(".capture-clarification-question");
     const clarificationForm = card.querySelector(".capture-clarification-form");
     const clarificationAnswer = card.querySelector(".capture-clarification-answer");
+    const clarificationSubmit = card.querySelector(".capture-clarification-submit");
     const clarificationDiscard = card.querySelector(".capture-clarification-discard");
+    const clarificationStage = card.querySelector(".capture-clarification-stage");
+    const clarificationError = card.querySelector(".capture-clarification-error");
     const processingEl = card.querySelector(".capture-processing");
+    const processingStatus = card.querySelector(".capture-processing-status");
     const stuckEl = card.querySelector(".capture-stuck");
     const retryButton = card.querySelector(".capture-retry");
     const resultSection = card.querySelector(".capture-result");
@@ -271,6 +277,11 @@ const membase = (() => {
       hide(clarificationSection);
       hide(stuckEl);
       show(processingEl);
+      const startedAt = performance.now();
+      processingStatus.textContent = "The memory is being processed...";
+      const ticker = setInterval(() => {
+        processingStatus.textContent = `The memory is being processed... (${formatElapsed(performance.now() - startedAt)} elapsed)`;
+      }, 1000);
       const inFlight = allUnits.filter((u) => u.status === "processing");
       try {
         const finished = await Promise.all(inFlight.map((u) => pollUnitUntilDone(u.id)));
@@ -287,6 +298,8 @@ const membase = (() => {
         }
         showError(err.message);
         return;
+      } finally {
+        clearInterval(ticker);
       }
       showResult();
     }
@@ -307,6 +320,7 @@ const membase = (() => {
     });
 
     function askNextClarification() {
+      setClarificationBusy(false);
       if (pendingQueue.length === 0) {
         waitForProcessing();
         return;
@@ -335,9 +349,35 @@ const membase = (() => {
       }
     }
 
+    // Disables both buttons and shows a progress label while a clarify/
+    // discard request is in flight, so a click gets immediate feedback
+    // instead of looking unresponsive during real network/LLM latency --
+    // and can't be double-submitted while the first click is still
+    // pending. Restored on error so a transient failure (e.g. a dropped
+    // connection) can just be retried, not just reported as a dead end.
+    function setClarificationBusy(busy, label) {
+      clarificationSubmit.disabled = busy;
+      clarificationDiscard.disabled = busy;
+      clarificationAnswer.disabled = busy;
+      if (busy) {
+        clarificationSubmit.textContent = label;
+        hide(clarificationError);
+        show(clarificationStage);
+        clarificationStage.textContent = label;
+      } else {
+        clarificationSubmit.textContent = "Submit answer";
+        hide(clarificationStage);
+      }
+    }
+
+    function showClarificationError(message) {
+      showStatus(clarificationError, message, true);
+    }
+
     clarificationForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const current = pendingQueue[0];
+      setClarificationBusy(true, "Submitting answer...");
       try {
         const updatedUnit = await postJSON(`/api/memory-units/${current.unitId}/clarify`, {
           answer: clarificationAnswer.value,
@@ -350,12 +390,14 @@ const membase = (() => {
         enqueueIfPending(updatedUnit);
         askNextClarification();
       } catch (err) {
-        showError(err.message);
+        setClarificationBusy(false);
+        showClarificationError(err.message);
       }
     });
 
     clarificationDiscard.addEventListener("click", async () => {
       const current = pendingQueue[0];
+      setClarificationBusy(true, "Discarding...");
       try {
         const resp = await fetchWithTimeout(`/api/memory-units/${current.unitId}/discard`, { method: "POST" });
         const updatedUnit = await resp.json().catch(() => ({}));
@@ -364,7 +406,8 @@ const membase = (() => {
         pendingQueue = pendingQueue.slice(1);
         askNextClarification();
       } catch (err) {
-        showError(err.message);
+        setClarificationBusy(false);
+        showClarificationError(err.message);
       }
     });
 
