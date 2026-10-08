@@ -592,13 +592,18 @@ extracted text:
 - `membase_max_images_captioned_per_capture` (default 8): one captioning
   call already costs O(1) regardless of an image's resolution (the
   vision path's own fixed tiling handles that internally) -- this instead
-  bounds how many *images in a single capture* get that call made at
-  all, so attaching dozens of images in one request can't turn into
+  bounds how many images in a single *upload batch* get that call made
+  at all, so attaching dozens of images in one request can't turn into
   dozens of sequential vision calls with no visible limit. Images beyond
   the cap are stored normally, just without a caption (`extraction_
   status` stays `"unsupported"`) -- the same "best-effort, never lose
   the original" tolerance as every other derived step in this pipeline,
-  not a new failure mode.
+  not a new failure mode. Enforced per call to `_caption_new_images()`
+  -- `create_capture()`'s batch of uploads, or one `add_attachment()`
+  call -- not as a cumulative budget across a capture's lifetime;
+  attaching images one at a time via repeated `add_attachment()` calls
+  each gets its own fresh budget. The risk this exists for (many images
+  in one request) is covered either way.
 - `membase_max_chunks_per_attachment` (default 300): bounds how many
   `AttachmentChunk` rows one attachment's text gets split into and
   embedded as, so a single enormous document (a 1000-page PDF, say)

@@ -51,11 +51,17 @@ for model in "$GEN_MODEL" "$EMBED_MODEL"; do
 done
 
 echo "4. Generation works?"
-resp=$(curl -sf "$HOST/api/generate" -d "{\"model\":\"$GEN_MODEL\",\"prompt\":\"Say OK.\",\"stream\":false}")
-if echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('response') else 1)" 2>/dev/null; then
+# /api/chat, not /api/generate -- that's what OllamaProvider actually
+# calls (see app/llm/ollama_provider.py; /api/generate's flat
+# system+prompt fields were found to silently truncate array-typed
+# JSON-schema-constrained output for gemma4, see docs/DECISIONS.md), so
+# this smoke test exercises the same endpoint the app depends on rather
+# than a different one that happens to also exist.
+resp=$(curl -sf "$HOST/api/chat" -d "{\"model\":\"$GEN_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}],\"stream\":false}")
+if echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); exit(0 if d.get('message', {}).get('content') else 1)" 2>/dev/null; then
   pass "generation returned a response"
 else
-  fail "generation call failed or returned no 'response' field"
+  fail "generation call failed or returned no 'message.content' field"
 fi
 
 echo "5. Embeddings work and match configured dimension?"

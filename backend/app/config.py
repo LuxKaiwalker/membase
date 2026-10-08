@@ -34,9 +34,16 @@ class Settings(BaseSettings):
     # One captioning call per image already bounds per-image cost to O(1)
     # regardless of resolution (the vision encoder's own fixed tiling
     # handles that) -- this instead bounds the number of images in a
-    # *single* capture that get captioned, so attaching dozens of images
-    # at once doesn't turn one request into dozens of sequential vision
-    # calls with no visible bound.
+    # *single upload batch* that get captioned, so attaching dozens of
+    # images to one capture at once doesn't turn one request into dozens
+    # of sequential vision calls with no visible bound. Enforced per
+    # call to _caption_new_images(), i.e. per create_capture()'s batch
+    # of uploads or per individual add_attachment() call -- NOT a
+    # cumulative budget across a capture's lifetime, so repeatedly
+    # calling add_attachment() one file at a time is not bounded by
+    # this across calls (each call gets its own fresh budget). The
+    # risk this exists for -- attaching many images in one request --
+    # is fully covered either way.
     membase_max_images_captioned_per_capture: int = 8
 
 
