@@ -143,6 +143,29 @@
 
 ## Known technical gaps
 
+- **To fix: ingestion-time clarification/enrichment never checks what's
+  already stored.** Confirmed directly in code: `generate_questions()`
+  (`app/ingestion/clarify.py`) and `enrich()`
+  (`app/ingestion/enrichment.py`) take no `db`/session parameter at
+  all -- there is no `hybrid_search()` or any other memory-store lookup
+  anywhere in the ingestion path (`app/ingestion/pipeline.py`).
+  Retrieval only ever happens at recall time
+  (`POST /api/recall`/`RecallSession`), never during storage. Each
+  capture is enriched in total isolation from every other one.
+  Concretely: if an earlier capture explains an invented/unfamiliar
+  term (answered via clarification, or just named in passing), and a
+  *later*, unrelated capture mentions that same term again, the system
+  has no way to recognize it's already known -- `generate_questions()`
+  may ask about it again, and `enrich()` has no prior context to draw
+  on when deciding what it means, since `unit.clarifications` is scoped
+  to that one `MemoryUnit` row, never shared across captures. Needs
+  real design work, not just wiring in a DB session: what would even
+  count as "the same term" (exact string match? semantic similarity?),
+  how much of a prior match's context to inject into the prompt
+  without ballooning it, and whether this should only suppress
+  redundant *questions* or also inform `enrich()`'s actual semantic
+  output (aliases/meaning) with what a prior capture already
+  established.
 - **No retry mechanism if `finish_attachment_chunking` is dropped by a
   server restart.** Unlike unit enrichment (`finish_unit_processing`,
   recoverable via `POST /memory-units/{id}/retry`), an attachment whose
