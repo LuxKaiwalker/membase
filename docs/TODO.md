@@ -120,9 +120,54 @@
   from recall like `awaiting_clarification`?), how wrong/false-positive
   matches get corrected or undone, and whether this should ever run
   automatically vs. always surfacing as a confirmation to the user first.
+- **Eventually, fuse the memory-retrieval and attachment-upload UI
+  workflows into one surface that can retrieve and attach memory
+  simultaneously.** Raised by the user, not formalized -- written down
+  as a direction. Today "Remember" (`/`, creating captures + attaching
+  files) and "Recall" (`/recall`, querying) are two separate pages with
+  no interaction between them; attaching a file is only ever something
+  you do while writing a *new* memory (`POST /api/captures` with
+  `files`) or adding to an existing one you already know the id of
+  (`POST /api/captures/{id}/attachments`, via `add_attachment()`).
+  There's no flow where recalling something and attaching a file to it
+  happen in the same interaction -- e.g. asking "what's my rent
+  agreement" and, in that same place, being able to attach an updated
+  copy to whatever it finds. Open, unformalized questions this would
+  need to answer before it could be designed: what the unified
+  interaction even looks like (search-then-attach? a single compose box
+  that can both ask and attach?), whether an attachment added this way
+  attaches to a specific existing capture/unit or starts a new one,
+  and how this interacts with the capture/memory-unit distinction
+  (`docs/ARCHITECTURE.md`) if attaching during recall doesn't cleanly
+  map to either flow.
 
 ## Known technical gaps
 
+- **To fix: no handling of contradictory memories at all.** Verified
+  live, not theoretical: storing "3 is my favourite number." and later
+  "4 is my favourite number." produces two independent, fully valid
+  memory units -- nothing flags them as contradictory, nothing merges
+  or supersedes the older one, every capture is purely additive (see
+  the "forget" direction below, which is related but distinct: that's
+  about a *causal* link between captures, e.g. a shopping trip
+  resolving a shopping list; this is about two memories that are just
+  factually incompatible with no causal relationship at all).
+  `hybrid_search` scored both candidates almost identically in testing
+  (fused scores differing by ~0.002, i.e. noise, not a meaningful
+  preference), so both were passed to answer generation as evidence,
+  and the model happened to handle it well on its own ("You have
+  recorded both 3 and 4 as your favourite numbers.") -- but there is no
+  code-level guarantee of that. The `_ANSWER_SYSTEM` prompt
+  (`app/retrieval/pipeline.py`) has no instruction at all for
+  contradictory evidence; a different phrasing or more lopsided
+  retrieval scores could just as easily produce a confident, wrong
+  single answer with nothing in the system to catch it. Needs real
+  design work, not just a prompt tweak: should storing a new fact that
+  contradicts an existing one surface the conflict to the user at
+  write time? Should retrieval/answer generation be required to
+  flag disagreement explicitly rather than leaving it to model judgment
+  per-query? Should older contradicted memories be superseded,
+  archived, or just left to coexist with a visible conflict marker?
 - **Interactive recall (`RecallSession`) is not the default UI** --
   reverted after `eval/run_interactive_benchmark.py` measured it
   underperforming both the semantic baseline and the one-shot agent
