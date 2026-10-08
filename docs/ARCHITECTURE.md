@@ -127,13 +127,13 @@ capture text + files
       |   PDF/text extraction use. Bounded per capture
       |   (membase_max_images_captioned_per_capture); a caption failure
       |   or a skipped-for-budget image just stays uncaptioned, same
-      |   best-effort tolerance as every other derived step here.
-      |
-      ├─ _index_attachment_chunks() (app/ingestion/pipeline.py): chunks
-      |   each attachment's extracted text (app/ingestion/chunking.py,
-      |   capped at membase_max_chunks_per_attachment -- see
-      |   docs/DECISIONS.md "Large attachments") and best-effort embeds
-      |   each chunk into attachment_chunks
+      |   best-effort tolerance as every other derived step here. Stays
+      |   in this synchronous path deliberately: generate_questions()
+      |   and enrich() just below both need the caption as context (see
+      |   docs/DECISIONS.md "attachment context"), so it must finish
+      |   before either ever runs. (Chunk-level indexing, by contrast,
+      |   has no bearing on those decisions -- see the background-task
+      |   diagram below.)
       |
       ├─ segment_capture() (app/ingestion/segmentation.py): LLM decides
       |   how many units, each unit's content must be a verbatim excerpt
@@ -149,8 +149,12 @@ capture text + files
             |   and about what" -- deliberately separate from the heavier
             |   semantic call below, and runs first, so a unit reaches
             |   "awaiting_clarification" (and the user sees a question)
-            |   without waiting on full enrichment at all. May return
-            |   several candidate questions at once (bounded,
+            |   without waiting on full enrichment at all. Takes the same
+            |   attachment_text as enrich() below (required parameter,
+            |   not optional -- see docs/DECISIONS.md), so a reference
+            |   an attachment already resolves (e.g. "this colour" + a
+            |   red-shoe photo) is never flagged as needing a question.
+            |   May return several candidate questions at once (bounded,
             |   MAX_QUESTIONS_PER_ROUND); only the first is shown, the
             |   rest queue (MemoryUnit.clarification_queue) and drain one
             |   at a time as each is answered, with no further LLM call.
@@ -166,6 +170,25 @@ capture text + files
                 never blocked waiting for it and a second capture can be
                 submitted (or a second clarification answered) while the
                 first is still enriching -- see docs/DECISIONS.md.
+
+api/captures.py also schedules finish_attachment_chunking() (below) for
+every attachment on the capture, right after this whole synchronous
+path returns -- chunk-level indexing has no bearing on any decision
+made above, so it was moved out of the request entirely (see
+docs/DECISIONS.md "offloading to background processing").
+```
+
+```
+finish_attachment_chunking() (background task, own DB session)
+      |
+      └─ _index_attachment_chunks() (app/ingestion/pipeline.py): chunks
+          an attachment's extracted text (app/ingestion/chunking.py,
+          capped at membase_max_chunks_per_attachment -- see
+          docs/DECISIONS.md "Large attachments") and best-effort embeds
+          each chunk into attachment_chunks. Re-derives `pages` for a
+          PDF via a cheap local re-extraction (no LLM call) rather than
+          needing the original in-memory ProcessedFile threaded across
+          the background-task boundary.
 ```
 
 ```
@@ -177,7 +200,10 @@ finish_unit_processing() (background task, own DB session + row lock)
       |   retrieval-aids (topics/definitions/relations) -- each degrades
       |   independently on LLMError rather than all-or-nothing (never
       |   raises: a failed sub-call's fields just come back empty, with
-      |   semantic["enrichment_status"] reflecting "ok" vs "unavailable")
+      |   semantic["enrichment_status"] reflecting "ok" vs "unavailable").
+      |   Takes attachment_text as a required parameter -- see
+      |   docs/DECISIONS.md -- so meaning/aliases/relations extraction
+      |   sees an attached image's caption, not just full-text search.
       ├─ build_retrieval_text(): deterministic (non-LLM) text combining
       |   original + clarifications + meaning + aliases + definitions +
       |   relations (spec section 11)

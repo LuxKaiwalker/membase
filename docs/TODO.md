@@ -143,6 +143,16 @@
 
 ## Known technical gaps
 
+- **No retry mechanism if `finish_attachment_chunking` is dropped by a
+  server restart.** Unlike unit enrichment (`finish_unit_processing`,
+  recoverable via `POST /memory-units/{id}/retry`), an attachment whose
+  background chunking task never ran has no equivalent recovery
+  endpoint -- it stays fully full-text searchable via its
+  `extracted_text` (that's never affected), just without a fine-grained
+  chunk-level index, with no way to trigger re-chunking short of
+  deleting and re-adding the attachment. Acceptable at this MVP's
+  expected restart frequency; noted so it isn't silently forgotten. See
+  docs/DECISIONS.md "offloading to background processing".
 - **To fix: no handling of contradictory memories at all.** Verified
   live, not theoretical: storing "3 is my favourite number." and later
   "4 is my favourite number." produces two independent, fully valid

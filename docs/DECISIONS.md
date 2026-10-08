@@ -688,3 +688,127 @@ completion (and alone -- see the "shared dev database" caution in
 test and will corrupt a concurrently-running suite sharing the same
 Postgres instance) before trusting a generation-model swap, no matter
 how plausible the plumbing looks.
+
+---
+
+**Decision:** `clarify.generate_questions()` and `enrich()` both take a
+required `attachment_text` parameter (not an optional kwarg) -- every
+caller must pass whatever's already known about attached files,
+including an uploaded image's caption (`_describe_image`), so a vague
+reference in the memory's text that an attachment already resolves is
+never flagged as needing a question, and semantic extraction
+(meaning/aliases/relations) isn't blind to attachment content either.
+
+**Reason:** User-raised with a concrete example: uploading a photo of a
+red shoe with the text "I like shoes of this colour" previously still
+triggered a clarification question asking which colour was meant, even
+though the caption (`_describe_image`, run before segmentation --
+see "Gemma 4 migration" above) already answers it. Root cause:
+`attachment_text` was computed in `pipeline.py` (`_attachment_text_for`)
+and threaded into `_run_full_enrichment` for building `searchable_text`
+(a plain string concatenation), but never into the two LLM calls that
+actually make judgment calls about the memory's content --
+`generate_questions()` and `enrich()`. Full-text search over an
+attachment already worked; the model's own understanding of what the
+memory means did not.
+
+**Deliberately minimal prompt engineering, maximal code-level
+guarantee** (explicit user direction): the fix is not an elaborate
+few-shot example tuned to the shoe scenario -- the system prompts
+gained one short, general instruction each ("if attached file content
+is given, treat it as already-known information, not something to ask
+about"). The actual guarantee is structural: `attachment_text` is a
+*required* positional parameter, so a caller cannot forget to pass it
+without a `TypeError` at call time, not a silent gap; and pipeline.py's
+call order (`_caption_new_images()` always completes, inside the same
+request, before segmentation or `_advance_unit()`/`generate_questions()`
+ever runs) guarantees the text is complete and available by the time
+either call happens. Verified against the live model with the user's
+own example (red-shoe photo + "I like shoes of this colour"): no
+clarification question was asked, and the resulting semantic meaning
+correctly said "red".
+
+**Alternatives considered:** A deterministic heuristic to detect vague
+references ("this colour", "that thing") and suppress clarification
+when an attachment is present -- rejected as exactly the kind of
+brittle, false-positive-prone pattern-matching the "minimal prompt
+engineering, maximal hard guarantee" direction was steering away from;
+judging whether an attachment actually resolves a given reference is
+inherently a semantic question with no reliable non-LLM shortcut, so
+the LLM call stays, but the *data it's given* and *when it's called*
+are now both hard-coded guarantees rather than hoped-for prompt
+behavior.
+
+---
+
+**Decision:** Offload non-decision-making derived processing out of the
+synchronous request path, to minimize latency from a capture's first
+submission through its last answered clarification question.
+Specifically: `_index_attachment_chunks()` (chunk-splitting + embedding
+an attachment's text for fine-grained search) no longer runs inline
+during `create_capture()` -- it's now `finish_attachment_chunking()`,
+a background task scheduled by `api/captures.py` exactly like unit
+enrichment already was.
+
+**Reason:** User-requested: "minimize the time it takes to process a
+memory from the first user input... to the last user input... offload
+most of the calculation to the memory processing stage." Chunk
+embedding has no bearing on segmentation or clarification decisions
+(unlike image captioning, which must stay foreground -- see the
+decision above), so there was no correctness reason for it to block
+the response the user is waiting on. `add_attachment()` (attaching a
+file to an already-"ready" capture, a separate interaction from the
+create-then-clarify flow this request was about) was deliberately left
+unchanged -- it's a single file at a time, not part of the latency path
+the user described, and moving it would have meant either changing its
+return signature (breaking callers) or inventing a side-channel for a
+case that isn't the actual complaint.
+
+**What stays foreground, and why:** segmentation (`segment_capture`)
+and the clarification-question check (`generate_questions`) are the
+irreducible part -- the whole point of the earlier clarify/enrichment
+split was already to make the user-facing decision as fast as possible
+(see the clarification/enrichment split decision elsewhere in this
+file). Image captioning also stays foreground, specifically *because*
+of the decision above: it must complete before `generate_questions()`
+and `enrich()` run, or the attachment-context fix doesn't work. This is
+a real, acknowledged trade-off, not an oversight -- captioning is
+bounded (`membase_max_images_captioned_per_capture`, default 8) so its
+worst case is known, but it is real latency in the critical path.
+
+**Recovery gap, noted not fixed:** unlike unit enrichment
+(`finish_unit_processing`, recoverable via `POST /retry` if a server
+restart drops the background task), there is currently no equivalent
+retry endpoint for a dropped `finish_attachment_chunking` task -- an
+attachment would just stay without chunks (still fully full-text
+searchable via its `extracted_text`, just missing the fine-grained
+chunk-level index) until the next whole-attachment reprocessing
+mechanism exists. Acceptable for now at this MVP's expected restart
+frequency; flagged in docs/TODO.md rather than silently left unnoted.
+
+---
+
+**Decision:** A client disconnecting mid-request does not abort
+server-side processing or lose work -- confirmed by inspecting the
+code (no `request.is_disconnected()` checks or cancellation handling
+anywhere in `app/`), not assumed. An `async def` endpoint handler that
+is simply `await`-ing a sequence of calls keeps running to completion
+even if the client goes away; only the final HTTP response write is
+wasted, not the work itself. Authoritative content was already durably
+committed before any derived/LLM-dependent step runs (the two-phase-
+commit pattern, see docs/ARCHITECTURE.md), so even a disconnect during
+the slowest part of ingestion never loses the user's own words -- the
+capture just finishes processing invisibly, and the `/captures` Browse
+page is the way to find it again afterward.
+
+**Reason:** User asked for "general robustness checks and edge case
+handling... since the memory storage process can be very time
+intensive and disconnections could happen in between." Rather than add
+explicit disconnect-detection/cancellation (which would require
+deciding what to do with partially-committed work mid-transaction, a
+much larger and riskier change), the simpler and already-true property
+is: this app never had a mechanism that would lose work on disconnect
+in the first place, because it never explicitly cancels anything.
+Documented here so this property doesn't get accidentally broken by a
+future change that starts checking `request.is_disconnected()` without
+realizing it would need to handle a half-finished transaction.
