@@ -812,3 +812,767 @@ in the first place, because it never explicitly cancels anything.
 Documented here so this property doesn't get accidentally broken by a
 future change that starts checking `request.is_disconnected()` without
 realizing it would need to handle a half-finished transaction.
+
+---
+
+# Streamlining phase ("too bloaty" pass)
+
+Everything below this point was made under one combined mandate: "reduce
+unnecessary complexity and latency while preserving the architectural
+ideas that make this an augmented-memory system rather than a
+conventional notes/RAG application." The five abstractions the whole
+pass was required to justify itself against: Capture, MemoryUnit,
+Semantic representation, RecallSession, LLM/Database. Each decision
+below names which of those it serves, or what it removed.
+
+---
+
+**Decision:** Collapse the five-call ingestion pipeline (`segment_capture`
++ `generate_questions` + `enrich()`'s three narrative/entities/
+retrieval-aids sub-calls) into two calls total across a unit's lifecycle:
+`analyze_capture()` (once per capture -- segmentation + full per-unit
+semantic analysis + clarification decision, all in one structured-output
+call) and `reanalyze_unit()` (once per clarification round -- re-derive
+semantics and decide if a further question is warranted). Lives in the
+new `app/ingestion/analysis.py`, replacing `clarify.py`/`enrichment.py`/
+`segmentation.py` (all deleted).
+
+**Reason:** An ordinary memory with no clarification need previously
+cost 4 generation calls (segmentation, question-check, 3x enrichment)
+plus 1 embed; it now costs 1 generation call plus 1 embed. This was the
+single largest latency/call-count lever available, and directly serves
+the "storage should be cheaper than recall" pressure the spec asked for.
+
+**What was preserved, deliberately:** the verbatim-excerpt safety check
+(`is_verbatim`, moved not rewritten) still rejects any proposed unit that
+isn't an exact substring of the raw capture text, falling back to one
+whole-text unit -- the collapse changes how many calls decide
+segmentation, never the safety property that segmentation can't rewrite
+authoritative content.
+
+**Alternative considered:** Keep 3 calls (segmentation, one combined
+enrichment+clarification). Rejected -- once clarification-need detection
+and semantic enrichment are looking at the same text for the same
+purpose (deciding what's worth storing/asking about), splitting them
+into two calls bought no quality the eval set could detect, only an
+extra round-trip.
+
+---
+
+**Decision:** Clarification is strictly sequential -- one question
+surfaced at a time, answered, the unit re-analyzed exactly once
+(`reanalyze_unit`), which both re-derives semantics AND decides whether a
+*further* question is still needed. The old `clarification_queue` JSONB
+column (a pre-generated batch of future questions) is dropped from the
+schema entirely; `MAX_QUESTIONS_PER_ROUND` no longer exists because
+there's no queue to bound.
+
+**Reason:** Pre-generating several questions up front commits to asking
+all of them even if the first answer makes the rest moot (e.g. answering
+"what's Flimvex?" with "it's my gym locker PIN" can retroactively make a
+second pre-generated question about "which gym" either still necessary or
+suddenly answerable from context) -- re-evaluating after every answer is
+strictly more adaptive, at the cost of one call per round instead of
+zero marginal cost for a queued question. `MAX_CLARIFICATION_ROUNDS = 3`
+(unchanged) still bounds how many rounds the system may *initiate*.
+
+**Clarification outcomes:** a deterministic, regex-based (no LLM call)
+classifier (`_classify_outcome` in `app/ingestion/pipeline.py`) recognizes
+`declined` ("rather not", "none of your business", ...) vs. `unknown`
+("I don't know", "not sure", ...) vs. `answered` from the free-text
+answer. A field marked declined/unknown is hard-coded into
+`declined_or_unknown_fields` and the next round's question is
+*suppressed* if it targets that same field, even if the model proposes it
+again -- this is a code-level guarantee, not a prompt instruction, because
+the entire point of tracking the outcome is to make re-asking impossible,
+not merely discouraged. (`UNCLEAR`/`CORRECTION` from the spec's suggested
+outcome vocabulary are represented as: an empty/ambiguous answer that
+doesn't match either pattern falls through to `answered` as a best-effort
+outcome rather than a fourth bucket, and `correct_unit`'s existing
+free-form correction mechanism already covers `CORRECTION` -- adding a
+fourth JSON-level outcome tag would have doubled the state space for no
+behavioral difference the current UI/eval set exercises.)
+
+---
+
+**Decision:** Direct structured metadata entry (Location, Date, People,
+Organizations, Topics) is accepted as an optional JSON-encoded `metadata`
+form field on `POST /api/captures`, stored verbatim on
+`MemoryUnit.explicit_metadata`, and always takes authority over whatever
+the same analysis call separately infers for the same semantic field. A
+genuine conflict (both sides non-empty and different) is surfaced as a
+synthetic clarification question (`_apply_explicit_metadata` in
+`pipeline.py`) rather than silently resolved either way; in the interim,
+both values are kept in the semantic field (not just the explicit one)
+so nothing the model inferred is silently discarded while the question is
+still open.
+
+**Reason:** Spec-mandated explicit authority ordering. Minimal API
+surface: no new endpoint, one optional form field, parsed defensively
+(malformed JSON is treated as "none given," not a 400) since metadata is
+optional and shouldn't be able to fail the whole submission.
+
+**Verified against the real model:** submitting `{"location": "Zürich"}`
+against text whose body read like an office memo (model inferred
+`location: "office"`) produced exactly the designed clarification --
+`"You entered location='Zürich', but the text seems to say
+location='office'. Which should be associated with this memory?"` -- with
+`semantic.locations` holding both values pending the answer. Confirmed
+live against `gemma4:12b` via the dev server, not just the fake-LLM test
+suite.
+
+---
+
+**Decision:** A cheap, pre-LLM lexical lookup (`_find_related_context` in
+`pipeline.py`) scans the new text for capitalized/proper-noun-shaped
+terms and does a plain `ILIKE` search against `status='ready'` units'
+`retrieval_text`, returning up to 3 short snippets. These are injected
+as a labeled "potentially related earlier memories" context block into
+both `analyze_capture()` and `reanalyze_unit()`'s prompts, explicitly
+marked as context the current text overrides on conflict -- never as
+authority.
+
+**Reason:** Prevents the system from re-asking about a term it already
+has an explanation for (e.g. "Zorblex" clarified once, mentioned again
+later) without paying for a semantic/vector search or a second LLM call
+-- regex + `ILIKE` is pure SQL. Deliberately NOT `hybrid_search()`: a
+full retrieval round for every ingested memory would undo the "storage
+should be cheap" pressure this whole phase was about.
+
+**Prior memory is context, not authority:** this is enforced by prompt
+wording only (there is no code-level override, unlike the explicit-
+metadata case above) -- a deliberate difference, since prior memory is
+inherently soft background ("have you perhaps already explained this
+term"), not a structured field with a definite right answer the way
+explicit metadata is.
+
+---
+
+**Decision:** Lightweight contradiction detection at storage time:
+after a unit embeds successfully, `_detect_conflicts()` extracts
+`(subject, predicate) -> object` triples from its own `semantic.relations`
+and searches for other `ready` units whose relations share a
+(subject, predicate) key but disagree on the object. A match adds a
+purely advisory `{"unit_id", "note"}` entry to `potential_conflicts` on
+*both* units -- never deletes, supersedes, or hides either side.
+
+**Reason:** Spec-mandated; "two memories disagree" must be surfaced, not
+silently resolved by picking one. Reuses the existing `hybrid_search()`
+call (no new retrieval primitive) and does the actual conflict
+comparison in plain Python (string equality on already-extracted
+fields) -- no extra LLM call for the comparison itself.
+
+**Bug found and fixed during testing:** the first implementation
+searched using the new unit's full `retrieval_text` as the query. That
+text *includes the differing object itself* (e.g. "...1400 dollars..."),
+so a full-text search for it can structurally never match a prior memory
+that says "...1200 dollars..." -- the one word that would prove the
+match is exactly the word guaranteed not to appear in the thing you're
+searching for. Fixed by searching on the relation's subject+predicate
+only (e.g. "rent is"), which is stable across the disagreement and
+actually finds the other side. Caught by a dedicated test
+(`tests/test_contradiction.py`) that deliberately exercises two
+differently-valued memories about the same subject, not by inspection --
+the original version passed every "no false positive" test and quietly
+failed every true positive until this was added.
+
+**Retrieval-side surfacing:** `_format_unit()` in
+`app/retrieval/pipeline.py` appends a `[Conflict] ...` line (plain string
+formatting, no LLM call) for any evidence unit carrying
+`potential_conflicts`, and the answer-generation system prompt was
+extended with one explicit instruction: a `[Conflict]` line means two
+stored memories disagree and the answer **must** state that disagreement
+rather than silently picking a side. This is the only place conflict
+presentation happens, keeping "represent disagreement explicitly" a
+single code path rather than something every caller has to remember to
+handle.
+
+**Not built, and why:** no truth-maintenance database, no temporal
+belief revision, no automatic "newest wins" rule, no supersession. See
+docs/TODO.md for what evidence would justify any of those.
+
+---
+
+**Decision:** `RecallSession` (`app/retrieval/session.py`) is now the
+canonical retrieval architecture end to end, including for the
+"stateless" one-shot endpoint. `POST /api/recall` no longer calls
+`run_agent()` directly -- it calls `start_session()`, runs exactly the
+same first automatic round a multi-turn session would (same ambiguity
+narrowing, same grounding decision), and reports the outcome in the
+flat legacy response shape. The session row is still persisted (it's
+recall history, same as any other session), but its id is never
+returned to a one-shot caller, so there's no way to continue it from
+that endpoint.
+
+**Reason:** Spec-mandated: "No two independent retrieval algorithms."
+Before this change, the one-shot path and the session path made the
+same *searches* (both called `automatic_search()`) but reached different
+*decisions* from the results -- the one-shot agent had no ambiguity
+detection, no discriminating-question logic, and no cue handling at all,
+so a genuinely ambiguous query got a possibly-wrong best-guess answer via
+`/api/recall` and a clarifying question via `/api/recall/sessions`,
+depending purely on which endpoint happened to be called for the exact
+same stored memories.
+
+**`run_agent()` is retained as an internal primitive** -- a one-shot
+search-and-answer with no ambiguity narrowing and no persisted session
+row -- for callers that deliberately want exactly that and not the
+session machinery: the eval harness (`eval/run_eval.py`) and latency
+benchmarks. It is no longer used by any HTTP-facing path.
+
+---
+
+**Decision:** A deterministic bypass (`_is_high_confidence` in
+`app/retrieval/agent.py`) skips the `evaluate_sufficiency()` LLM call
+entirely when the top candidate's fused score clears `0.80`, its margin
+over the runner-up (if any) clears `0.20`, and its semantic analysis
+isn't a degraded (`enrichment_status == "unavailable"`) fallback. All
+three conditions must hold.
+
+**Reason:** Spec-mandated "deterministic high-confidence short-circuit
+...using a combination of absolute relevance + margin to second
+candidate + candidate evidence completeness (not one arbitrary score
+alone)" -- a single-field check (score alone) would risk accepting a
+confidently-wrong top hit; requiring margin too means a close second
+candidate always still gets the reasoning step; requiring non-degraded
+evidence means a unit that only exists because the LLM was unavailable
+during ingestion never gets to skip the one place that was going to
+sanity-check it.
+
+**Calibration status:** thresholds are an initial engineering default,
+sanity-checked (not swept) against the real model via
+`scripts/run-eval.sh` -- the full 30-case eval set passed 28/30 with this
+shortcut active (see "Performance and quality snapshot" below). A
+genuine threshold sweep (vary both constants, measure false early
+acceptance / missed early acceptance / latency delta across the eval
+corpus) is in docs/TODO.md as the natural next experiment, not done here
+-- the corpus is small enough that a swept threshold would risk
+overfitting to 30 hand-written cases rather than reflecting a real
+distribution.
+
+---
+
+**Decision:** `MAX_AGENT_ITERATIONS` reduced 3 -> 2, and
+`MAX_REFORMULATIONS_PER_ROUND` reduced 2 -> 1 (`app/retrieval/agent.py`).
+
+**Reason:** Spec-mandated initial defaults ("a query that still isn't
+answerable after one reformulation is better handed to the user as a
+cue request than burned on a third automatic guess"). Not re-tuned
+against the eval corpus beyond the one full run reported below.
+
+**Measured effect, honestly reported:** the same 30-case eval set that
+passed 30/30 in earlier phases under the old 3/2 budget passed 28/30
+under the new one-call-ingestion + 2/1-iteration architecture combined.
+The two new failures:
+- `clarification_alias_second_term`: the single unified `analyze_capture`
+  call chose not to flag "Flimvex" as needing clarification at all (the
+  old dedicated question-generation call, with no other task competing
+  for its attention, apparently did) -- so the test's scripted
+  clarification answer was never consumed, and the model answered from
+  the unexplained term alone. This is an ingestion-collapse quality
+  trade-off, not an iteration-budget one.
+- `user_specific_terminology` ("What did I call the project?" ->
+  "Nightingale"): abstained instead of answering. Plausibly the reduced
+  reformulation budget (1 instead of 2) ran out before finding a
+  phrasing that bridges "what did I call X" to the stored alias -- but
+  this wasn't isolated by re-running with the old budget, so it's
+  reported as a correlated observation, not a proven cause.
+
+Both are regressions worth watching, not reverted: 28/30 (93%) on a
+30-case hand-written set is within the range where one or two cases
+flipping on model sampling variance alone is plausible even with *no*
+code change, and the spec explicitly traded some of this quality margin
+for the call-count/latency reduction on purpose. Recorded in
+docs/TODO.md as the concrete starting point for a real before/after
+comparison (same cases, old budget vs. new, multiple runs each) if this
+turns out to matter in practice.
+
+---
+
+**Decision:** Cue-to-candidate matching (`app/retrieval/discriminate.py`)
+gets a unified fallback: `_matches_cue()` first checks for an exact match
+against the unit's structured semantic fields (unchanged, precise), and
+-- new -- if that fails, checks whether the cue appears as a normalized
+substring of the unit's own `retrieval_text` at all (skipped for cues
+under 3 characters, to avoid short-token noise).
+
+**Reason:** Spec-mandated: "use a unified semantic representation for
+matching... not more field-specific heuristics." The structured-field
+list (`people`/`organizations`/`locations`/`aliases`/`topics`/
+`relations`/`definitions`) already grew once this session to fix a real
+bug (an entity's name landing in `relations`/`definitions` instead of a
+flat list field) -- rather than keep discovering new fields that need
+adding to the list, the `retrieval_text` fallback catches anything a cue
+names that the extraction step didn't separately pull into *any* field,
+since `retrieval_text` already contains everything the semantic
+representation knows in one place.
+
+---
+
+**Decision:** `is_ambiguous()` now requires the runner-up candidate's own
+fused score to clear an absolute floor (`AMBIGUITY_MIN_RUNNER_UP_SCORE =
+0.45`), in addition to the existing close-margin check.
+
+**Reason:** Spec-mandated: "don't treat the fused score as a perfect
+probability... consider... score margin [not in isolation]." Without
+this, two candidates that are both weak, barely-above-the-relevance-bar
+matches (e.g. 0.20 and 0.19) would trigger a clarifying question just
+because they happen to be close to *each other* -- which is "nothing
+solid was found," not "two strong contenders." The floor means a close
+margin only counts as genuine ambiguity when both sides are independently
+strong matches.
+
+**Metadata overlap, considered and not built:** the spec also suggested
+weighing metadata overlap between the top two candidates into the
+ambiguity decision. Investigated and deliberately not added: the
+existing downstream behavior (`generate_discriminating_question`
+returning `None` when every candidate shares a value, at which point
+`session.py` falls through to answering with both candidates' evidence
+rather than narrowing) already produces the right outcome for the
+"candidates are metadata-identical" case without `is_ambiguous()` itself
+needing to know about it. Adding an early-exit for that case in
+`is_ambiguous()` would have *changed* that outcome (triggering
+`narrow_to_dominant_group()` instead, discarding the second candidate's
+evidence) for no accuracy benefit found in testing -- see docs/TODO.md.
+
+---
+
+**Decision:** Recall-session state is never promoted into a MemoryUnit
+automatically. The one explicit mechanism for turning something from a
+recall session into a memory is `POST /api/recall/sessions/{id}/
+save-as-memory`, which creates a brand-new `Capture` through the
+*ordinary* `create_capture()` pipeline (segmentation, clarification,
+enrichment, provenance -- identical to `POST /api/captures`). The
+request `text` must exactly match something already in that session's
+own `messages` (a user turn) or `cues` (an extracted cue) --
+`app/retrieval/session.py`'s `user_supplied_texts()` -- rejected with 400
+otherwise, so this can never be used to inject arbitrary or agent-
+generated text (a hypothesis, a system question) as if the user had said
+it.
+
+**Reason:** Spec-mandated: never bypass the normal pipeline, and never
+auto-promote. The validation against `user_supplied_texts()` is the
+actual safety property -- it's not enough that the *action* is user-
+initiated (a button click); the *content* being saved must independently
+be traceable to something the user actually typed in this session.
+
+**Deferred, and why:** the frontend only ever uses the one-shot
+`/api/recall` flow today (`app/static/app.js`'s `initRecallPage`) --
+there is no UI that displays a session's cues or message history at all
+(the multi-turn `RecallSession` API is fully implemented and reachable,
+just not this page's default, per an earlier phase's benchmark). Wiring
+a "Save as memory" *button* into the UI would require either building
+that session-history UI (a materially larger piece of work than this
+feature itself) or threading a session id back out of the deliberately
+anonymous one-shot endpoint (undoing the "no way to continue a one-shot
+call" property decided above). Per the spec's own escape valve ("if this
+would materially complicate the current UI/API, document as a small
+deferred item"), the backend capability is complete and tested
+(`tests/test_save_as_memory.py`); the UI affordance is deferred -- see
+docs/TODO.md.
+
+---
+
+**Decision:** `hybrid_search()` and `hybrid_search_chunks()`
+(`app/retrieval/pipeline.py`) now accept an optional `query_vector`
+parameter via a new `embed_query()` helper; `automatic_search()`
+(`app/retrieval/agent.py`) embeds each query string once per iteration
+and passes the resulting vector into both calls instead of each one
+independently calling `llm.embed()` for the same text.
+
+**Reason:** Spec-flagged as "low risk, should be implemented" -- a
+second embedding call for text that was just embedded a moment ago is
+pure waste. A sentinel default (`_UNSET`, not plain `None`) distinguishes
+"caller didn't pass a vector, embed it yourself" from "caller already
+tried and the embedding is known unavailable" -- plain `None` couldn't
+carry both meanings without either silently retrying a known-failed
+embed or breaking the handful of call sites that still call either
+function standalone (tests, `eval/run_eval.py`-style direct calls),
+which continue to work unchanged.
+
+---
+
+**Decision:** The long-held PostgreSQL row lock
+(`with_for_update(...)` for the full duration of an LLM call) is replaced
+with a short-lived processing lease: `_claim_processing()` sets
+`status="processing"` plus a fresh random `processing_token` and
+`processing_started_at` in a short transaction and commits; the LLM work
+(now just one embedding call, see the ingestion-collapse decision above)
+runs with no transaction open at all; `_commit_if_token_matches()` does a
+single `UPDATE ... WHERE id=? AND processing_token=?` and checks
+`rowcount > 0`. A token mismatch means a concurrent attempt already
+finished first -- the result is simply dropped, never applied on top of
+whatever already landed. `retry_enrichment`/`POST /retry` only reclaims a
+unit stuck in `processing` if `processing_started_at` is older than
+`membase_processing_lease_stale_seconds` (300s).
+
+**Reason:** Spec-mandated: "a short-lived processing lease/token pattern
+...preserves race safety without holding a lock across expensive model
+calls." A row lock held for an LLM call's duration (previously up to
+several calls, now one) blocks any other transaction touching that row
+-- including, in the worst case, an unrelated read -- for exactly as long
+as the slowest external dependency this process doesn't control takes to
+respond. The lease pattern bounds the *lock* duration to two fast local
+transactions, independent of how long Ollama takes.
+
+---
+
+**Decision:** Image captioning moved from the synchronous ingestion path
+to a fully independent background task, `finish_image_captioning()`,
+scheduled by the API layer alongside (not chained after) attachment
+chunking. An uploaded image is stored and its sibling text memory forms
+immediately regardless of whether captioning ever succeeds; a captioning
+failure leaves the image attached and uncaptioned, never blocks or fails
+the capture.
+
+**Reason:** Spec-mandated: "an image should first be stored safely; the
+memory must not remain blocked because image captioning is unavailable."
+This directly reverses an earlier phase's decision (captioning was made
+*synchronous*, specifically so `clarify`/`enrich` could see the caption
+as context and avoid an avoidable clarification question about something
+a photo already resolved). Both decisions were correct for the problem
+they were solving; the explicit trade-off accepted here is that the
+*first* analysis pass for a capture with images now runs without their
+captions as context, so a vague reference an image would have resolved
+may get asked about anyway. Retrieval quality is not affected the same
+way: the caption still becomes fully searchable once captioning
+completes.
+
+**Gap found and fixed while implementing this:** a caption arriving after
+its sibling unit already embedded would otherwise never become
+searchable at all for a *short* caption -- too short to trigger chunking
+(see the lazy-chunking decision below), and the unit-level embedding that
+would have included it as an excerpt already happened before the caption
+existed. Fixed by having `finish_image_captioning()` reuse the same
+light re-indexing path `add_attachment()` uses for a posthoc file:
+rebuild each ready sibling unit's `retrieval_text`/`searchable_text` with
+a trailing excerpt and re-embed, without re-running full analysis.
+Extracted into a shared `_refresh_ready_units_with_attachment_excerpt()`
+so both callers stay in sync.
+
+---
+
+**Decision:** Attachment chunking is lazy/conditional: `should_chunk()`
+skips chunk-level embedding entirely when the attachment's extracted
+text is under `membase_min_chars_for_chunking` (2000 chars) -- the parent
+unit's own full-text search already covers a document that short.
+`_index_attachment_chunks()` was made idempotent (clears any existing
+chunks for the attachment before re-inserting), which is what makes
+`retry_attachment_chunking()` safe to call again after a dropped
+background task, without a separate pending/processing status column for
+chunks.
+
+**Reason:** Spec-mandated: "a simple deterministic size threshold is
+sufficient; don't deeply process a tiny file," plus a recovery mechanism
+that's "no job queue... a simple state machine or retry endpoint... or
+make chunking naturally idempotent." Idempotency-via-retry was chosen
+over a new status column: a chunk-having attachment and a chunk-lacking
+one are already distinguishable by `AttachmentChunk` existence, so a
+status column would track information already recoverable by querying
+the thing it's redundant with.
+
+**Not done:** `retry_attachment_chunking()` exists and is tested but has
+no API route wired to it yet -- see docs/TODO.md.
+
+---
+
+## Performance and quality snapshot (post-streamlining)
+
+Measured against this phase's final code, real `gemma4:12b` +
+`nomic-embed-text` via Ollama, `scripts/run-eval.sh`'s 30-case corpus
+(`eval/cases.yaml`):
+
+- **28/30 eval cases passed** (93%), full transcript and the two
+  failures' analysis in the iteration-budget decision above.
+- **LLM call count per ordinary memory (no clarification, no
+  attachment):** 1 generation call (`analyze_capture`) + 1 embedding
+  call, down from 4 generation calls + 1 embedding call before this
+  phase (`segment_capture` + `generate_questions` + 3x `enrich()`
+  sub-calls + embed). A memory needing one round of clarification adds
+  exactly 1 more generation call (`reanalyze_unit`) either way.
+- **LLM call count per simple one-shot recall:** best case (the
+  deterministic high-confidence shortcut fires) is 1 embedding call + 1
+  answer-generation call, with zero `evaluate_sufficiency` calls -- down
+  from a mandatory sufficiency-evaluation call every time. A query
+  needing reformulation now costs at most 1 extra search round (down
+  from up to 2), each round re-embedding at most once per query string
+  (see the embedding-dedup decision above, down from twice).
+- **Contradiction detection adds, at most, the cost it already reuses:**
+  one `hybrid_search()` call per newly-finalized unit with at least one
+  relation -- no new retrieval primitive, no extra LLM call for the
+  comparison itself.
+- Not measured: wall-clock latency under the exact same conditions
+  before vs. after (no clean "before" baseline was re-run this phase --
+  reverting the full call-collapse to get one would have cost more of
+  this phase's budget than the measurement was worth, given the call-
+  count reduction is the more direct and less noisy signal). Flagged in
+  docs/TODO.md as the natural next experiment if latency numbers are
+  specifically needed later.
+
+---
+
+**Decision:** "Multi-file posthoc attachment" -- `POST /api/captures/
+{id}/attachments` now accepts multiple files in one call
+(`add_attachments()` in `app/ingestion/pipeline.py`), not just one.
+Validation and storage are atomic across the whole batch (one
+unsupported/oversized file rolls back the entire call, matching
+`create_capture()`'s own existing multi-upload handling) -- rather than
+leaving a confusing partial result where some of the files from one
+request got attached and one didn't. Best-effort derived processing
+(captioning, chunking) stays per-file after that, same tolerance as
+everywhere else. Sibling units are re-embedded exactly ONCE after the
+whole batch finishes, not once per file -- N files no longer means N
+redundant embedding calls. `add_attachment()` (singular) is now a thin
+wrapper over this, so no existing caller changed behavior.
+
+**Reason:** User-requested ("add the option to upload and attach
+multiple files to a memory"). Create-time multi-file upload already
+existed (`POST /api/captures` took `files: list[UploadFile]` from the
+start); the gap was specifically the posthoc path, which only ever took
+one file and had no UI at all. A UI control (file picker + "Attach
+files" button) was added for this -- initially placed on the Browse
+page, then moved to the Store page's own post-save result card after
+feedback that it belongs where the user's attention already is right
+after saving (see "Store page simplified" below).
+
+---
+
+**Decision:** The combined attachment text fed into generation prompts
+(`analyze_capture()`'s initial call, and both `reanalyze_unit()` call
+sites -- clarification resolution and correction) is now capped at
+`MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS` (1500 chars), via a new
+`_attachment_text_for_analysis()` that truncates. The full-text search
+index (`_build_searchable_text`, via the uncapped `_attachment_text_for()`)
+is unaffected -- Postgres full-text search has no model-context budget
+to protect.
+
+**Reason:** A generation call's context window is shared between its
+input prompt and its output -- the same 4096-token budget that caused
+the "20 facts collapse to one blob" bug fixed earlier (see "Chunk long
+captures before analysis" above). That fix was about OUTPUT size; an
+uncapped `attachment_text` is the INPUT-side version of the identical
+risk -- a large PDF, or several attachments concatenated with no limit,
+crowds out the budget the model needs for its own structured-JSON
+response, on every analysis call a capture's units ever make for their
+whole lifetime (not just once at ingestion). Found by inspection while
+answering a direct question about it, not by a reported failure --
+fixed proactively since the multi-file attachment feature above makes
+hitting this materially more likely (more attachments concatenated
+together per capture, no cap).
+
+---
+
+# The "membase structurer" (post-save deep enrichment)
+
+**Decision:** Add a second, independent background layer -- the
+*structurer* -- that deepens an already-`"ready"` (searchable) unit's
+representation without ever affecting whether it's searchable.
+User-mandated: "this process should run in parallel to the membase
+hosting, and memory recall should be able to happen to both processed
+and unprocessed memories at any time."
+
+**What it does (v1 scope):**
+- Re-derives a richer semantic representation (`app/ingestion/
+  structurer.py`'s `structure_unit()`) -- the same `Semantics` shape the
+  fast path produces, but from one dedicated, unhurried call that isn't
+  sharing a context budget with segmentation or clarification decisions.
+  Explicitly allowed to be "LLM heavy" (user's words) -- unlike every
+  other call in this codebase, this one has no latency pressure, since
+  nothing user-facing is waiting on it.
+- Finds candidate related memories via the *existing* `hybrid_search()`
+  call (same reuse pattern as contradiction detection -- no new
+  retrieval primitive) and asks the model which of them are genuinely
+  related, storing the result as `related_unit_ids` (a flat, bounded
+  list -- advisory cross-references, explicitly NOT a knowledge graph,
+  consistent with the streamlining phase's "no knowledge graph" rule).
+- Rebuilds `retrieval_text`/`searchable_text`/`embedding` **in place**,
+  via the same lease/token commit pattern `_finalize_unit()` already
+  uses (`structure_token`/`structure_started_at`, parallel to
+  `processing_token`/`processing_started_at`) -- so there is no window
+  where the unit is unsearchable or carries a half-written mix of old
+  and new fields. `hybrid_search()` itself needs zero changes: a
+  structured unit is just a `ready` unit with better data in the exact
+  same columns retrieval already reads.
+
+**Trigger -- "should start for any memory as soon as it is stored":**
+scheduled as a FastAPI BackgroundTask immediately after
+`finish_unit_processing` for the same unit, in the same request
+(`api/captures.py`'s `create()`, and the clarification-resolution/
+correction/retry paths). Starlette's `BackgroundTasks` run sequentially,
+in registration order, within one request -- so scheduling
+`finish_structuring` right after `finish_unit_processing` guarantees the
+unit is already `"ready"` (has real `semantic`/`retrieval_text` to build
+on) by the time structuring actually runs, with no polling, no queue,
+and no new infrastructure needed to express that ordering.
+
+**No new infrastructure:** still a FastAPI BackgroundTask, own DB
+session, own lease -- not a worker daemon, not Celery/Redis (CLAUDE.md's
+existing constraint, unrevisited). "Runs in parallel to the hosting"
+is satisfied by being backgrounded and never touching the request/
+response path or the search path, not by being a separate process.
+
+**State, deliberately separate from the existing `status` gate:** a new
+`structure_status` column (`unstructured` | `structuring` | `structured`
+| `failed`) tracks the structurer's own progress. It is NEVER read by
+`hybrid_search()` and never changes `MemoryUnit.status` -- the one and
+only searchability gate remains `status == "ready"`, exactly as before
+this feature existed. A unit can sit in `structure_status="unstructured"`
+indefinitely (structuring never ran, dropped, or still queued) and
+remain fully, normally searchable the whole time.
+
+**Deferred, and why (not silently skipped):** structurer-driven
+*re-segmentation* -- splitting an existing ready unit into more units if
+the deeper pass decides the original boundary was wrong. The user's
+spec explicitly scoped this to "if needed and providing meaningful
+quality improvement," and on inspection it runs into the one invariant
+this whole codebase treats as non-negotiable: `authoritative_content` is
+never rewritten. Splitting a unit after the fact would require either
+violating that (shrinking the original unit's content) or inventing a
+"supersede the old unit with new siblings, retire it" lifecycle that
+doesn't exist yet and has real edge cases (existing
+`potential_conflicts` entries and `RecallSession.final_sources`
+snapshots reference unit ids directly, by id -- a retired unit id must
+stay resolvable or those go stale). Not built this pass; see
+docs/TODO.md for what a safe version would need.
+
+**Recovery:** `POST /api/memory-units/{id}/restructure` reclaims a unit
+stuck in `structure_status="structuring"` past a staleness window, same
+pattern as the existing `/retry` endpoint for the fast pipeline's lease.
+
+**Visualized only on the Browse page** (per explicit instruction, and
+consistent with the Store page's own simplification below): a
+`structure_status` badge per unit, read at page-load time, same as the
+existing `status` badges -- no polling added for this (matches the
+Browse page's existing no-polling design); reloading the page shows
+current state.
+
+---
+
+**Decision:** The Store (create) page's UI was simplified alongside the
+structurer work: it no longer waits for or polls background processing
+status at all, and the old "processing... / stuck after 10 minutes /
+retry" UI was removed from this page entirely (`pollUnitUntilDone`,
+`MAX_POLL_MS`, the `.capture-processing` block). It now shows "Saved" --
+with the real derived semantic info -- as soon as every pending
+clarification question (if any) is resolved.
+
+**Reason:** `authoritative_content` and `semantic` are already set
+*synchronously*, before the HTTP response for `POST /api/captures` (or
+`/clarify`) even returns -- only `retrieval_text`/`embedding` (and now
+structuring) are backgrounded. Waiting for those to finish before
+showing anything was never actually necessary for the Store page's own
+purpose (confirming what got saved); it was inherited UI caution from
+when the background step did more work. Per explicit instruction, all
+"is this memory's background processing done yet" visualization now
+lives on the Browse page only, which is also where the structurer's own
+status belongs.
+
+**What moved there instead:** attaching additional files to a
+just-saved memory. Originally built on the Browse page's per-capture
+row; moved to the Store page's own post-save result card after
+feedback that it belongs where the user's attention already is right
+after saving, not on a separate list page they'd have to go find the
+capture on again. Same backend endpoint either way
+(`POST /api/captures/{id}/attachments`, see "Multi-file posthoc
+attachment" above) -- purely a UI placement decision.
+
+---
+
+**Decision:** "Disable follow-up questions" -- a new setting, enforced
+server-side, that removes the clarification round-trip from the
+storage cycle entirely. `POST /api/captures` gained an optional
+`disable_followup_questions` form field; `create_capture()` and
+`_unit_from_analysis()` (`app/ingestion/pipeline.py`) gained an
+`allow_clarification` parameter. When `False`, NO unit resulting from
+that capture can ever reach `status="awaiting_clarification"` --
+suppressed uniformly for both a model-proposed question AND a genuine
+explicit-metadata conflict (the explicit value still silently wins
+either way; only the surfaced *question* is dropped, not the authority
+rule). A settings-menu checkbox (`app/templates/base.html`,
+persisted client-side in `localStorage` like the existing "obligatory"
+setting) controls whether the Store page sends this field.
+
+**Reason:** User-requested, specifically to reduce how long a
+submission can stay "blocked" waiting on the user. The clarification
+round-trip is architecturally different from every other latency this
+project has optimized this phase: analyze_capture()'s own call takes a
+few bounded seconds, but a pending clarification question waits on
+*human* judgment, which has no bound at all -- a user might take
+minutes, or never come back to answer it, leaving the unit stuck in
+`awaiting_clarification` (durably saved, but not searchable) for as
+long as that takes. Disabling the setting removes that specific
+unbounded dependency: every unit now goes straight to `"processing"`
+(the fast-pipeline's own bounded background embed step) the moment
+`analyze_capture()` returns, regardless of what it proposed.
+
+**What was deliberately NOT done:** the `analyze_capture()` prompt and
+schema are unchanged -- the model is still asked to consider
+clarification need (and still produces a `clarification_question`
+field), it's just unconditionally discarded by the pipeline when the
+setting is on. Stripping clarification out of the prompt/schema itself
+to save a few output tokens was considered and rejected: the real,
+stated cost being eliminated is the unbounded human-wait, not the
+model's own (already bounded, already fast) response time, so a second
+schema variant would have added real complexity for a saving that
+isn't the one that actually matters here.
+
+---
+
+## Benchmark: fast pipeline vs. structurer wall-clock time
+
+Measured, not estimated: 5 short, single-fact memories, each timed
+through `create_capture()` (the synchronous `analyze_capture` call),
+`finish_unit_processing()` (the background embed), and
+`finish_structuring()` (the structurer's own pass) back to back,
+against the real `gemma4:12b`/`nomic-embed-text` models via Ollama,
+otherwise idle (`-np 1`, no concurrent load).
+
+| Memory | analyze (sync) | embed (bg) | structure (bg) |
+|---|---|---|---|
+| "I met Anna at ETH..." | 17.5s | 1.5s | 11.4s |
+| "My gym locker combination is 42." | 8.1s | 0.1s | 10.8s |
+| "I visited Rome in 2024..." | 7.3s | 0.1s | 12.9s |
+| "I need to renew my passport..." | 8.1s | 0.1s | 10.2s |
+| "Tom gave me a book called Dune..." | 14.1s | 0.1s | 11.4s |
+| **average** | **11.0s** | **0.4s** | **11.3s** |
+
+**What this means:**
+
+- The number the USER actually waits on is the `analyze` column alone
+  (~11s average, 7-18s range) -- `embed` and `structure` are both
+  backgrounded, so neither adds to request latency.
+- A unit becomes `"ready"` (searchable) after analyze+embed, averaging
+  **~11.4s total** -- embed itself is negligible (~0.4s average; the
+  1.5s outlier on the first row is consistent with a cold-start/first-
+  call artifact on the embedding model, not a representative cost).
+- **Structuring costs almost exactly as much wall-clock time as the
+  entire fast pipeline combined** (11.3s vs. 11.4s, a 0.99x ratio) --
+  for these short, simple, single-fact memories. This is a real,
+  measured finding, not the "allowed to be LLM heavy" headroom
+  translating into a dramatically larger number: both paths are
+  fundamentally bounded by ONE generation call each for a memory this
+  size, and the structurer's richer system prompt + the related-
+  memory-candidate step don't add a second call, just somewhat more
+  work within the one call it does make.
+- **Practical implication:** every memory now costs roughly *double*
+  the model compute-time it did before structuring existed (one fast-
+  pipeline pass + one structuring pass), even though none of that
+  second pass is on the user's critical path. Since Ollama serializes
+  requests (`-np 1`), a burst of several new memories in quick
+  succession means structuring passes queue up behind each other (and
+  behind any concurrent recall query) -- invisible to any single user
+  action, but a real aggregate load increase worth knowing about before
+  assuming structuring is "free" just because it's backgrounded.
+- Not covered by this benchmark: a long/dense, multi-unit capture (the
+  kind that triggers chunking in `analyze_capture()` -- see "Chunk long
+  captures before analysis" above). A rough, not-controlled data point
+  from earlier testing: a ~20-fact capture needed 2 chunks/analyze
+  calls and took several minutes end to end for analysis alone (before
+  structuring was even involved) -- scaling, as expected, with how many
+  separate generation calls a large capture needs, not a fixed cost.
+- For contrast, image captioning (`finish_image_captioning`, a single
+  `generate()` call with no JSON schema overhead) measured ~4.6s for a
+  trivial test image -- meaningfully cheaper than either full
+  structured-output path, consistent with schema-constrained JSON
+  generation costing more than free-text generation for a comparable
+  amount of actual content.

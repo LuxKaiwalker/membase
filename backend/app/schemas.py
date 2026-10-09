@@ -24,6 +24,11 @@ class MemoryUnitOut(BaseModel):
     clarifications: list
     pending_clarification: dict | None
     semantic: dict
+    explicit_metadata: dict
+    potential_conflicts: list
+    structure_status: str
+    structured_at: datetime | None
+    related_unit_ids: list
     created_at: datetime
 
 
@@ -82,6 +87,14 @@ class RecallResponse(BaseModel):
 
 
 class RecallSessionMessageRequest(BaseModel):
+    text: str
+
+
+class SaveAsMemoryRequest(BaseModel):
+    # Must match something the user actually said in this session (a
+    # message or an extracted cue) -- enforced server-side, never an
+    # arbitrary string or an agent-generated hypothesis/question (see
+    # docs/DECISIONS.md "Save as memory").
     text: str
 
 

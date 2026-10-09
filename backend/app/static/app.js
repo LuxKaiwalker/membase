@@ -1,8 +1,17 @@
 const membase = (() => {
   function showStatus(el, message, isError) {
-    el.textContent = message;
     el.classList.remove("hidden");
     el.classList.toggle("error", !!isError);
+    if (isError) {
+      el.textContent = message;
+    } else {
+      el.innerHTML = "";
+      const spinner = document.createElement("span");
+      spinner.className = "spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      el.appendChild(spinner);
+      el.appendChild(document.createTextNode(message));
+    }
   }
 
   function hide(el) {
@@ -49,15 +58,49 @@ const membase = (() => {
     }
   }
 
+  // Unlike "obligatory" above, this one IS enforced server-side (see
+  // docs/DECISIONS.md "Disable follow-up questions") -- when on, the
+  // `disable_followup_questions` form field is sent with every
+  // POST /api/captures, and the backend never surfaces a clarification
+  // question for that capture at all, regardless of what the model (or
+  // an explicit-metadata conflict) would otherwise have asked. Defaults
+  // to false so existing behavior is unchanged for anyone who never
+  // opens the settings menu.
+  const DISABLE_FOLLOWUP_SETTING_KEY = "membase.disableFollowupQuestions";
+
+  function isFollowupDisabled() {
+    try {
+      return localStorage.getItem(DISABLE_FOLLOWUP_SETTING_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function setFollowupDisabled(value) {
+    try {
+      localStorage.setItem(DISABLE_FOLLOWUP_SETTING_KEY, value ? "1" : "0");
+    } catch {
+      // Preference just won't persist across reloads -- not worth
+      // surfacing an error for.
+    }
+  }
+
   // Present in base.html on every page, so this runs unconditionally --
   // no per-page init call needed.
   function initSettingsMenu() {
     const toggle = document.getElementById("settings-toggle");
     const menu = document.getElementById("settings-menu");
-    const checkbox = document.getElementById("setting-obligatory-questions");
-    if (!toggle || !menu || !checkbox) return;
+    const obligatoryCheckbox = document.getElementById("setting-obligatory-questions");
+    const disableFollowupCheckbox = document.getElementById("setting-disable-followup-questions");
+    if (!toggle || !menu || !obligatoryCheckbox || !disableFollowupCheckbox) return;
 
-    checkbox.checked = isObligatory();
+    obligatoryCheckbox.checked = isObligatory();
+    disableFollowupCheckbox.checked = isFollowupDisabled();
+    // "Must you answer a question that will never be asked" doesn't
+    // make sense -- grey the obligatory setting out while follow-up
+    // questions are disabled entirely, rather than leave two settings
+    // visibly contradicting each other.
+    obligatoryCheckbox.disabled = disableFollowupCheckbox.checked;
 
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -74,22 +117,27 @@ const membase = (() => {
       }
     });
 
-    checkbox.addEventListener("change", () => setObligatory(checkbox.checked));
+    obligatoryCheckbox.addEventListener("change", () => setObligatory(obligatoryCheckbox.checked));
+    disableFollowupCheckbox.addEventListener("change", () => {
+      setFollowupDisabled(disableFollowupCheckbox.checked);
+      obligatoryCheckbox.disabled = disableFollowupCheckbox.checked;
+    });
   }
 
   initSettingsMenu();
 
   // A hung request (e.g. a stuck DB transaction server-side) must never
   // leave the page silently spinning forever with no feedback -- that's
-  // indistinguishable from a frozen UI. 420s is sized to the server's own
-  // worst legitimate case, not guessed independently: ingestion can run
-  // up to 5 sequential LLM calls (generate_questions, enrich()'s three
-  // narrative/entities/retrieval-aids sub-calls, embed), each up to the
-  // server's configured 90s llm_timeout_seconds -- a shorter client
-  // timeout would abort a slow-but-working request and misreport it as
-  // stuck. Still bounds the true-hang case to a visible error instead of
-  // an infinite wait.
-  const REQUEST_TIMEOUT_MS = 420_000;
+  // indistinguishable from a frozen UI. Sized to the server's own worst
+  // legitimate case, not guessed independently: the synchronous part of
+  // saving a capture makes at most one LLM call (analyze_capture -- see
+  // docs/DECISIONS.md "Collapse ingestion LLM calls"), up to the server's
+  // configured 90s llm_timeout_seconds -- embedding/finalization happens
+  // in a background task after this request already returned. A shorter
+  // client timeout would abort a slow-but-working request and misreport
+  // it as stuck; this still bounds the true-hang case to a visible error
+  // instead of an infinite wait.
+  const REQUEST_TIMEOUT_MS = 150_000;
 
   async function fetchWithTimeout(url, options) {
     const controller = new AbortController();
@@ -158,42 +206,21 @@ const membase = (() => {
     derivedEl.textContent = JSON.stringify(lines, null, 2);
   }
 
-  // How often to re-check a unit stuck in "processing" (full enrichment
-  // now runs as a background task -- see docs/DECISIONS.md -- so the
-  // client has to poll for it instead of getting it inline in the save
-  // response).
-  const POLL_INTERVAL_MS = 1500;
-
-  // An unbounded poll loop would spin forever if the background task
-  // never finishes -- e.g. the server restarted mid-task and dropped it
-  // (a scenario docs/DECISIONS.md explicitly documents, recoverable via
-  // POST /retry). Bounded generously above the worst *legitimate* case
-  // (up to 4 sequential LLM calls in _run_full_enrichment, each up to
-  // the server's 90s llm_timeout_seconds -- see app/db.py) so this only
-  // ever fires for a genuinely stuck unit, not a slow-but-working one.
-  const MAX_POLL_MS = 600_000;
-
-  class PollTimeoutError extends Error {}
-
-  async function pollUnitUntilDone(unitId) {
-    const deadline = Date.now() + MAX_POLL_MS;
-    while (true) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      const resp = await fetchWithTimeout(`/api/memory-units/${unitId}`);
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(data.detail || "Couldn't check memory status");
-      if (data.status !== "processing") return data;
-      if (Date.now() > deadline) {
-        throw new PollTimeoutError(`Still processing after ${formatElapsed(MAX_POLL_MS)}`);
-      }
-    }
-  }
+  // Whether a unit's background processing (the embedding step, and --
+  // see docs/DECISIONS.md "membase structurer" -- the deeper structurer
+  // pass) has actually finished is deliberately NOT waited for or
+  // polled on this page any more: the Store page shows "Saved" as soon
+  // as the text itself is durably persisted (authoritative_content and
+  // semantic fields are already set synchronously by the time this
+  // page's request returns -- only retrieval_text/embedding/structuring
+  // are backgrounded). Post-processing status/progress is visualized on
+  // the Browse page instead, which is the one place that view belongs.
 
   function buildCaptureCard() {
     const card = document.createElement("div");
     card.className = "card capture-card";
     card.innerHTML = `
-      <p class="capture-saving muted">Saving...</p>
+      <p class="capture-saving muted"><span class="spinner" aria-hidden="true"></span>Saving...</p>
       <div class="capture-clarification hidden">
         <h2>One question</h2>
         <p class="muted">This memory isn't saved as searchable yet until this is answered.</p>
@@ -206,18 +233,17 @@ const membase = (() => {
         <p class="capture-clarification-stage muted hidden"></p>
         <p class="capture-clarification-error status error hidden"></p>
       </div>
-      <div class="capture-processing hidden">
-        <p class="capture-processing-status muted">The memory is being processed...</p>
-        <p class="capture-stuck hidden status error">
-          Still processing after 10 minutes -- the server may have
-          restarted mid-task.
-          <button type="button" class="capture-retry">Retry processing</button>
-        </p>
-      </div>
       <div class="capture-result hidden">
         <h2 class="capture-result-heading">Saved.</h2>
         <p class="muted">Derived information (automatically extracted; your original text above is never changed by it):</p>
         <pre class="derived"></pre>
+        <p class="muted capture-attachment-list"></p>
+        <p class="muted capture-safe-to-leave">
+          Your words are already saved. Everything else -- indexing it
+          for search, and the slower background enrichment pass -- keeps
+          running on the server, so it's safe to close this page now;
+          check the Browse page later if you want to see its progress.
+        </p>
       </div>
       <p class="capture-error status error hidden"></p>
     `;
@@ -238,94 +264,57 @@ const membase = (() => {
     const clarificationDiscard = card.querySelector(".capture-clarification-discard");
     const clarificationStage = card.querySelector(".capture-clarification-stage");
     const clarificationError = card.querySelector(".capture-clarification-error");
-    const processingEl = card.querySelector(".capture-processing");
-    const processingStatus = card.querySelector(".capture-processing-status");
-    const stuckEl = card.querySelector(".capture-stuck");
-    const retryButton = card.querySelector(".capture-retry");
     const resultSection = card.querySelector(".capture-result");
     const resultHeading = card.querySelector(".capture-result-heading");
     const derivedEl = card.querySelector(".derived");
     const errorEl = card.querySelector(".capture-error");
+    const attachmentListEl = card.querySelector(".capture-attachment-list");
 
     let allUnits = [];
     // Capture may split into several units; each may independently have
     // a pending clarification. Ask them one at a time rather than all at
     // once (spec: don't turn this into an interrogation).
     let pendingQueue = [];
+    let currentAttachments = [];
+
+    // Read-only: just what's already attached to this memory. Attaching
+    // files happens before saving (see initCreatePage()'s selected-files
+    // list) -- this card never offers to add more after the fact (see
+    // docs/DECISIONS.md "Multi-file posthoc attachment").
+    function renderAttachmentList() {
+      attachmentListEl.textContent = currentAttachments.length
+        ? `Attachments: ${currentAttachments.map((a) => a.original_filename).join(", ")}`
+        : "";
+    }
 
     function showError(message) {
       hide(savingEl);
       hide(clarificationSection);
-      hide(processingEl);
       showStatus(errorEl, message, true);
     }
 
+    // Shown as soon as every pending clarification question (if any) is
+    // settled -- does not wait for background embedding/structuring to
+    // finish, since authoritative content and the derived fields shown
+    // below are already durably saved and known synchronously by this
+    // point. Whether background processing later succeeds, fails, or is
+    // still running is a Browse-page concern now, not this page's (see
+    // docs/DECISIONS.md "membase structurer").
     function showResult() {
-      hide(processingEl);
-      const ready = allUnits.filter((u) => u.status === "ready");
-      const failed = allUnits.filter((u) => u.status === "failed");
+      const saved = allUnits.filter((u) => u.status !== "discarded");
       resultHeading.textContent =
-        ready.length > 1 ? `Saved ${ready.length} memories.` : ready.length === 1 ? "Saved." : "Nothing saved.";
-      renderUnits(derivedEl, ready);
+        saved.length > 1 ? `Saved ${saved.length} memories.` : saved.length === 1 ? "Saved." : "Nothing saved.";
+      renderUnits(derivedEl, saved);
+      renderAttachmentList();
       show(resultSection);
-      if (failed.length > 0) {
-        showStatus(errorEl, `${failed.length} memory unit(s) failed to process and were not saved.`, true);
-      }
     }
-
-    async function waitForProcessing() {
-      hide(clarificationSection);
-      hide(stuckEl);
-      show(processingEl);
-      const startedAt = performance.now();
-      processingStatus.textContent = "The memory is being processed...";
-      const ticker = setInterval(() => {
-        processingStatus.textContent = `The memory is being processed... (${formatElapsed(performance.now() - startedAt)} elapsed)`;
-      }, 1000);
-      const inFlight = allUnits.filter((u) => u.status === "processing");
-      try {
-        const finished = await Promise.all(inFlight.map((u) => pollUnitUntilDone(u.id)));
-        for (const unit of finished) {
-          allUnits = allUnits.map((u) => (u.id === unit.id ? unit : u));
-        }
-      } catch (err) {
-        if (err instanceof PollTimeoutError) {
-          // Still "processing" as far as the unit itself is concerned --
-          // offer a retry instead of a dead-end error, since POST /retry
-          // is exactly the documented recovery path for this.
-          show(stuckEl);
-          return;
-        }
-        showError(err.message);
-        return;
-      } finally {
-        clearInterval(ticker);
-      }
-      showResult();
-    }
-
-    retryButton.addEventListener("click", async () => {
-      hide(stuckEl);
-      try {
-        await Promise.all(
-          allUnits
-            .filter((u) => u.status === "processing")
-            .map((u) => postJSON(`/api/memory-units/${u.id}/retry`, {}))
-        );
-      } catch (err) {
-        showError(err.message);
-        return;
-      }
-      await waitForProcessing();
-    });
 
     function askNextClarification() {
       setClarificationBusy(false);
       if (pendingQueue.length === 0) {
-        waitForProcessing();
+        showResult();
         return;
       }
-      hide(processingEl);
       clarificationQuestion.textContent = pendingQueue[0].question;
       // Soft guard only: the API always accepts a blank answer as "skip"
       // (see docs/DECISIONS.md) -- this toggles the HTML `required`
@@ -362,8 +351,7 @@ const membase = (() => {
       if (busy) {
         clarificationSubmit.textContent = label;
         hide(clarificationError);
-        show(clarificationStage);
-        clarificationStage.textContent = label;
+        showStatus(clarificationStage, label, false);
       } else {
         clarificationSubmit.textContent = "Submit answer";
         hide(clarificationStage);
@@ -418,6 +406,7 @@ const membase = (() => {
         if (!resp.ok) throw new Error(capture.detail || "Failed to save");
 
         hide(savingEl);
+        currentAttachments = capture.attachments;
         allUnits = capture.units;
         pendingQueue = [];
         for (const unit of capture.units) enqueueIfPending(unit);
@@ -431,11 +420,53 @@ const membase = (() => {
   function initCreatePage() {
     const form = document.getElementById("create-form");
     const capturesEl = document.getElementById("captures");
+    const fileInput = document.getElementById("files");
+    const selectedFilesEl = document.getElementById("selected-files");
+
+    // Accumulated across possibly several picker interactions -- a bare
+    // <input type="file" multiple> only accumulates selections WITHIN
+    // one picker dialog; reopening the dialog to add more replaces its
+    // .files entirely, which otherwise silently drops whatever was
+    // already chosen. This list (and the visible preview below it) is
+    // what actually gets submitted; the input's own .files is read once
+    // per "change" and then cleared.
+    let selectedFiles = [];
+
+    function renderSelectedFiles() {
+      selectedFilesEl.innerHTML = "";
+      for (const [index, file] of selectedFiles.entries()) {
+        const li = document.createElement("li");
+        li.className = "selected-file";
+        const name = document.createElement("span");
+        name.textContent = file.name;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Remove";
+        remove.addEventListener("click", () => {
+          selectedFiles.splice(index, 1);
+          renderSelectedFiles();
+        });
+        li.appendChild(name);
+        li.appendChild(remove);
+        selectedFilesEl.appendChild(li);
+      }
+    }
+
+    fileInput.addEventListener("change", () => {
+      selectedFiles.push(...fileInput.files);
+      fileInput.value = ""; // so the next picker interaction is purely additive
+      renderSelectedFiles();
+    });
 
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
-      const formData = new FormData(form);
+      const formData = new FormData();
+      formData.set("text", document.getElementById("text").value);
+      for (const file of selectedFiles) formData.append("files", file);
+      formData.set("disable_followup_questions", isFollowupDisabled() ? "true" : "false");
       form.reset();
+      selectedFiles = [];
+      renderSelectedFiles();
 
       const card = buildCaptureCard();
       capturesEl.prepend(card);
@@ -484,9 +515,9 @@ const membase = (() => {
       const query = document.getElementById("query").value;
 
       const startedAt = performance.now();
-      showStatus(statusEl, "Recalling...");
+      showStatus(statusEl, "Remembering...");
       const ticker = setInterval(() => {
-        showStatus(statusEl, `Recalling... (${formatElapsed(performance.now() - startedAt)} elapsed)`);
+        showStatus(statusEl, `Remembering... (${formatElapsed(performance.now() - startedAt)} elapsed)`);
       }, 200);
 
       try {
@@ -520,18 +551,55 @@ const membase = (() => {
       card.className = "card capture-row";
       const when = new Date(capture.created_at).toLocaleString();
       const unitBadges = capture.units
-        .map((u) => `<span class="status-badge status-badge-${escapeHtml(u.status)}">${escapeHtml(u.status)}</span>`)
+        .map((u) => {
+          const statusBadge = `<span class="status-badge status-badge-${escapeHtml(u.status)}">${escapeHtml(u.status)}</span>`;
+          // The structurer's own progress (see docs/DECISIONS.md "The
+          // 'membase structurer'") -- deliberately only shown here, not
+          // on the Store page, and only read at page-load time (no
+          // polling), same as the status badge beside it.
+          const structureBadge = `<span class="status-badge structure-badge-${escapeHtml(u.structure_status)}">structurer: ${escapeHtml(u.structure_status)}</span>`;
+          return `${statusBadge} ${structureBadge}`;
+        })
         .join(" ");
       const attachmentList = capture.attachments.length
         ? `<p class="muted">Attachments: ${capture.attachments.map((a) => escapeHtml(a.original_filename)).join(", ")}</p>`
         : "";
+      const failedStructureUnits = capture.units.filter((u) => u.structure_status === "failed");
+      const restructureButtons = failedStructureUnits
+        .map((u) => `<button type="button" class="capture-restructure" data-unit-id="${escapeHtml(u.id)}">Retry structuring</button>`)
+        .join(" ");
       card.innerHTML = `
         <p class="muted">${escapeHtml(when)}</p>
         <p>${escapeHtml(capture.raw_text)}</p>
         <p>${unitBadges}</p>
         ${attachmentList}
+        ${restructureButtons}
+        <p class="capture-restructure-error status error hidden"></p>
         <button type="button" class="capture-delete">Delete</button>
       `;
+
+      const restructureError = card.querySelector(".capture-restructure-error");
+      for (const button of card.querySelectorAll(".capture-restructure")) {
+        button.addEventListener("click", async () => {
+          button.disabled = true;
+          hide(restructureError);
+          showStatus(restructureError, "Retrying...", false);
+          try {
+            const resp = await fetchWithTimeout(`/api/memory-units/${button.dataset.unitId}/restructure`, { method: "POST" });
+            const updated = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(updated.detail || `Failed to retry (${resp.status})`);
+            const unit = capture.units.find((u) => u.id === updated.id);
+            if (unit) unit.structure_status = updated.structure_status;
+            hide(restructureError);
+            if (updated.structure_status !== "failed") button.remove();
+            else button.disabled = false;
+          } catch (err) {
+            showStatus(restructureError, err.message, true);
+            button.disabled = false;
+          }
+        });
+      }
+
       card.querySelector(".capture-delete").addEventListener("click", async () => {
         if (!confirm("Delete this memory for good? This can't be undone.")) return;
         try {

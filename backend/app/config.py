@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     membase_embed_dim: int = 768
     uploads_dir: Path = Path(".data/uploads")
     membase_max_upload_mb: int = 50
+    # Found during a deployment-readiness audit (see docs/DEPLOYMENT.md):
+    # unlike file uploads, the raw `text` field had no server-side size
+    # limit at all -- an unauthenticated caller could post an arbitrarily
+    # large body, which the chunking logic (see docs/DECISIONS.md "Chunk
+    # long captures before analysis") would then amplify into many real
+    # LLM calls. 50,000 chars is generously above any real single memory
+    # (the streamlining phase's own ~2,000-char, 20-fact stress test
+    # chunked into just a handful of calls) while still bounding the
+    # worst case.
+    membase_max_text_chars: int = 50_000
     llm_timeout_seconds: float = 90.0
     # Bounds on how much of one attachment gets expensive per-chunk LLM/
     # embedding treatment -- see docs/DECISIONS.md "Large attachments".
@@ -31,20 +41,26 @@ class Settings(BaseSettings):
     # by this; only how many AttachmentChunk rows get embedded for deep
     # chunk-level search into a single huge document.
     membase_max_chunks_per_attachment: int = 600
-    # One captioning call per image already bounds per-image cost to O(1)
-    # regardless of resolution (the vision encoder's own fixed tiling
-    # handles that) -- this instead bounds the number of images in a
-    # *single upload batch* that get captioned, so attaching dozens of
-    # images to one capture at once doesn't turn one request into dozens
-    # of sequential vision calls with no visible bound. Enforced per
-    # call to _caption_new_images(), i.e. per create_capture()'s batch
-    # of uploads or per individual add_attachment() call -- NOT a
-    # cumulative budget across a capture's lifetime, so repeatedly
-    # calling add_attachment() one file at a time is not bounded by
-    # this across calls (each call gets its own fresh budget). The
-    # risk this exists for -- attaching many images in one request --
-    # is fully covered either way.
-    membase_max_images_captioned_per_capture: int = 8
+    # Streamlining phase additions (see docs/DECISIONS.md):
+    # A background unit-processing lease older than this is treated as
+    # abandoned (e.g. the server restarted mid-task) and safe for
+    # POST /retry to reclaim -- generous above llm_timeout_seconds (90s)
+    # since this now covers at most one generation + one embed call, not
+    # several.
+    membase_processing_lease_stale_seconds: float = 300.0
+    # Below this many characters, an attachment's extracted text is just
+    # folded into the parent unit's full-text search (already free) --
+    # chunk-level embedding is skipped entirely, since a short document
+    # has nothing a single excerpt doesn't already cover. Chosen as
+    # roughly "a couple of chunks' worth" (chunking.py's MAX_CHUNK_CHARS
+    # is 1200) -- an engineering default, not swept against an eval set.
+    membase_min_chars_for_chunking: int = 2000
+    # How many existing ready units to check a new unit's relations
+    # against for a potential factual conflict (see docs/DECISIONS.md
+    # "Contradiction detection") -- reuses the same hybrid_search() call
+    # already being made for retrieval, just capped small since this is
+    # meant to stay cheap, not an exhaustive scan of the whole store.
+    membase_conflict_check_candidates: int = 5
 
 
 @lru_cache

@@ -65,10 +65,10 @@ async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
     example is built around.
 
     Two separate FakeLLMProvider instances (not one with a 2-item list):
-    enrich() is now three independent sub-calls all drawing from the same
-    enrichment_response queue (see app/ingestion/enrichment.py), so a
-    single dict per instance -- returned unchanged to all three sub-calls
-    -- keeps each capture's semantics cleanly separate.
+    a single dict per instance is returned unchanged to every
+    analyze_capture/reanalyze_unit call that instance ever makes (see
+    app/ingestion/analysis.py), which keeps each capture's semantics
+    cleanly separate here.
     """
     anna_llm = FakeLLMProvider(
         enrichment_response={

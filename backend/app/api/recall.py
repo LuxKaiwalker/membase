@@ -1,20 +1,30 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.ingestion.pipeline import IngestionError, create_capture, finish_unit_processing
 from app.llm import get_llm_provider
 from app.llm.base import LLMProvider
 from app.models import RecallSession
-from app.retrieval.agent import run_agent
-from app.retrieval.session import RecallSessionError, cancel_session, continue_session, start_session
+from app.retrieval.pipeline import ABSTENTION_MESSAGE
+from app.retrieval.session import (
+    STATUS_SUCCESS,
+    RecallSessionError,
+    cancel_session,
+    continue_session,
+    start_session,
+    user_supplied_texts,
+)
 from app.schemas import (
+    CaptureOut,
     ChunkSourceOut,
     RecallRequest,
     RecallResponse,
     RecallSessionMessageRequest,
     RecallSessionOut,
+    SaveAsMemoryRequest,
     SourceOut,
 )
 
@@ -27,40 +37,30 @@ async def recall(
     db: Session = Depends(get_db),
     llm: LLMProvider = Depends(get_llm_provider),
 ):
-    """Legacy one-shot recall (no multi-turn state). Kept for simple
-    direct/paraphrased/indirect lookups and the eval harness; see
-    POST /api/recall/sessions for iterative recall with clarifying
-    questions.
+    """Legacy one-shot recall (no multi-turn state for the caller). There
+    is only one retrieval+answer algorithm (see docs/DECISIONS.md
+    "RecallSession canonical") -- this runs a RecallSession's first
+    automatic round exactly as POST /api/recall/sessions does (same
+    ambiguity narrowing, same grounding decision) and reports its
+    outcome in the flat legacy shape. The session row itself is still
+    persisted (recall history, not memory), but its id is never returned
+    here, so a caller of this endpoint has no way to continue it; if the
+    first round can't produce a confident answer (ambiguous with no
+    resolving angle, nothing found, or an error), that's reported as an
+    abstention rather than a follow-up question, since a one-shot caller
+    has no way to answer one.
     """
-    result = await run_agent(db, llm, body.query)
-    sources = [
-        SourceOut(
-            id=s.unit.id,
-            capture_id=s.unit.capture_id,
-            content=s.unit.authoritative_content,
-            semantic=s.unit.semantic,
-            created_at=s.unit.created_at,
-            vector_score=s.vector_score,
-            fts_score=s.fts_score,
-            fused_score=s.fused_score,
-        )
-        for s in result.sources
-    ]
-    chunk_sources = [
-        ChunkSourceOut(
-            id=c.chunk.id,
-            capture_id=c.chunk.capture_id,
-            attachment_filename=c.chunk.attachment.original_filename,
-            page_number=c.chunk.page_number,
-            excerpt=c.chunk.text[:500],
-            vector_score=c.vector_score,
-            fts_score=c.fts_score,
-            fused_score=c.fused_score,
-        )
-        for c in result.chunk_sources
-    ]
+    try:
+        session = await start_session(db, llm, body.query)
+    except RecallSessionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session.status != STATUS_SUCCESS:
+        return RecallResponse(answer=ABSTENTION_MESSAGE, abstained=True, sources=[], chunk_sources=[])
     return RecallResponse(
-        answer=result.answer, abstained=result.abstained, sources=sources, chunk_sources=chunk_sources
+        answer=session.final_answer or "",
+        abstained=False,
+        sources=[SourceOut(**s) for s in session.final_sources],
+        chunk_sources=[ChunkSourceOut(**c) for c in session.final_chunk_sources],
     )
 
 
@@ -138,3 +138,35 @@ async def cancel(session_id: uuid.UUID, db: Session = Depends(get_db)):
     except RecallSessionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _session_out(session)
+
+
+@router.post("/recall/sessions/{session_id}/save-as-memory", response_model=CaptureOut, status_code=201)
+async def save_as_memory(
+    session_id: uuid.UUID,
+    body: SaveAsMemoryRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
+):
+    """Explicit user action (see docs/DECISIONS.md "Save as memory"):
+    creates a brand-new Capture through the ordinary storage pipeline --
+    segmentation, clarification, enrichment, provenance -- exactly like
+    POST /api/captures. Nothing in a RecallSession (a cue, a hypothesis,
+    the final answer) is ever promoted directly into a MemoryUnit;
+    `text` must match something the user actually said in this session
+    (a message turn or an extracted cue), never arbitrary text or an
+    agent-generated hypothesis/question, so this can't be used as a
+    backdoor to skip the normal pipeline.
+    """
+    session = _get_session_or_404(db, session_id)
+    text = body.text.strip()
+    if not text or text not in user_supplied_texts(session):
+        raise HTTPException(status_code=400, detail="text must match something you said in this session")
+    try:
+        capture = await create_capture(db, llm, text=text, uploads=[])
+    except IngestionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    for unit in capture.units:
+        if unit.status == "processing":
+            background_tasks.add_task(finish_unit_processing, unit.id)
+    return capture

@@ -4,12 +4,13 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
-from app.llm.base import LLMError, LLMProvider
+from app.llm.base import LLMProvider
 from app.retrieval.pipeline import (
     ABSTENTION_MESSAGE,
     TOP_K_FOR_ANSWER,
     ScoredChunk,
     ScoredUnit,
+    embed_query,
     evaluate_sufficiency,
     generate_answer,
     hybrid_search,
@@ -27,10 +28,56 @@ logger = logging.getLogger(__name__)
 # "automatic iteration" layer (spec section 9/20): fast, bounded,
 # no-user-interaction. app/retrieval/session.py wraps repeated calls to
 # automatic_search() in user-mediated rounds for the full iterative-recall
-# experience; this module's run_agent() is the simpler one-shot path
-# (still used by the legacy POST /api/recall and the eval harness).
-MAX_AGENT_ITERATIONS = 3
-MAX_REFORMULATIONS_PER_ROUND = 2
+# experience, which is now the canonical retrieval architecture (see
+# docs/DECISIONS.md "RecallSession canonical") -- POST /api/recall itself
+# goes through app/retrieval/session.py's start_session(), not run_agent(),
+# so there's exactly one retrieval+answer-decision algorithm end to end.
+# run_agent() below is kept as an internal primitive: a one-shot
+# search-and-answer with no ambiguity narrowing/discriminating question
+# and no persisted session row, for callers that want exactly that (the
+# eval harness, latency benchmarks) rather than the full session flow.
+# Streamlined down from 3/2 (see docs/DECISIONS.md "Reduce automatic
+# retrieval iterations"): storage should be cheaper than recall, and
+# recall itself should be cheap by default -- a query that still isn't
+# answerable after one reformulation is better handed to the user as a
+# cue request (RecallSession's needs_user_cue) than burned on a third
+# automatic guess. Initial defaults per the streamlining spec, not
+# re-tuned against the eval corpus yet; revisit if eval numbers call
+# for it (see docs/TODO.md).
+MAX_AGENT_ITERATIONS = 2
+MAX_REFORMULATIONS_PER_ROUND = 1
+
+
+# Deterministic bypass around the expensive evaluate_sufficiency LLM call
+# (see docs/DECISIONS.md "Deterministic sufficiency short-circuit"): when
+# the top candidate is overwhelmingly dominant AND its evidence is
+# substantive (not a degraded fallback unit), there's nothing a reasoning
+# call could usefully add -- skip straight to answering. Deliberately
+# conservative: all three signals (absolute score, margin over the
+# runner-up, evidence completeness) must hold, since a false early
+# acceptance (treating a wrong top hit as "clearly enough") is worse than
+# one extra LLM call. Thresholds are an initial engineering default
+# (sanity-checked against the real model via scripts/run-eval.sh, not
+# swept against it) -- see docs/DECISIONS.md for the measurement and
+# docs/TODO.md for fuller calibration as a follow-up.
+HIGH_CONFIDENCE_FUSED_SCORE = 0.80
+HIGH_CONFIDENCE_MARGIN = 0.20
+
+
+def _is_high_confidence(ranked: list[ScoredUnit]) -> bool:
+    if not ranked:
+        return False
+    top = ranked[0]
+    if top.fused_score < HIGH_CONFIDENCE_FUSED_SCORE:
+        return False
+    if len(ranked) > 1 and (top.fused_score - ranked[1].fused_score) < HIGH_CONFIDENCE_MARGIN:
+        return False
+    # Evidence completeness: a unit that fell back to empty/degraded
+    # semantics (LLM was unavailable during ingestion, see
+    # app/ingestion/analysis.py) is a weaker answer source even at a high
+    # retrieval score -- don't skip the reasoning step for it.
+    semantic = top.unit.semantic or {}
+    return semantic.get("enrichment_status") != "unavailable"
 
 
 @dataclass
@@ -75,11 +122,16 @@ async def automatic_search(
     for iteration in range(MAX_AGENT_ITERATIONS):
         for q in current_queries:
             tried.add(q)
-            for scored in await hybrid_search(db, llm, q, limit=TOP_K_FOR_ANSWER):
+            # Embed once per query string and reuse it for both searches
+            # (see docs/DECISIONS.md "Dedupe query embeddings") -- this
+            # was previously two independent llm.embed() calls for the
+            # exact same text.
+            q_vector = await embed_query(llm, q)
+            for scored in await hybrid_search(db, llm, q, limit=TOP_K_FOR_ANSWER, query_vector=q_vector):
                 existing = best.get(scored.unit.id)
                 if existing is None or scored.fused_score > existing.fused_score:
                     best[scored.unit.id] = scored
-            for scored_chunk in await hybrid_search_chunks(db, llm, q, limit=TOP_K_FOR_ANSWER):
+            for scored_chunk in await hybrid_search_chunks(db, llm, q, limit=TOP_K_FOR_ANSWER, query_vector=q_vector):
                 existing_chunk = best_chunks.get(scored_chunk.chunk.id)
                 if existing_chunk is None or scored_chunk.fused_score > existing_chunk.fused_score:
                     best_chunks[scored_chunk.chunk.id] = scored_chunk
@@ -88,6 +140,8 @@ async def automatic_search(
         ranked_chunks = sorted(best_chunks.values(), key=lambda s: s.fused_score, reverse=True)[:TOP_K_FOR_ANSWER]
 
         if iteration == MAX_AGENT_ITERATIONS - 1:
+            break
+        if _is_high_confidence(ranked):
             break
         decision = await evaluate_sufficiency(llm, query, ranked, tried)
         for hq in decision["reformulated_queries"]:

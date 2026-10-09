@@ -1,57 +1,52 @@
 import pytest
 
-from app.ingestion.clarify import generate_questions
 from app.ingestion.pipeline import MAX_CLARIFICATION_ROUNDS, create_capture, resolve_clarification
-from app.llm.base import LLMProvider
 from app.retrieval.pipeline import hybrid_search
 from tests.fakes import FakeLLMProvider
 from tests.helpers import resolve_clarification_and_finish
 
-_ZORBLEX_QUESTION = {
-    "questions": [{"question": "What is a Zorblex code?", "field": "Zorblex code", "relevance": "high"}]
-}
-_NO_QUESTIONS = {"questions": []}
+# Streamlining phase (see docs/DECISIONS.md "Sequential clarification"):
+# there is no separate question-generation call and no pre-generated
+# queue any more. One unified call (analyze_capture, see
+# app/ingestion/analysis.py) decides segmentation + semantics +
+# clarification need all at once; each clarification round costs exactly
+# one further call (reanalyze_unit) that both re-derives semantics AND
+# decides whether a *further* question is still warranted. This file
+# replaces the old queue-based test_clarification.py.
 
-_GYM_SEMANTICS = {
-    "meaning": "The user's gym locker combination is 42.",
+_ZORBLEX_QUESTION = {"clarification_question": "What is a Zorblex code?", "clarification_field": "Zorblex code"}
+_NO_QUESTION: dict = {}
+
+_GYM_SEMANTICS_NO_QUESTION = {
     "aliases": ["Zorblex code", "gym locker combination"],
-    "people": [],
-    "organizations": [],
-    "locations": [],
     "topics": ["gym"],
-    "definitions": [{"term": "Zorblex code", "definition": "gym locker combination"}],
-    "relations": [],
-    "event_date": "",
 }
 
 
 @pytest.mark.asyncio
 async def test_clarification_question_generated_and_surfaced(db):
-    """The question-generation pass (app/ingestion/clarify.py) runs before
-    -- and independently of -- full enrichment: a unit reaches
-    awaiting_clarification without enrich() ever having been called."""
-    llm = FakeLLMProvider(question_response=_ZORBLEX_QUESTION)
+    """The unified analyze_capture() call decides both the semantics AND
+    whether a question is needed, in one shot -- there's no separate
+    question-generation pass any more."""
+    llm = FakeLLMProvider(enrichment_response=_ZORBLEX_QUESTION)
 
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
     assert unit.pending_clarification == {"question": "What is a Zorblex code?", "field": "Zorblex code", "round": 1}
-    assert unit.clarification_queue == []
     # Gated: a unit with an open clarification question is durably saved
     # but not yet searchable (see docs/DECISIONS.md).
     assert unit.status == "awaiting_clarification"
-    assert "enrichment" not in llm.calls, "full enrichment must not run while a question is pending"
+    assert unit.embedding is None
+    assert llm.calls == ["analyze_capture"]
 
 
 @pytest.mark.asyncio
 async def test_clarification_answer_is_persisted(db):
-    llm = FakeLLMProvider(
-        question_response=[_ZORBLEX_QUESTION, _NO_QUESTIONS],
-        enrichment_response=_GYM_SEMANTICS,
-    )
+    llm = FakeLLMProvider(enrichment_response=[_ZORBLEX_QUESTION, _GYM_SEMANTICS_NO_QUESTION])
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
-    # Full enrichment (and therefore embedding) is deferred entirely while
-    # a question is pending -- see docs/DECISIONS.md.
+    # Embedding/retrieval text are deferred entirely while a question is
+    # pending -- see docs/DECISIONS.md.
     assert unit.embedding is None
 
     unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
@@ -60,6 +55,7 @@ async def test_clarification_answer_is_persisted(db):
     assert len(unit.clarifications) == 1
     assert unit.clarifications[0]["question"] == "What is a Zorblex code?"
     assert unit.clarifications[0]["answer"] == "It's my gym locker combination."
+    assert unit.clarifications[0]["outcome"] == "answered"
     assert unit.semantic["aliases"] == ["Zorblex code", "gym locker combination"]
     assert "gym locker combination" in unit.retrieval_text
     assert unit.embedding is not None
@@ -72,10 +68,7 @@ async def test_blank_clarification_answer_skips_without_recording(db):
     docs/DECISIONS.md) -- a blank/omitted answer must still unblock the
     unit, but must not fabricate a clarification entry for an answer the
     user never actually gave."""
-    llm = FakeLLMProvider(
-        question_response=[_ZORBLEX_QUESTION, _NO_QUESTIONS],
-        enrichment_response=dict(_GYM_SEMANTICS, aliases=[]),
-    )
+    llm = FakeLLMProvider(enrichment_response=[_ZORBLEX_QUESTION, _NO_QUESTION])
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
 
@@ -91,10 +84,8 @@ async def test_clarification_rounds_are_bounded(db):
     """The model keeps wanting to ask more questions every round, but
     MAX_CLARIFICATION_ROUNDS caps it -- see docs/DECISIONS.md. Each round
     still only ever surfaces one question at a time to the user."""
-    always_asks = {
-        "questions": [{"question": "Another question?", "field": "x", "relevance": "high"}]
-    }
-    llm = FakeLLMProvider(question_response=always_asks, enrichment_response=dict(_GYM_SEMANTICS, aliases=[]))
+    always_asks = {"clarification_question": "Another question?", "clarification_field": "x"}
+    llm = FakeLLMProvider(enrichment_response=always_asks)
 
     capture = await create_capture(db, llm, text="Ambiguous thing.", uploads=[])
     unit = capture.units[0]
@@ -105,41 +96,29 @@ async def test_clarification_rounds_are_bounded(db):
         unit = await resolve_clarification_and_finish(db, llm, unit, "An answer.")
 
     # Round limit reached: even though the model still wants to ask,
-    # the question must not be surfaced again -- enrichment runs instead.
+    # the question must not be surfaced again -- finalization runs instead.
     assert unit.pending_clarification is None
     assert unit.clarification_round == MAX_CLARIFICATION_ROUNDS
     assert unit.status == "ready"
 
 
 @pytest.mark.asyncio
-async def test_multiple_questions_in_one_round_asked_in_sequence(db):
-    """generate_questions() can return several candidates at once; they're
-    drained one at a time into pending_clarification (never shown as a
-    batch), and draining the queue costs no extra LLM call."""
-    batch = {
-        "questions": [
-            {"question": "What is a Zorblex code?", "field": "Zorblex code", "relevance": "high"},
-            {"question": "Which gym is this?", "field": "gym", "relevance": "medium"},
-        ]
-    }
-    llm = FakeLLMProvider(question_response=[batch, _NO_QUESTIONS], enrichment_response=_GYM_SEMANTICS)
-
-    capture = await create_capture(db, llm, text="My Zorblex code is 42 at the gym.", uploads=[])
+async def test_declined_or_unknown_field_is_never_reasked(db):
+    """A hard-coded guarantee, not just a prompt instruction: once the
+    user has said "I don't know" (or declined) about a field, the system
+    must never ask about that same field again, even if the model
+    proposes it a second time (see docs/DECISIONS.md "Clarification
+    outcomes")."""
+    llm = FakeLLMProvider(enrichment_response=[_ZORBLEX_QUESTION, _ZORBLEX_QUESTION])
+    capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
-    assert unit.pending_clarification["question"] == "What is a Zorblex code?"
-    assert unit.clarification_queue == [{"question": "Which gym is this?", "field": "gym"}]
-    calls_after_first_round = llm.calls.count("questions")
 
-    unit = await resolve_clarification_and_finish(db, llm, unit, "It's my gym locker combination.")
-    # Second question drained from the queue -- no new "questions" call yet.
-    assert unit.pending_clarification == {"question": "Which gym is this?", "field": "gym", "round": 1}
-    assert unit.clarification_queue == []
-    assert unit.status == "awaiting_clarification"
-    assert llm.calls.count("questions") == calls_after_first_round
+    unit = await resolve_clarification_and_finish(db, llm, unit, "I don't know.")
 
-    unit = await resolve_clarification_and_finish(db, llm, unit, "Downtown gym.")
+    assert unit.clarifications[0]["outcome"] == "unknown"
+    # The model's second-round response still asks about "Zorblex code"
+    # again, but that field was just marked unknown -- must be suppressed.
     assert unit.pending_clarification is None
-    assert len(unit.clarifications) == 2
     assert unit.status == "ready"
 
 
@@ -149,12 +128,11 @@ async def test_answer_can_trigger_a_new_round_of_questions(db):
     worth asking about, a new round is opened (bounded by
     MAX_CLARIFICATION_ROUNDS, same as any other round)."""
     llm = FakeLLMProvider(
-        question_response=[
+        enrichment_response=[
             _ZORBLEX_QUESTION,
-            {"questions": [{"question": "Which gym is this?", "field": "gym", "relevance": "high"}]},
-            _NO_QUESTIONS,
-        ],
-        enrichment_response=_GYM_SEMANTICS,
+            {"clarification_question": "Which gym is this?", "clarification_field": "gym"},
+            _GYM_SEMANTICS_NO_QUESTION,
+        ]
     )
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
@@ -180,10 +158,7 @@ async def test_retrieval_succeeds_via_clarification_derived_alias(db):
     alias-in-text pathway deterministically (the semantic/vector version
     of this is covered against the real model in
     tests/test_integration_real_llm.py)."""
-    llm = FakeLLMProvider(
-        question_response=[_ZORBLEX_QUESTION, _NO_QUESTIONS],
-        enrichment_response=_GYM_SEMANTICS,
-    )
+    llm = FakeLLMProvider(enrichment_response=[_ZORBLEX_QUESTION, _GYM_SEMANTICS_NO_QUESTION])
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = await resolve_clarification_and_finish(db, llm, capture.units[0], "It's my gym locker combination.")
     assert unit.status == "ready"
@@ -197,7 +172,7 @@ async def test_unit_awaiting_clarification_is_not_searchable(db):
     """The gate itself: before the question is answered, the unit must
     not surface in recall at all -- not even via an exact keyword match
     on its own authoritative_content."""
-    llm = FakeLLMProvider(question_response=_ZORBLEX_QUESTION)
+    llm = FakeLLMProvider(enrichment_response=_ZORBLEX_QUESTION)
 
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
     unit = capture.units[0]
@@ -211,51 +186,88 @@ async def test_unit_awaiting_clarification_is_not_searchable(db):
     assert fetched.authoritative_content == "My Zorblex code is 42."
 
 
-class _PromptCapturingLLM(LLMProvider):
-    """Records the prompt it's asked to complete -- the only reliable way
-    to verify attachment context actually reaches generate_questions()'s
-    prompt, since FakeLLMProvider dispatches purely by schema shape and
-    never looks at prompt content."""
+@pytest.mark.asyncio
+async def test_explicit_metadata_conflict_surfaces_as_clarification(db):
+    """Explicit user-entered metadata always has higher authority than
+    LLM-inferred metadata, but a genuine conflict (both sides non-empty
+    and different) must be surfaced, never silently resolved either way
+    (see docs/DECISIONS.md "Explicit metadata authority")."""
+    llm = FakeLLMProvider(enrichment_response={"locations": ["Geneva"]})
 
-    def __init__(self, response: dict) -> None:
-        self._response = response
-        self.prompts: list[str] = []
+    capture = await create_capture(
+        db, llm, text="Notes from the office.", uploads=[], explicit_metadata={"location": "Zürich"}
+    )
+    unit = capture.units[0]
 
-    async def generate(self, prompt, *, system=None, temperature=0.2, images=None):
-        raise NotImplementedError
-
-    async def generate_structured(self, prompt, *, schema, system=None, images=None):
-        self.prompts.append(prompt)
-        return self._response
-
-    async def embed(self, texts):
-        raise NotImplementedError
-
-    @property
-    def embedding_model_name(self) -> str:
-        return "fake"
-
-    @property
-    def embedding_dim(self) -> int:
-        return 1
+    assert unit.status == "awaiting_clarification"
+    assert unit.pending_clarification["field"] == "metadata conflict"
+    assert "Zürich" in unit.pending_clarification["question"]
+    assert "geneva" in unit.pending_clarification["question"].lower()
+    # Explicit value still wins for now -- both are retained so nothing
+    # the model inferred is silently lost either.
+    assert set(unit.semantic["locations"]) == {"Geneva", "Zürich"}
 
 
 @pytest.mark.asyncio
-async def test_generate_questions_includes_attachment_text_in_prompt():
-    """An attached image's caption (or any attachment's extracted text)
-    must reach the clarification-question prompt -- a vague reference
-    the attachment already resolves (e.g. "this colour" + a red-shoe
-    photo) must not be flagged as needing a question. The guarantee this
-    relies on is the required `attachment_text` parameter and pipeline.py's
-    call order (captioning always finishes before this is ever called),
-    not prompt wording -- see docs/DECISIONS.md."""
-    llm = _PromptCapturingLLM({"questions": []})
-    await generate_questions(
-        llm,
-        "I like shoes of this colour.",
-        [],
-        "a photograph of a red running shoe",
-        max_questions=3,
+async def test_explicit_metadata_with_no_conflict_is_applied_silently(db):
+    """No disagreement -- explicit metadata is just folded into the
+    semantic representation with no clarification needed."""
+    llm = FakeLLMProvider(enrichment_response=_NO_QUESTION)
+
+    capture = await create_capture(
+        db, llm, text="Notes from the office.", uploads=[], explicit_metadata={"location": "Zürich"}
     )
-    assert len(llm.prompts) == 1
-    assert "a photograph of a red running shoe" in llm.prompts[0]
+    unit = capture.units[0]
+
+    assert unit.status != "awaiting_clarification"
+    assert unit.semantic["locations"] == ["Zürich"]
+    assert unit.explicit_metadata == {"location": "Zürich"}
+
+
+# --- Disable follow-up questions (see docs/DECISIONS.md "Disable
+# follow-up questions"): allow_clarification=False must remove the
+# clarification round-trip from the storage cycle entirely -- no unit
+# may ever reach "awaiting_clarification", regardless of source.
+
+
+@pytest.mark.asyncio
+async def test_disabled_clarification_skips_a_model_proposed_question(db):
+    llm = FakeLLMProvider(enrichment_response=_ZORBLEX_QUESTION)
+
+    capture = await create_capture(
+        db, llm, text="My Zorblex code is 42.", uploads=[], allow_clarification=False
+    )
+    unit = capture.units[0]
+
+    assert unit.status != "awaiting_clarification"
+    assert unit.pending_clarification is None
+    assert unit.status == "processing"
+
+
+@pytest.mark.asyncio
+async def test_disabled_clarification_skips_an_explicit_metadata_conflict(db):
+    llm = FakeLLMProvider(enrichment_response={"locations": ["Geneva"]})
+
+    capture = await create_capture(
+        db, llm, text="Notes from the office.", uploads=[],
+        explicit_metadata={"location": "Zürich"}, allow_clarification=False,
+    )
+    unit = capture.units[0]
+
+    assert unit.status != "awaiting_clarification"
+    assert unit.pending_clarification is None
+    # The explicit value still silently wins -- only the surfaced
+    # question is suppressed, not the authority rule itself.
+    assert set(unit.semantic["locations"]) == {"Geneva", "Zürich"}
+
+
+@pytest.mark.asyncio
+async def test_clarification_enabled_by_default(db):
+    """allow_clarification defaults to True -- existing callers that
+    don't pass it keep today's behavior unchanged."""
+    llm = FakeLLMProvider(enrichment_response=_ZORBLEX_QUESTION)
+
+    capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
+    unit = capture.units[0]
+
+    assert unit.status == "awaiting_clarification"

@@ -1,5 +1,121 @@
 # TODO / open questions
 
+## Resolved this phase (the "membase structurer")
+
+- **A second, independent background pass now deepens an already-
+  "ready" unit's semantics and finds advisory links to related
+  memories** -- `app/ingestion/structurer.py` + the lease-based wiring
+  in `app/ingestion/pipeline.py`. Triggered automatically the moment a
+  unit first reaches "ready"; never touches `status` (searchability).
+  See docs/DECISIONS.md "The 'membase structurer'".
+- **Store page simplified**: no longer waits for or polls background
+  processing; shows "Saved" as soon as clarification (if any) is
+  resolved, since semantics are already known synchronously by then.
+  All post-processing visualization (fast-pipeline status AND the
+  structurer's own status) moved to the Browse page, per explicit
+  instruction.
+- **Multi-file posthoc attachment**: `POST /api/captures/{id}/
+  attachments` takes multiple files atomically; a UI control for it
+  lives on the Store page's post-save result card (not Browse, after
+  a placement correction).
+- **Attachment text fed into generation prompts is now capped**
+  (`MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS`), closing a real
+  input-side version of the context-overflow bug fixed earlier this
+  phase.
+
+## Known gaps in the structurer (v1), not silently skipped
+
+- **No structurer-driven re-segmentation.** Deferred explicitly -- see
+  docs/DECISIONS.md "The 'membase structurer'" for why (conflicts with
+  the never-rewrite-authoritative-content invariant; would need a
+  proper "supersede with new siblings, retire the old unit" lifecycle
+  that doesn't exist, and `potential_conflicts`/`RecallSession.
+  final_sources` both reference unit ids directly, which that lifecycle
+  would need to keep resolvable). The next step, if this turns out to
+  matter: design that lifecycle explicitly, as its own piece of work,
+  rather than bolting a split onto the existing "upgrade in place" path.
+- **`correct_unit()` doesn't re-trigger structuring.** If a unit was
+  already `structure_status="structured"` and the user then corrects
+  it (`POST /memory-units/{id}/correct`), the structured representation
+  goes stale relative to the new content/semantics, and nothing resets
+  `structure_status` back to "unstructured" to let it run again. Not
+  fixed this pass (scope: `correct_unit`'s endpoint has no
+  `BackgroundTasks` parameter today, and structuring is explicitly a
+  "runs once" v1 design) -- flagged rather than silently left
+  inconsistent.
+- **No sweep/calibration of the structurer's own prompt or the related-
+  link decision's precision/recall** -- verified against the real
+  model that it runs, upgrades semantics, and does not corrupt
+  anything on failure, but not evaluated for enrichment *quality*
+  against a corpus the way the fast pipeline's eval set does.
+- **`POST /memory-units/{id}/restructure` runs synchronously** (unlike
+  the fast pipeline's `/retry`, which just reschedules a background
+  task) -- acceptable for a manual recovery action a user clicks once,
+  but means the HTTP request is open for however long that one
+  "LLM-heavy" call takes. If that turns out to be too slow for a
+  foreground click, reschedule it as a background task instead and
+  have the UI poll -- deliberately not built that way yet, since it
+  would reintroduce the polling this same phase just removed from the
+  Store page, and Browse's badges already update on next page load.
+
+## Resolved this phase (streamlining / "too bloaty" pass)
+
+Full reasoning for every item below is in docs/DECISIONS.md under
+"Streamlining phase ('too bloaty' pass)" -- this is just the index.
+
+- **Ingestion collapsed from 5 LLM calls to 2** across a unit's
+  lifecycle (`analyze_capture` once per capture, `reanalyze_unit` once
+  per clarification round). `clarify.py`/`enrichment.py`/
+  `segmentation.py` deleted; `app/ingestion/analysis.py` is the
+  replacement.
+- **Clarification is strictly sequential**, one question at a time,
+  re-evaluated after every answer; `clarification_queue` dropped from
+  the schema. Outcomes (answered/unknown/declined) are classified
+  deterministically (no LLM call) and a declined/unknown field is
+  hard-coded to never be re-asked.
+- **Explicit structured metadata** (location/date/people/organizations/
+  topics) is accepted on `POST /api/captures`, always wins over
+  inference for the same field, and a genuine conflict becomes a
+  clarification question -- verified live against the real model.
+- **Cheap prior-memory lookup** (regex + `ILIKE`, no LLM/embedding call)
+  injects up to 3 related snippets as context during analysis.
+- **Lightweight contradiction detection** at storage time, surfaced at
+  answer time as an explicit `[Conflict]` note the model is instructed
+  to state rather than silently resolve.
+- **RecallSession is canonical end to end**, including for
+  `POST /api/recall` (now internally runs `start_session()`, not
+  `run_agent()` directly) -- no more two independent retrieval
+  algorithms. `run_agent()` survives as an internal one-shot primitive
+  for the eval harness/benchmarks only.
+- **Deterministic high-confidence shortcut** skips
+  `evaluate_sufficiency()` when the top candidate is both dominant and
+  evidentially complete; `MAX_AGENT_ITERATIONS` 3->2,
+  `MAX_REFORMULATIONS_PER_ROUND` 2->1.
+- **Cue matching unified**: structured-field exact match, falling back
+  to a normalized substring check against `retrieval_text`, instead of
+  an ever-growing field list.
+- **Ambiguity detection requires the runner-up to clear an absolute
+  score floor**, not just a close margin to the leader.
+- **"Save as memory"** (`POST /api/recall/sessions/{id}/save-as-memory`)
+  implemented and tested: creates a normal `Capture` through the
+  ordinary pipeline, restricted to text provably said by the user in
+  that session. This resolves the "Open product questions" item below
+  of the same name -- for this phase's scope, nothing is auto-promoted,
+  and the one explicit action goes through the normal pipeline exactly
+  as the spec required.
+- **Query embeddings deduped** between unit search and chunk search
+  (one `embed()` call per query string per round, not two).
+- **Long-held DB row lock replaced with a processing lease/token**;
+  image captioning fully decoupled into its own background task;
+  attachment chunking made lazy (size-threshold-gated) and idempotent
+  (which is what makes a dropped background task safely retryable).
+- **A real literal-"null"-string model quirk was found and fixed**
+  while verifying explicit metadata against the live model: gemma4:12b
+  sometimes emits the string `"null"` (or `"none"`) for an empty field
+  instead of `""`. `app/ingestion/analysis.py`'s `_as_str`/`_as_str_list`
+  now normalize this; covered by
+  `tests/test_analysis.py::test_literal_null_string_from_model_is_treated_as_empty`.
+
 ## Resolved this phase (iterative recall)
 
 - **Recall is a persisted multi-round session**, not a single
@@ -42,17 +158,20 @@
 
 ## Open product questions
 
-- **Should a user be able to promote something said during recall into
-  a permanent memory** ("save this as a memory")? Deliberately
-  unresolved (spec section 46) -- it's a real product decision (what
-  exactly gets saved, in whose words, with what provenance) rather than
-  an obvious engineering call. Current behavior: nothing said during
-  recall is ever saved; the user must separately use the ordinary
-  capture-creation flow in their own words.
+- **Resolved this phase: a user can promote something they said during
+  recall into a permanent memory** via
+  `POST /api/recall/sessions/{id}/save-as-memory` -- see "Resolved this
+  phase (streamlining)" above and docs/DECISIONS.md. What's still open:
+  the frontend has no UI for this yet (the recall page is one-shot-only
+  and shows no session/cue history to attach a button to); see "Known
+  technical gaps" below.
 - **Should recall-session history itself become searchable memory**
-  (e.g. "what did I ask about last week")? Not implemented. Sessions
-  are currently fetchable by id (`GET /api/recall/sessions/{id}`) but
-  there's no list/search endpoint over past sessions.
+  (e.g. "what did I ask about last week")? Still not implemented, and
+  now explicitly deferred rather than just unaddressed -- spec section
+  31 for this phase says plainly "recall sessions are application
+  history, not memory... semantic search over past sessions is out of
+  scope." Sessions remain fetchable by id
+  (`GET /api/recall/sessions/{id}`) but there's no list/search endpoint.
 - **Should `AMBIGUITY_SCORE_MARGIN`/`POSITIVE_CUE_BOOST` be calibrated
   via a sweep** the way `VECTOR_SIM_THRESHOLD` was? Not done this phase
   -- there wasn't yet a large enough multi-round eval set (6 cases vs.
@@ -143,6 +262,65 @@
 
 ## Known technical gaps
 
+- **Found during a code audit, not a reported bug: `RecallResponse.
+  chunk_sources` (attachment-chunk evidence) is returned by
+  `POST /api/recall` but never rendered by the recall page** --
+  `renderSources()` in `app/static/app.js` only handles `data.sources`
+  (memory units), not `data.chunk_sources`. Pre-existing, not introduced
+  this phase. Low-impact (chunk evidence still contributes to the
+  answer text itself, it's just not shown as supporting evidence
+  alongside it) but worth fixing if large-attachment recall becomes a
+  more common case.
+- **Two eval regressions after this phase's call-count/iteration
+  reduction, not yet root-caused in isolation.** Full detail in
+  docs/DECISIONS.md's "Measured effect, honestly reported" -- summary:
+  `clarification_alias_second_term` (the unified `analyze_capture` call
+  didn't flag an invented term as needing clarification where the old
+  dedicated question-generation call apparently did) and
+  `user_specific_terminology` (an indirect alias query abstained instead
+  of answering, plausibly from the reduced reformulation budget).
+  28/30 overall vs. 30/30 before this phase's changes, on the same
+  30-case corpus. **Next experiment this suggests:** re-run the eval set
+  3-5 times at the current budget to establish the sampling-noise floor
+  (since gemma4:12b's own non-determinism alone could explain 1-2 flips
+  on a 30-case set), then, if these two keep failing consistently,
+  bisect which specific change (ingestion collapse vs. iteration/
+  reformulation reduction vs. the high-confidence shortcut) is
+  responsible by re-enabling one at a time.
+- **`AMBIGUITY_MIN_RUNNER_UP_SCORE` (0.45) and the high-confidence
+  shortcut's `HIGH_CONFIDENCE_FUSED_SCORE`/`HIGH_CONFIDENCE_MARGIN`
+  (0.80/0.20) are engineering defaults, sanity-checked against one real-
+  model eval run, not swept.** A genuine sweep (vary each constant
+  independently, measure false/missed early acceptance and false/missed
+  ambiguity detection across the eval corpus) is the natural next
+  experiment once the corpus is large enough that a swept threshold
+  wouldn't just overfit 30 hand-written cases.
+- **`retry_attachment_chunking()` has no API route.** It exists, is
+  idempotent, and is tested directly
+  (`tests/test_chunking.py`), but nothing in `app/api/` calls it -- a
+  server restart that drops a `finish_attachment_chunking` background
+  task currently has no user-facing recovery path, only a callable
+  Python function. Needs either a `POST /api/attachments/{id}/retry`
+  route or a startup reconciliation pass (scan for attachments past the
+  size threshold with zero chunks), whichever turns out to need less new
+  surface.
+- **"Save as memory" has no frontend affordance.** The backend endpoint
+  (`POST /api/recall/sessions/{id}/save-as-memory`) is implemented and
+  tested, but the current recall page (`app/templates/recall.html`,
+  `initRecallPage` in `app.js`) only ever uses the one-shot `/api/recall`
+  endpoint and displays no session id, cues, or message history for a
+  button to attach to. Building that UI is a materially larger piece of
+  work (the session-history/interactive-recall UI that was never wired
+  up, see the iterative-recall-phase benchmark note elsewhere in this
+  file) than this feature itself -- deferred together with that, not
+  separately.
+- **No wall-clock latency before/after comparison for this phase**, only
+  LLM call counts (which are exact and don't need a benchmark run to
+  know) -- see docs/DECISIONS.md's performance snapshot for why a live
+  before/after wasn't re-run. If a concrete latency number is needed
+  later: `git stash`/checkout the pre-streamlining commit, run the same
+  eval corpus with timing instrumentation added to
+  `eval/run_eval.py`, repeat on the current code, compare.
 - **To fix: a terse, context-free capture (one or two words, no stated
   intent) is stored but not retrievable under any query describing the
   *purpose* those words were captured for.** Verified live: storing

@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.llm.base import LLMError, LLMProvider
 from app.models import RecallSession
 from app.retrieval.agent import automatic_search
@@ -224,6 +225,9 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
 
 async def start_session(db: Session, llm: LLMProvider, query: str) -> RecallSession:
     query = query.strip()
+    max_chars = get_settings().membase_max_text_chars
+    if len(query) > max_chars:
+        raise RecallSessionError(f"query exceeds max length of {max_chars} characters")
     session = RecallSession(original_query=query, status=STATUS_ACTIVE, messages=[])
     _append_message(session, "user", query)
     db.add(session)
@@ -249,6 +253,9 @@ async def continue_session(db: Session, llm: LLMProvider, session: RecallSession
     message = message.strip()
     if not message:
         raise RecallSessionError("Message must not be empty")
+    max_chars = get_settings().membase_max_text_chars
+    if len(message) > max_chars:
+        raise RecallSessionError(f"message exceeds max length of {max_chars} characters")
 
     _append_message(session, "user", message)
     cues = await extract_cues(llm, message, pending_question=session.current_question)
@@ -260,6 +267,21 @@ async def continue_session(db: Session, llm: LLMProvider, session: RecallSession
 
     await _run_round(db, llm, session)
     return session
+
+
+def user_supplied_texts(session: RecallSession) -> set[str]:
+    """Every piece of text this session can attribute directly to the
+    user -- their own message turns and the cues extracted from them --
+    as distinct from agent-generated hypotheses or system questions.
+    Used to guard "save as memory" (see docs/DECISIONS.md): recall-
+    session state is never promoted into a MemoryUnit automatically, and
+    the one explicit action that lets a user promote *something* from a
+    session must still only ever act on text the user actually said,
+    never a system-generated hypothesis or question.
+    """
+    texts = {m["text"] for m in session.messages if m.get("role") == "user"}
+    texts |= {c["text"] for c in session.cues}
+    return texts
 
 
 def cancel_session(db: Session, session: RecallSession) -> RecallSession:

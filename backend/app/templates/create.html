@@ -1,15 +1,16 @@
 {% extends "base.html" %}
-{% block title %}membase — Remember{% endblock %}
+{% block title %}membase — Store{% endblock %}
 {% block content %}
 <section class="panel">
-  <h1>Write what you want to remember</h1>
+  <h1>Write what you want to store</h1>
   <form id="create-form">
     <textarea id="text" name="text" rows="4"
       placeholder="e.g. I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
       required></textarea>
 
     <label for="files">Attachments (optional)</label>
-    <input id="files" name="files" type="file" multiple />
+    <input id="files" type="file" multiple />
+    <ul id="selected-files" class="selected-files"></ul>
 
     <button type="submit">Save</button>
   </form>

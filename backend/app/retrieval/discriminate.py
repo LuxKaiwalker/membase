@@ -9,6 +9,17 @@ from app.retrieval.pipeline import ScoredUnit
 # first (spec section 12/32: a high score is not proof of uniqueness).
 AMBIGUITY_SCORE_MARGIN = 0.15
 
+# The fused score is a rough rank signal, not a calibrated probability
+# (see docs/DECISIONS.md "Improve ambiguity detection") -- a small margin
+# between two candidates only means genuine ambiguity if the runner-up
+# itself clears a real relevance bar. Two weak, barely-above-the-noise-
+# floor matches that happen to be close to each other are "nothing solid
+# was found", not "two strong contenders to disambiguate between";
+# without this, a query with no good answer at all could still trigger
+# a pointless clarifying question just because its two weakest matches
+# scored similarly low.
+AMBIGUITY_MIN_RUNNER_UP_SCORE = 0.45
+
 # One question per distinguishing attribute; phrased as a concrete yes/no
 # question about a specific value rather than an open-ended "tell me more"
 # (spec section 13/40). "relations"/"definitions" were added after the
@@ -96,15 +107,39 @@ def is_ambiguous(ranked: list[ScoredUnit]) -> bool:
     if len(groups) < 2:
         return False
     top_scores = sorted((max(s.fused_score for s in g) for g in groups.values()), reverse=True)
+    if top_scores[1] < AMBIGUITY_MIN_RUNNER_UP_SCORE:
+        return False
     return (top_scores[0] - top_scores[1]) < AMBIGUITY_SCORE_MARGIN
+
+
+def _matches_cue(unit, cue_lower: str) -> bool:
+    """A cue matches a candidate if it names a value the unit's own
+    structured semantic fields already extracted (exact match -- a
+    strong, precise signal), OR -- the unified fallback for a cue naming
+    something the extraction step didn't happen to pull out into any
+    field, rather than chasing it with yet another field-specific
+    special case -- if it appears as a normalized substring of the
+    unit's own retrieval_text at all (see docs/DECISIONS.md "Simplify
+    cue-to-candidate matching"). The substring path is skipped for very
+    short cues (<3 chars) where it would mostly produce noise rather
+    than signal.
+    """
+    semantic = unit.semantic or {}
+    values = {v.lower() for field in _CUE_MATCH_FIELDS for v in values_for_field(semantic, field)}
+    if cue_lower in values:
+        return True
+    if len(cue_lower) < 3:
+        return False
+    return cue_lower in (getattr(unit, "retrieval_text", "") or "").lower()
 
 
 def apply_negative_cues(ranked: list[ScoredUnit], negative_cue_texts: list[str]) -> list[ScoredUnit]:
     """Demote a candidate the user has explicitly ruled out (spec section
     5/37/38: "No, it wasn't Anna") by excluding any candidate whose
-    structured metadata (not just a loose text match) names that value.
-    This only changes which candidates this session currently considers
-    plausible -- it never touches the underlying MemoryUnit.
+    semantic representation (structured fields, or its retrieval_text as
+    a fallback -- see _matches_cue) names that value. This only changes
+    which candidates this session currently considers plausible -- it
+    never touches the underlying MemoryUnit.
     """
     if not negative_cue_texts:
         return ranked
@@ -112,14 +147,7 @@ def apply_negative_cues(ranked: list[ScoredUnit], negative_cue_texts: list[str])
     if not negatives:
         return ranked
 
-    kept = []
-    for s in ranked:
-        semantic = s.unit.semantic or {}
-        values = [v for field in _CUE_MATCH_FIELDS for v in values_for_field(semantic, field)]
-        if any(v.lower() in negatives for v in values):
-            continue
-        kept.append(s)
-    return kept
+    return [s for s in ranked if not any(_matches_cue(s.unit, n) for n in negatives)]
 
 
 # Flat bonus applied when a positive cue's text exactly names an
@@ -152,9 +180,7 @@ def apply_positive_cue_boost(ranked: list[ScoredUnit], positive_cue_texts: list[
 
     boosted: list[ScoredUnit] = []
     for s in ranked:
-        semantic = s.unit.semantic or {}
-        values = [v for field in _CUE_MATCH_FIELDS for v in values_for_field(semantic, field)]
-        matches = any(v.lower() in cues for v in values)
+        matches = any(_matches_cue(s.unit, c) for c in cues)
         new_score = min(1.0, s.fused_score + POSITIVE_CUE_BOOST) if matches else s.fused_score
         boosted.append(ScoredUnit(unit=s.unit, vector_score=s.vector_score, fts_score=s.fts_score, fused_score=new_score))
     return boosted

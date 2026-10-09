@@ -23,14 +23,10 @@ async def test_delete_capture_removes_row_and_file(db, fake_llm, tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_correction_updates_semantic_representation(db):
-    # enrich() is now three independent sub-calls (narrative/entities/
-    # retrieval-aids, see app/ingestion/enrichment.py) all drawing from
-    # the same enrichment_response queue -- a single dict is returned to
-    # all three unchanged (each only reads the fields relevant to it), so
-    # two separate LLM instances (one per enrich() invocation) keep this
-    # test's two distinct "before"/"after" semantics cleanly separated,
-    # rather than a single provider's list queue being consumed 3x per
-    # call.
+    # Two separate LLM instances (one for the initial analyze_capture
+    # call, one for correct_unit's reanalyze_unit call) keep this test's
+    # two distinct "before"/"after" semantics cleanly separated, rather
+    # than relying on list-queue ordering within a single provider.
     gym_semantics = {
         "meaning": "The user's gym locker combination is 42.",
         "aliases": ["gym locker combination"],

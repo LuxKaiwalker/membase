@@ -8,9 +8,11 @@ from app.ingestion.pipeline import (
     IngestionError,
     correct_unit,
     discard_unit,
+    finish_structuring,
     finish_unit_processing,
     resolve_clarification,
     retry_enrichment,
+    retry_structuring,
 )
 from app.llm import get_llm_provider
 from app.llm.base import LLMProvider
@@ -32,10 +34,14 @@ def _schedule_if_processing(background_tasks: BackgroundTasks, unit: MemoryUnit)
     resolved (status == "processing", set by _advance_unit) -- see
     docs/DECISIONS.md. Scheduled here, after the response-bound db
     session's work is done, so the background task opens its own fresh
-    session rather than racing the request's.
+    session rather than racing the request's. finish_structuring is
+    scheduled right after, same ordering guarantee as in
+    api/captures.py's create() (see docs/DECISIONS.md "The 'membase
+    structurer'").
     """
     if unit.status == "processing":
         background_tasks.add_task(finish_unit_processing, unit.id)
+        background_tasks.add_task(finish_structuring, unit.id)
     return unit
 
 
@@ -79,6 +85,24 @@ async def retry(
         raise HTTPException(status_code=400, detail=f"Unit is '{unit.status}', nothing to retry")
     updated = await retry_enrichment(db, llm, unit)
     return _schedule_if_processing(background_tasks, updated)
+
+
+@router.post("/{unit_id}/restructure", response_model=MemoryUnitOut)
+async def restructure(unit_id: uuid.UUID, db: Session = Depends(get_db), llm: LLMProvider = Depends(get_llm_provider)):
+    """Recovery path for the structurer's own lease (see
+    docs/DECISIONS.md "The 'membase structurer'") -- reclaims a unit
+    stuck in structure_status="structuring" past the staleness window,
+    or retries one that previously "failed". Runs synchronously (unlike
+    the fast pipeline's /retry, which just reschedules a background
+    task) since structuring is explicitly allowed to be slow and
+    there's no separate "schedule it and come back later" flow for it
+    yet -- see docs/TODO.md.
+    """
+    unit = _get_unit_or_404(db, unit_id)
+    try:
+        return await retry_structuring(db, llm, unit)
+    except IngestionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{unit_id}/correct", response_model=MemoryUnitOut)

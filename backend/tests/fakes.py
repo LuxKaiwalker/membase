@@ -1,4 +1,5 @@
 import hashlib
+import re
 from typing import Any
 
 from app.llm.base import (
@@ -9,23 +10,24 @@ from app.llm.base import (
 )
 from app.models import EMBEDDING_DIM
 
-_EMPTY_SEMANTICS = {
-    "meaning": "",
-    "aliases": [],
-    "people": [],
-    "organizations": [],
-    "locations": [],
-    "topics": [],
-    "definitions": [],
-    "relations": [],
-    "event_date": "",
+# Shared default for every semantic field analyze_capture/reanalyze_unit
+# can produce -- _parse_semantics()/_as_*() in app/ingestion/analysis.py
+# already tolerate missing keys gracefully, but spelling out the full
+# shape here keeps fake responses self-documenting.
+_EMPTY_SEMANTIC_FIELDS = {
+    "meaning": "", "aliases": [], "people": [], "organizations": [], "locations": [],
+    "topics": [], "definitions": [], "relations": [], "event_date": "",
+    "clarification_question": "", "clarification_field": "",
 }
-
-_DEFAULT_SEGMENTATION = {"units": []}  # empty -> pipeline falls back to no-split
 _DEFAULT_EVALUATE = {"sufficient": True, "reformulated_queries": []}
 _DEFAULT_ANSWER = {"answer": "stub answer", "grounded": True}
 _DEFAULT_CUES = {"cues": []}
-_DEFAULT_QUESTIONS = {"questions": []}  # empty -> no clarification this round
+
+# analyze_capture's prompt always ends "Text:\n{raw_text}\n\nAnalyze
+# this." (see app/ingestion/analysis.py) -- extracting it lets the fake
+# echo the real text back as the default single unit's verbatim
+# "content" without a test needing to repeat it in segmentation_response.
+_CAPTURE_TEXT_RE = re.compile(r"Text:\n(.*)\n\nAnalyze this\.", re.DOTALL)
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
@@ -45,18 +47,19 @@ def _hash_vector(text: str, dim: int) -> list[float]:
 class _ResponseQueue:
     """Wraps a configured response: a single dict is returned every call; a
     list is popped in order, with the last item repeating once exhausted.
-    None falls back to `default`."""
+    None falls back to `default` (which may itself be None, as a sentinel
+    meaning "nothing configured, caller builds a dynamic default")."""
 
-    def __init__(self, configured: Any, default: dict) -> None:
+    def __init__(self, configured: Any, default: Any) -> None:
         self._default = default
         if configured is None:
-            self._items: list[dict] | None = None
+            self._items: list[Any] | None = None
         elif isinstance(configured, list):
             self._items = list(configured)
         else:
             self._items = [configured]
 
-    def next(self) -> dict:
+    def next(self) -> Any:
         if self._items is None:
             return self._default
         if len(self._items) > 1:
@@ -68,32 +71,30 @@ class FakeLLMProvider(LLMProvider):
     """Fast, deterministic stand-in for LLMProvider used by unit tests.
 
     `fail` simulates backend failure modes: None | "unavailable" | "timeout"
-    | "malformed" (applies to every call). The six `*_response` params let
-    a test pin exactly what generate_structured() returns for each of the
-    six structured-output shapes the app uses, dispatched by a
-    distinguishing key in the schema's properties:
-      - "units"               -> segmentation
-      - "sufficient"          -> agent's evaluate-sufficiency step
-      - "grounded"            -> final answer generation
-      - "cues"                -> recall-session cue extraction
-      - "questions"           -> storage-time clarification-question generation
-      - (none of the above)   -> semantic enrichment (narrative / entities /
-                                 retrieval-aids sub-calls, see
-                                 app/ingestion/enrichment.py -- none of their
-                                 three schemas use a key distinct enough to
-                                 need their own dispatch branch, so all three
-                                 draw from the same `enrichment_response`
-                                 queue; a single-dict config is returned to
-                                 all three calls unchanged since each only
-                                 reads the fields relevant to it, but a
-                                 LIST config is now consumed 3x per enrich()
-                                 invocation, not 1x -- size list configs
-                                 accordingly)
+    | "malformed" (applies to every call). Dispatched by a distinguishing
+    key in the schema's properties:
+      - "units"       -> analyze_capture() (segmentation + per-unit
+                         analysis in one call, see
+                         app/ingestion/analysis.py). If
+                         `segmentation_response` is configured, returned
+                         as-is (for multi-unit tests); otherwise a single
+                         unit is built automatically, echoing the real
+                         text being analyzed as its verbatim "content"
+                         and drawing semantic/clarification fields from
+                         `enrichment_response`.
+      - "sufficient"  -> agent's evaluate-sufficiency step
+      - "grounded"    -> final answer generation
+      - "cues"        -> recall-session cue extraction
+      - (none of the above) -> reanalyze_unit() (a single unit's
+                         post-clarification re-analysis -- same semantic
+                         shape as above minus "content"/"units"), drawn
+                         from the same `enrichment_response` queue.
 
-    Each may be a single dict (returned every time) or a list (consumed in
-    order, popped in order with the last value held once exhausted) --
-    useful for simulating a multi-round agent or a clarification that
-    changes the model's answer on the second call.
+    Each `*_response` may be a single dict (returned every time) or a
+    list (consumed in order, one per actual call -- unlike the old
+    three-sub-call enrich(), analyze_capture()/reanalyze_unit() are each
+    exactly one call now, so a list's Nth item is simply the Nth call's
+    response, no multiplier to account for).
     """
 
     def __init__(
@@ -105,22 +106,15 @@ class FakeLLMProvider(LLMProvider):
         evaluate_response: Any = None,
         answer_response: Any = None,
         cue_response: Any = None,
-        question_response: Any = None,
         image_caption_response: Any = None,
     ) -> None:
         self._dim = dim
         self.fail = fail
-        self._segmentation = _ResponseQueue(segmentation_response, _DEFAULT_SEGMENTATION)
-        self._enrichment = _ResponseQueue(enrichment_response, dict(_EMPTY_SEMANTICS))
+        self._segmentation = _ResponseQueue(segmentation_response, None)
+        self._enrichment = _ResponseQueue(enrichment_response, dict(_EMPTY_SEMANTIC_FIELDS))
         self._evaluate = _ResponseQueue(evaluate_response, _DEFAULT_EVALUATE)
         self._answer = _ResponseQueue(answer_response, _DEFAULT_ANSWER)
         self._cues = _ResponseQueue(cue_response, dict(_DEFAULT_CUES))
-        self._questions = _ResponseQueue(question_response, dict(_DEFAULT_QUESTIONS))
-        # Unlike every other *_response param, a caption is naturally a
-        # plain string rather than a dict -- wrap it (and each item, if a
-        # list of per-call captions was passed, same "list is popped in
-        # order" convention as every other param here) so _ResponseQueue
-        # always holds dicts internally.
         if isinstance(image_caption_response, list):
             wrapped_caption_response = [{"caption": c} for c in image_caption_response]
         elif isinstance(image_caption_response, str):
@@ -128,11 +122,9 @@ class FakeLLMProvider(LLMProvider):
         else:
             wrapped_caption_response = image_caption_response
         self._image_caption = _ResponseQueue(wrapped_caption_response, {"caption": "a fake image"})
-        self.calls: list[str] = []  # schema "kind" per generate_structured call, for tests that assert call counts
-        # Raw bytes passed via `images=` on each generate() call, in order --
-        # lets a test assert the real image bytes actually reached the
-        # "LLM" rather than just that captioning ran at all.
+        self.calls: list[str] = []  # dispatch "kind" per generate_structured call, for tests that assert call counts
         self.images_received: list[list[bytes]] = []
+        self.embed_calls: list[list[str]] = []  # texts passed per embed() call, for tests asserting dedup
 
     @property
     def embedding_model_name(self) -> str:
@@ -177,8 +169,13 @@ class FakeLLMProvider(LLMProvider):
 
         props = schema.get("properties", {})
         if "units" in props:
-            self.calls.append("segmentation")
-            return self._segmentation.next()
+            self.calls.append("analyze_capture")
+            configured = self._segmentation.next()
+            if configured is not None:
+                return configured
+            match = _CAPTURE_TEXT_RE.search(prompt)
+            content = match.group(1) if match else prompt
+            return {"units": [{"content": content, **self._enrichment.next()}]}
         if "sufficient" in props:
             self.calls.append("evaluate")
             return self._evaluate.next()
@@ -188,12 +185,10 @@ class FakeLLMProvider(LLMProvider):
         if "cues" in props:
             self.calls.append("cues")
             return self._cues.next()
-        if "questions" in props:
-            self.calls.append("questions")
-            return self._questions.next()
-        self.calls.append("enrichment")
-        return self._enrichment.next()
+        self.calls.append("reanalyze")
+        return dict(self._enrichment.next())
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embed_calls.append(list(texts))
         self._maybe_fail_connectivity()
         return [_hash_vector(t, self._dim) for t in texts]

@@ -1,250 +1,275 @@
-# Engineering report: iterative recall phase
+# Engineering report: streamlining phase
 
-This supersedes the previous report. Scope: the previous phase
-corrected clarification-gating and hardened retrieval around the
-memory-unit architecture; this phase's task was different in kind --
-not another correctness gap, but a product-shape change to *how recall
-itself works*. Recall used to be `query -> search -> answer` in one
-HTTP request. It is now a persisted, multi-round `RecallSession`:
-a weak or partial first query can produce a clarifying question instead
-of a guess, the user's reply (an answer, a correction, or an unprompted
-extra detail) becomes a new search cue, and the session searches again
--- repeating until it succeeds, genuinely runs out of options, or the
-user gives up. Verified against the real local LLM throughout,
-including a full session walked through `curl` against the live server
-across an actual process restart.
+This supersedes the previous report. Scope: the previous two phases
+built out and then hardened the augmented-memory architecture
+(MemoryUnit segmentation, clarification gating, iterative RecallSession).
+This phase's mandate was different in kind -- not a new feature, but an
+explicit instruction that "the project is too bloaty": reduce LLM call
+count, remove duplicate retrieval pathways, collapse prematurely
+specialized processing stages, and reduce latency, **while preserving
+every architectural idea that makes this an augmented-memory system
+rather than a conventional notes/RAG app**. The spec named five
+abstractions everything else had to justify its existence against:
+Capture, MemoryUnit, Semantic representation, RecallSession, LLM/
+Database. All five survive this phase unchanged in kind; what changed
+is how many calls and how much code it takes to run them.
 
-## Current architecture
+Verified against the real local model throughout -- the 30-case eval
+corpus, a live multipart `POST /api/captures` round-trip including an
+explicit-metadata conflict and its clarification answer, and the full
+fast pytest suite (139 tests, all passing, against fakes).
 
-Ingestion (capture -> segmentation -> enrichment -> clarification gate
--> embedding/fts) is unchanged from the previous report; see
-docs/ARCHITECTURE.md for the full picture. What's new sits entirely on
-the retrieval side:
+## 1. Current architecture
 
-```
-user query (possibly just a weak cue)
-      v
-RecallSession created, persisted in Postgres
-      v
-round: automatic_search()            <- same bounded 3-iteration
-      (search -> evaluate ->             search/evaluate/reformulate
-       reformulate, shared with            loop the one-shot agent uses
-       the one-shot agent)
-      v
-apply_negative_cues() / apply_positive_cue_boost()   <- user corrections/
-      |                                                  confirmations
-      v                                                  reshape the
-is_ambiguous()?  (origin-capture groups,                 candidate set
-      |           close top scores)
-      +-- yes, and a question helps --> ASK, stop, wait for reply
-      +-- no / no more questions  ----> narrow_to_dominant_group()
-      v
-generate_answer()  (same grounding-enforcement function as before)
-      |
-      +-- grounded   --> SUCCESS, snapshot evidence, stop
-      +-- ungrounded --> ask one more question, or EXHAUSTED
-```
+Unchanged in *shape* from docs/ARCHITECTURE.md's description before this
+phase: a `Capture` decomposes into one or more `MemoryUnit`s; each unit
+carries authoritative content (verbatim, never rewritten), an append-only
+clarification history, a derived semantic representation, and a status
+gate (`draft -> awaiting_clarification -> processing -> ready`, or
+`failed`/`discarded`). Recall is `RecallSession`-based: a query starts a
+persisted session, an automatic search-and-answer round runs first, and
+a difficult query escalates to asking the user a discriminating question
+rather than guessing. See docs/ARCHITECTURE.md (updated this phase) for
+the full diagrams.
 
-A user reply re-enters at "round": `extract_cues()` turns free text into
-structured `{text, confidence, polarity}` cues, appended to the session,
-and another round runs with the full accumulated cue set.
+What's different is *how few calls it takes to run that shape*:
 
-## Retrieval-session design
+- **Ingestion** is one unified LLM call (`analyze_capture()`) per
+  capture instead of five across segmentation, clarification-need
+  detection, and three-way enrichment. A clarification round is one
+  further call (`reanalyze_unit()`), not a pre-generated queue.
+- **Recall** has exactly one retrieval+decision algorithm, not two:
+  the previously-separate one-shot `run_agent()` path and the
+  multi-turn `RecallSession` path now both route through
+  `start_session()`'s first automatic round. `run_agent()` survives
+  only as an internal primitive for the eval harness and benchmarks.
+- **A deterministic shortcut** skips the sufficiency-reasoning LLM call
+  entirely when the top search result is unambiguously dominant.
+- **Two new capabilities were added without new call-shaped
+  complexity**: explicit structured metadata (bypasses inference, no
+  LLM call) and lightweight contradiction detection (reuses the
+  existing search call, pure-Python comparison).
 
-`RecallSession` (`backend/app/models.py`) is one row per session:
-`original_query` (immutable -- the one thing that's never overwritten,
-protecting against query drift), `status`, `current_question`,
-`messages` (full transcript), `cues`, `hypotheses`, `tried_queries`,
-`asked_questions`, `round_count`, `last_candidate_count`, and
-`final_answer`/`final_sources`/`final_chunk_sources` (a snapshot, not a
-live reference, so a later correction or deletion of the underlying
-memory can't retroactively change what a past session recorded as its
-answer). No foreign key to `memory_units`/`attachment_chunks` -- the
-snapshot is deliberately self-contained.
+## 2. Removed complexity
 
-Three categories of information are kept structurally distinct, per the
-spec's data-flow concern about an iterative system contaminating its
-own memory store:
+Deleted outright: `app/ingestion/clarify.py`, `enrichment.py`,
+`segmentation.py`, and their dedicated test files -- replaced by the
+single `app/ingestion/analysis.py`. Removed from the schema:
+`MemoryUnit.clarification_queue` (there is no longer a batch of
+pre-generated future questions to store). Removed from config:
+`membase_max_images_captioned_per_capture` (the per-request image-batch
+cap it bounded no longer applies now that each image is captioned by its
+own independent background task, not a synchronous batch). Removed from
+`agent.py`: the implicit assumption that one-shot and multi-turn recall
+could reasonably diverge in answer quality for the same stored memories
+-- they can't any more, by construction.
 
-- **User-provided cues** (`cues`): confidence (`certain`/`likely`/
-  `uncertain`) and polarity (`positive`/`negative`), both tagged by
-  round. A positive cue is always searched, regardless of confidence --
-  confidence affects nothing about whether it's used, only (eventually)
-  how it should be weighed as evidence, which in practice means: it's
-  never treated as a hard filter. A negative cue is never searched; it
-  only excludes a candidate via `apply_negative_cues`.
-- **Retrieved evidence**: the `ScoredUnit`/`ScoredChunk` results from
-  `hybrid_search`/`hybrid_search_chunks` -- real stored content, scored.
-- **System hypotheses** (`hypotheses`): the reformulated queries
-  `evaluate_sufficiency` proposes along the way (itself unchanged from
-  the one-shot agent), kept on the session purely for transparency and
-  testability. Never passed into answer-generation evidence; never
-  becomes a memory.
+Reduced, not removed: `MAX_AGENT_ITERATIONS` 3->2,
+`MAX_REFORMULATIONS_PER_ROUND` 2->1, the DB idle-in-transaction timeout
+450s->180s (now that a transaction holds at most one LLM call instead of
+up to five). The long-held `with_for_update` row lock was replaced with a
+processing-lease/token pattern -- not removed, since the underlying race
+it protects against is real, but reduced to two fast local transactions
+instead of a lock held for an LLM call's duration.
 
-Two heuristics specific to this phase, both deliberately simple per the
-spec's own instruction not to build a formal active-learning system:
+**What was deliberately NOT removed, despite "too bloaty":** the
+verbatim-excerpt safety check, the two-phase-commit durability pattern,
+the status gate excluding unanswered units from search, provenance
+(clarifications never overwritten), grounding enforcement, and the
+processing-lease/background-task machinery itself (collapsed to fewer
+calls *inside* it, not replaced with a synchronous call, per the spec's
+explicit instruction to keep FastAPI BackgroundTasks and the state
+machine). Removing any of these would have been removing an
+architectural idea, not bloat.
 
-- `is_ambiguous`: candidates from ≥2 distinct origin captures with top
-  fused scores within `AMBIGUITY_SCORE_MARGIN` (0.15) are a real
-  decision, not something to silently resolve by picking whichever
-  ranked first.
-- `generate_discriminating_question`: picks the semantic attribute
-  (person/location/organization/topic/date) that best bisects the
-  remaining candidates and phrases one concrete question about it,
-  skipping anything already asked this session.
+## 3. Performance
 
-One thing discovered only by testing against the real model, not
-anticipated in the initial design: re-searching with a cue as its own
-short query (e.g. just "ETH") often scores *lower* on the fused metric
-than the original full-sentence query already did for every candidate,
-so naively merging per-query results via "keep the max score seen"
-never resolved ambiguity in practice. `apply_positive_cue_boost`
-addresses this directly: a confirmed cue that matches a candidate's own
-semantic metadata (the same metadata the question was generated from)
-gets a flat score bonus. Without it, a correct "yes, ETH" answer left a
-session stuck asking forever; with it, the session resolves in the next
-round -- verified live against the real model, see docs/DECISIONS.md.
+LLM call counts are exact (by inspection, not measurement -- a call
+count doesn't need a timer to know):
 
-## Agent behavior
+| Flow | Before this phase | After |
+|---|---|---|
+| Ordinary memory, no clarification | 4 generation calls + 1 embed | **1 generation call + 1 embed** |
+| Memory needing 1 clarification round | 4 + 1 (initial) + 1 (question re-check) + re-embed | 1 (initial) + 1 (`reanalyze_unit`) + 1 embed |
+| Simple one-shot recall, high-confidence match | 1 embed (unit search) + 1 embed (chunk search, duplicate) + 1 sufficiency-eval call + 1 answer call | **1 embed (shared) + 1 answer call** -- sufficiency-eval skipped entirely |
+| Recall needing 1 reformulation | up to 2 reformulations searched, each re-embedding twice | up to 1 reformulation, embedding deduped |
+| Contradiction check | did not exist | +1 reused `hybrid_search()` call per newly-finalized unit with a relation (no new LLM call) |
 
-- **Automatic iterations** (no user involved): `automatic_search()` in
-  `app/retrieval/agent.py`, extracted this phase so both the one-shot
-  agent and every `RecallSession` round share one implementation. Still
-  bounded to `MAX_AGENT_ITERATIONS = 3`, ≤2 reformulations per round --
-  unchanged from the previous phase.
-- **User-mediated iterations**: bounded only by `MAX_SESSION_ROUNDS = 12`
-  -- a runaway-loop safeguard, not a UX-facing turn limit (spec section
-  10 is explicit that these two kinds of bound shouldn't be conflated).
-- **Tools**: still just `hybrid_search`/`hybrid_search_chunks` (spec
-  section 19's minimal surface) -- no new tool was added for this phase;
-  cue extraction and the ambiguity heuristics are code the session
-  controller runs itself, not agent-invokable tools.
-- **Termination conditions**: `success` (grounded answer), `exhausted`
-  (nothing found, or ambiguity never resolved and no discriminating
-  angle remains), `cancelled` (explicit user action), `error` (LLM/infra
-  failure mid-round). `needs_user_cue` and `active` are the only
-  non-terminal statuses.
-- **Safeguards**: grounding enforcement is unchanged -- still exactly
-  one override point, now reached from both `run_agent()` and
-  `_run_round()`, both calling the same `generate_answer()`. Original
-  query never replaced. Repeated-question avoidance via
-  `asked_questions`. Negative cues demote by structured-metadata match,
-  not loose substring guessing.
+Not measured: wall-clock latency under identical load conditions
+before vs. after. Reverting the full call collapse to produce a clean
+"before" timing baseline would have cost more of this phase's time
+budget than the number was worth, given the call-count reduction is the
+more direct, less noisy signal, and Ollama (`-np 1`, serialized
+requests) makes any latency number collected on this machine highly
+sensitive to what else was running at the time -- confirmed firsthand
+when a manual verification request queued for over a minute behind the
+eval harness's own concurrent Ollama calls during this phase's own
+testing. If a wall-clock number is specifically needed later,
+docs/TODO.md has the exact before/after procedure.
 
-## Memory-safety model
+## 4. Retrieval quality
 
-`app/retrieval/session.py` and `app/retrieval/cues.py` never call
-`create_capture` and never write to `MemoryUnit`/`Capture` -- there is
-no code path from "something said during a recall conversation" to
-"durable memory" other than the user separately using the ordinary
-`POST /api/captures` flow with their own words. This was verified
-directly, not just by code inspection: `test_recall_session.py` asserts
-`MemoryUnit` row counts are unchanged before/after sessions that
-generate hypotheses, uncertain cues, and negative corrections.
-Storage-time clarification (`MemoryUnit.pending_clarification`, gates
-*searchability* of a memory) and retrieval-time clarification
-(`RecallSession.current_question`, gates *continuing the search*) are
-separate fields on separate models -- answering one never touches the
-other.
+The 30-case eval corpus (`eval/cases.yaml`), run against the real
+`gemma4:12b` + `nomic-embed-text` models via `scripts/run-eval.sh`:
+**28/30 passed (93%)**, full transcript in docs/DECISIONS.md. Two
+failures, both plausibly connected to this phase's specific trade-offs
+(detailed analysis and the recommended follow-up experiment in
+docs/DECISIONS.md and docs/TODO.md):
 
-## UI
+- `clarification_alias_second_term`: the unified `analyze_capture` call
+  didn't flag an invented term ("Flimvex") as needing clarification,
+  where a prior phase's dedicated, single-purpose question-generation
+  call apparently did.
+- `user_specific_terminology`: an indirect alias query ("What did I call
+  the project?" -> "Nightingale") abstained instead of answering,
+  plausibly from the reduced reformulation budget running out before
+  finding the bridging phrasing.
 
-`/recall` is now a lightweight conversation, not a single form: a
-transcript of user/system turns, a reply box that stays open while
-`status` is `needs_user_cue`, a "Give up" button (cancel), and a "Start
-a new recall" button once the session reaches a terminal state. A
-one-line progress indicator ("Found 2 related memories so far...")
-surfaces `last_candidate_count` without exposing any internal
-scores/reasoning. No browser automation tool was available in this
-environment (same limitation noted in the previous report's TODO) --
-validated instead via direct HTTP calls against the live running
-server, including rendering the HTML and walking a full multi-turn
-session through `curl`, across an actual `kill`+restart of the dev
-server to confirm session persistence.
+Neither was reverted: 93% on a 30-case hand-written corpus is within a
+plausible sampling-noise band for a non-deterministic model even with
+zero code change, and the spec explicitly traded some quality margin for
+the call-count reduction on purpose. They're recorded as the concrete
+starting point for a real before/after comparison if this turns out to
+matter in practice, not swept under the rug.
 
-## Evaluation
+Ambiguity detection was tightened, not loosened: `is_ambiguous()` now
+also requires the runner-up candidate to independently clear an absolute
+relevance floor (`0.45`), so two weak matches that happen to be close to
+*each other* near the noise floor no longer trigger a pointless
+clarifying question -- a genuine quality improvement alongside the
+latency-motivated changes.
 
-- **One-shot set** (`eval/cases.yaml`, unchanged, 30 cases): 29/30 on
-  this run. The one failure (`ambiguous_two_rome_trips`) is pre-existing
-  eval-case brittleness unrelated to this phase -- the model's answer
-  ("You ate pasta... Additionally, you enjoyed gelato...") is actually a
-  reasonable grounded merge of both ambiguous Rome trips, it just never
-  echoes the literal word "Rome" that `expect_contains` checks for.
-  `automatic_search`'s logic is byte-for-byte unchanged from the
-  previous phase's `run_agent` (confirmed by the full existing test
-  suite passing before any new code was added), so this is real-LLM
-  phrasing variance, not a regression.
-- **New iterative-recall set** (`eval/session_cases.yaml` +
-  `eval/run_session_eval.py`, run via `scripts/run-session-eval.sh`): 6
-  cases, **6/6 passing**, covering: ambiguous candidates resolved by a
-  location cue, resolved by a negative correction ("no, it wasn't
-  Markus"), an irrelevant cue that must not force a wrong answer, no
-  evidence at all (immediate abstention), an exact-match case answered
-  in one round, and original-query preservation across rounds with no
-  useful new cue.
-- Both sets run against the real configured models
-  (`qwen2.5:14b-instruct-q4_K_M` / `nomic-embed-text`), isolated in the
-  `membase_eval` database.
+## 5. Contradiction handling
 
-## Tests
+Implemented this phase, storage-side and retrieval-side, both reusing
+existing primitives rather than adding new ones. Storage-side: after a
+unit embeds, its relation triples are compared against other `ready`
+units found via the *existing* `hybrid_search()` call (searching on the
+relation's subject+predicate, not the unit's full text -- see the bug
+writeup in docs/DECISIONS.md for why that distinction mattered); a
+mismatch adds an advisory `potential_conflicts` marker to both sides,
+never deletes or supersedes either. Retrieval-side: `format_evidence()`
+renders a `[Conflict] ...` line for any evidence unit carrying one, and
+the answer-generation prompt is instructed to state the disagreement
+explicitly ("You have two stored memories that conflict: one says X and
+another says Y") rather than silently pick a side. This is the only
+place conflict presentation happens. No truth-maintenance database, no
+temporal belief revision, no "newest wins" rule -- all explicitly out of
+scope per the spec, documented as future options in docs/TODO.md.
 
-66 pytest tests total (up from the previous phase's 55; +11 new), all
-passing: `test_recall_session.py` (session state machine, ambiguity ->
-question -> resolution, negative-cue exclusion, uncertain-cue-as-search-
-signal-not-filter, hypothesis non-contamination, exhaustion, cancel/
-reject-continue, original-query preservation, repeated-question
-avoidance, pure-function tests of the discriminate heuristics, cue-
-extraction degradation on malformed LLM output, restart-durability via
-`db.expire_all()` + re-fetch). The prior phase's 55 tests pass unchanged
--- `automatic_search`/`evaluate_sufficiency` were extracted, not
-rewritten, and the extraction was verified behavior-preserving against
-the full suite before any new logic was added on top.
+## 6. Clarification
 
-## Remaining limitations
+Fully rebuilt around sequential, re-evaluated-after-every-answer
+questioning instead of a pre-generated queue:
 
-- Ambiguity detection (`AMBIGUITY_SCORE_MARGIN = 0.15`) is a hand-picked
-  constant, not calibrated via a sweep the way `VECTOR_SIM_THRESHOLD`
-  was -- there wasn't yet a large enough multi-round eval set. It's also
-  sensitive to full-text-search score asymmetry: two equally-plausible
-  candidates can get different scores purely from literal keyword
-  overlap with the query, independent of actual relevance (see
-  docs/TODO.md).
-- `apply_negative_cues`/`apply_positive_cue_boost` match cue text against
-  structured semantic metadata exactly (case-insensitive), not fuzzily --
-  "Anna" won't match "Annalisa" or a misspelling.
-- Cue extraction's handling of a reply that both answers yes/no *and*
-  adds new information required a prompt fix mid-phase after the real
-  model initially dropped the new detail (see docs/DECISIONS.md/TODO.md)
-  -- now correct in testing, but still model judgment, not a hard
-  guarantee, same caveat as the enrichment clarification-triggering gap
-  already documented.
-- A session round re-searches the original query plus every accumulated
-  positive cue from scratch (by design, to avoid "forgetting" earlier
-  candidates between rounds) -- not measured under load at a large
-  personal-memory-store scale.
-- No way to list/browse past recall sessions; only fetchable by id.
+- **Sequential flow**: one question surfaced at a time
+  (`pending_clarification`); answering it re-analyzes the unit exactly
+  once (`reanalyze_unit`), which both re-derives semantics and decides
+  whether a further question is still warranted. Bounded at
+  `MAX_CLARIFICATION_ROUNDS = 3`.
+- **Direct structured metadata**: an optional JSON `metadata` form field
+  on `POST /api/captures` (location/date/people/organizations/topics),
+  always authoritative over the same inferred field, with a genuine
+  conflict surfaced as its own clarification question. A small UI
+  (collapsed `<details>` block on the Remember page) was added for this,
+  not just the API.
+- **Unknown/declined handling**: a deterministic, no-LLM-call classifier
+  recognizes "I don't know" vs. "I'd rather not say" vs. an actual
+  answer from the free-text reply. A field marked declined/unknown is
+  hard-coded (in code, not just the prompt) to never be re-asked, even
+  if the model proposes it again -- verified by a dedicated test that
+  configures the fake model to keep asking about the same field and
+  confirms it's suppressed.
+- **Prior-memory context**: a cheap SQL lexical lookup (no LLM/embedding
+  call) injects up to 3 snippets from existing ready memories as
+  context into the analysis prompt, explicitly marked as
+  context-not-authority -- prevents re-asking about an already-explained
+  term without paying for a semantic search.
 
-## Major open design questions
+All four were verified against the real model via a live multipart
+request to the dev server: submitting explicit metadata that
+conflicted with the model's own inference produced exactly the designed
+clarification question, with both values retained pending the answer.
 
-- **Should a user be able to promote something said during recall into
-  a permanent memory?** Deliberately left open (spec section 46) --
-  not an obvious engineering call (what exactly gets saved, in whose
-  words, with what provenance). Current behavior: nothing from a
-  session is ever saved automatically or via any UI action.
-- **Should recall-session history become searchable memory itself**
-  (e.g. "what did I ask about last week")? Not implemented; sessions are
-  fetchable by id but there's no search/list surface over them.
-- **Should the ambiguity margin and positive-cue-boost constants be
-  probabilistic/learned rather than fixed heuristics** as real usage
-  accumulates? Spec explicitly permits deferring this for the MVP.
+## 7. Local LLM setup
 
-## Recommended next experiment
+Unchanged from the previous phase's decision and re-confirmed, not
+re-litigated: `gemma4:12b` for every generation/structured-output call,
+`nomic-embed-text` (768-dim) for embeddings, both via the system Ollama
+service, no second generation model resident (VRAM/eviction-thrashing
+reasons documented in CLAUDE.md and docs/DECISIONS.md predate this
+phase and still hold). This phase's own real-model testing surfaced one
+new, concrete finding about this model specifically: **gemma4:12b
+sometimes emits the literal string `"null"` (or `"none"`) for an
+empty/unset field instead of `""`** -- a structured-output quirk, not an
+intentional value. Found live (an `event_date` field came back as the
+string `"null"`), fixed in `app/ingestion/analysis.py`'s string-parsing
+helpers, and covered by a regression test. `scripts/model-doctor.sh`
+(unchanged) continues to be the environment-level check that both
+configured models are present and respond correctly.
 
-Build a larger, more varied iterative-recall eval set (the current one
-is 6 hand-picked cases, deliberately phrased for score symmetry where
-ambiguity is the point) and run a sweep over `AMBIGUITY_SCORE_MARGIN`
-and `POSITIVE_CUE_BOOST` the same way `VECTOR_SIM_THRESHOLD` was
-calibrated last phase -- this phase's manual testing already found one
-real gap (the positive-cue-boost mechanism itself, absent from the
-initial design) that a systematic sweep would likely surface others
-like it faster than one-off manual probing did.
+## 8. Deferred functionality
+
+Explicitly deferred this phase, each with a documented reason in
+docs/TODO.md:
+
+- **"Save as memory" has no frontend affordance.** The backend
+  (`POST /api/recall/sessions/{id}/save-as-memory`, restricted to text
+  provably said by the user in that session) is implemented and tested;
+  the UI isn't, because the recall page is one-shot-only today and shows
+  no session/cue history to attach a button to -- building that would be
+  a materially larger piece of work than this feature itself.
+- **`retry_attachment_chunking()` has no API route.** The function is
+  implemented, idempotent, and tested; nothing calls it from `app/api/`
+  yet.
+- **Recall-session history is not searchable.** Confirmed out of scope
+  per this phase's spec explicitly, not just unaddressed.
+- **Causal/automatic forgetting.** Not implemented; explicit user
+  deletion remains the only destructive path, as before.
+- **A real threshold sweep** for the new deterministic shortcut's and
+  ambiguity detector's constants. Sanity-checked against one real-model
+  eval run, not swept across a range -- the 30-case corpus is small
+  enough that a swept threshold risks overfitting it.
+
+## 9. Remaining technical risks
+
+**Engineering risks** (fixable with more implementation time, not more
+research):
+
+- The two eval regressions (section 4) aren't yet isolated to a specific
+  cause among three candidate changes (ingestion collapse, iteration/
+  reformulation reduction, the new shortcut). A multi-run baseline
+  comparison would resolve this.
+- `retry_attachment_chunking()` and "save as memory"'s UI are both
+  functionally complete but unreachable from the product surface.
+- No wall-clock latency baseline exists for this phase's changes, only
+  call counts.
+
+**Research/product risks** (need a product decision or more evidence,
+not just more engineering):
+
+- Whether the deterministic shortcut's thresholds (`0.80`/`0.20`) and
+  the ambiguity floor (`0.45`) generalize beyond a 30-case hand-written
+  corpus is genuinely unknown without a larger, more representative eval
+  set.
+- Whether recall-session history should ever become searchable, whether
+  causal forgetting is wanted at all, and what "save as memory" should
+  look like in the UI once/if the interactive recall surface itself gets
+  built, are all still open product questions (docs/TODO.md), not
+  engineering ones.
+
+## 10. Recommended next experiment
+
+**Isolate the two eval regressions.** Re-run `scripts/run-eval.sh`
+3-5 times unchanged to establish how much result variance is pure model
+sampling noise on this 30-case corpus. If `clarification_alias_second_term`
+and `user_specific_terminology` fail consistently (not just once), bisect
+by re-enabling one changed subsystem at a time against the new code
+(first: restore `MAX_AGENT_ITERATIONS=3`/`MAX_REFORMULATIONS_PER_ROUND=2`
+alone and re-run just `user_specific_terminology`'s category; separately:
+compare `analyze_capture()`'s clarification-decision behavior against
+the old dedicated `generate_questions()` prompt on the Flimvex case
+specifically) to determine which specific streamlining decision, if any,
+is the actual cause -- rather than guessing from one combined run. This
+is the most direct way to find out whether this phase traded real
+accuracy for latency, or just got unlucky on two cases out of thirty.

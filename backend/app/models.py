@@ -48,7 +48,7 @@ class MemoryUnit(Base):
     `authoritative_content` is user-originated text (either a verbatim
     excerpt of the capture's raw_text chosen by segmentation, or the whole
     raw_text when segmentation didn't split/wasn't available -- see
-    app/ingestion/segmentation.py). `clarifications` is an append-only list
+    app/ingestion/analysis.py). `clarifications` is an append-only list
     of verbatim user Q&A, also user-provided and never overwritten.
     Everything else (`semantic`, `retrieval_text`, `searchable_text`,
     `fts`, `embedding`) is LLM-derived or fully mechanically derived, and
@@ -69,13 +69,49 @@ class MemoryUnit(Base):
     # --- pipeline state (see app/ingestion/pipeline.py) ---
     status: Mapped[str] = mapped_column(Text, nullable=False, default="draft")
     pending_clarification: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # Candidate questions from the current clarification round not yet
-    # asked -- drained one at a time into pending_clarification as each is
-    # answered (app/ingestion/clarify.py generates up to several at once;
-    # the API/UI contract still only ever shows one at a time). Internal
-    # bookkeeping only, not exposed via MemoryUnitOut.
-    clarification_queue: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     clarification_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Streamlining phase (see docs/DECISIONS.md "Sequential clarification"):
+    # clarification is strictly one-question-at-a-time, re-evaluated after
+    # every answer -- there is deliberately no pre-generated queue of
+    # future questions anymore.
+
+    # Short-lived processing lease (see docs/DECISIONS.md "processing
+    # lease"): claimed atomically alongside status="processing", checked
+    # again when the background step commits its result, so a long LLM
+    # call never needs a held database row lock. A stale
+    # processing_started_at (no matching commit within a reasonable
+    # window) is what POST /retry treats as "safe to reclaim".
+    processing_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # User-provided structured fields (location/date/people/organizations/
+    # topics) -- optional, bypasses LLM inference entirely, and always
+    # takes authority over whatever the model separately infers for the
+    # same field (see docs/DECISIONS.md "Explicit metadata authority").
+    explicit_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # Lightweight conflict markers (see docs/DECISIONS.md "Contradiction
+    # detection"): [{"unit_id": str, "note": str}]. Purely additive and
+    # advisory -- nothing here ever deletes, supersedes, or hides the
+    # conflicting unit; it only tells answer generation to surface the
+    # disagreement explicitly instead of silently picking a side.
+    potential_conflicts: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+
+    # --- membase structurer (see docs/DECISIONS.md "The 'membase
+    # structurer'") -- a second, independent background pass that
+    # deepens an already-"ready" unit's representation. Entirely
+    # separate from `status` above: structure_status is NEVER read by
+    # hybrid_search() and never gates searchability -- a unit sits at
+    # "unstructured" indefinitely without being any less searchable.
+    structure_status: Mapped[str] = mapped_column(Text, nullable=False, default="unstructured")
+    # unstructured | structuring | structured | failed
+    structure_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structure_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    structured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Advisory cross-references to other memories the structurer judged
+    # genuinely related -- a flat, bounded list of MemoryUnit id
+    # strings, deliberately NOT a knowledge graph.
+    related_unit_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
     # --- derived (LLM-derived semantic representation; regenerable) ---
     semantic: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

@@ -1,6 +1,7 @@
 import logging
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -112,7 +113,11 @@ _ANSWER_SYSTEM = (
     "entirely and has nothing relevant to "
     "the question; otherwise answer with what the evidence does say and set "
     "grounded to true. Do not guess or fabricate anything not present in "
-    "the evidence."
+    "the evidence. If a piece of evidence has a '[Conflict]' note, two "
+    "stored memories disagree with each other -- you MUST state that "
+    "disagreement explicitly in your answer (e.g. \"You have two stored "
+    "memories that conflict: one says X and another says Y.\"), never "
+    "silently pick one side or omit the conflicting one."
 )
 
 
@@ -177,24 +182,54 @@ def _fuse(
     return fused
 
 
+# Sentinel distinguishing "caller didn't pass a vector, compute it
+# yourself" from "caller passed query_vector=None because it already
+# knows embedding is unavailable" -- see embed_query()/docs/DECISIONS.md
+# "Dedupe query embeddings". Plain None can't do double duty for both
+# meanings: a caller that already tried and failed must be able to say
+# so without hybrid_search silently retrying the same failing call.
+_UNSET = object()
+
+
+async def embed_query(llm: LLMProvider, query: str) -> list[float] | None:
+    """Embed once, for a caller (automatic_search) that's about to search
+    both memory units and attachment chunks with the same query string --
+    each previously called llm.embed(query) independently. Returns None
+    on failure rather than raising; both hybrid_search and
+    hybrid_search_chunks already degrade to full-text-only when given
+    None, same as if they'd failed to embed it themselves.
+    """
+    try:
+        [vector] = await llm.embed([query])
+        return vector
+    except LLMError:
+        logger.warning("Query embedding failed; falling back to full-text-only retrieval")
+        return None
+
+
 async def hybrid_search(
-    db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER
+    db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER, query_vector: Any = _UNSET
 ) -> list[ScoredUnit]:
     """One retrieval round: vector + full-text over MemoryUnit, fused by a
     weighted-score rerank, filtered to a basic relevance bar. Used both as
     the agent's SEARCH action and directly for repeated/reformulated
     queries within one agent run.
+
+    `query_vector`, if given, is used as-is instead of embedding `query`
+    again -- for a caller (automatic_search) that already embedded this
+    exact query once via embed_query() to search chunks too. Omit it to
+    have this function embed `query` itself, same as before.
     """
     query = query.strip()
     if not query:
         return []
 
+    if query_vector is _UNSET:
+        query_vector = await embed_query(llm, query)
+
     vector_scores: dict[uuid.UUID, float] = {}
-    try:
-        [query_vector] = await llm.embed([query])
+    if query_vector is not None:
         vector_scores = _vector_candidates(db, query_vector, CANDIDATE_LIMIT)
-    except LLMError:
-        logger.warning("Query embedding failed; falling back to full-text-only retrieval")
 
     fts_scores = _fts_candidates(db, query, CANDIDATE_LIMIT)
 
@@ -274,22 +309,26 @@ class ScoredChunk:
 
 
 async def hybrid_search_chunks(
-    db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER
+    db: Session, llm: LLMProvider, query: str, limit: int = TOP_K_FOR_ANSWER, query_vector: Any = _UNSET
 ) -> list[ScoredChunk]:
     """Same hybrid vector+fts fusion as hybrid_search(), over attachment
     chunks instead of memory units (spec section 27: large-document
     content should contribute more than one short blind excerpt).
+
+    `query_vector` behaves exactly as in hybrid_search() -- pass the
+    vector already embedded for this same query (see embed_query()) to
+    avoid embedding it a second time.
     """
     query = query.strip()
     if not query:
         return []
 
+    if query_vector is _UNSET:
+        query_vector = await embed_query(llm, query)
+
     vector_scores: dict[uuid.UUID, float] = {}
-    try:
-        [query_vector] = await llm.embed([query])
+    if query_vector is not None:
         vector_scores = _chunk_vector_candidates(db, query_vector, CANDIDATE_LIMIT)
-    except LLMError:
-        logger.warning("Query embedding failed; chunk search falling back to full-text-only")
 
     fts_scores = _chunk_fts_candidates(db, query, CANDIDATE_LIMIT)
 
@@ -352,6 +391,15 @@ def _format_unit(unit: MemoryUnit, label: str) -> str:
     # chunk blocks (see _format_chunk) rather than a blind excerpt here --
     # chunking means the relevant part of a large document is actually
     # findable instead of just whatever happens to be first.
+    # Advisory conflict markers written by _detect_conflicts() at storage
+    # time (see app/ingestion/pipeline.py) -- purely deterministic string
+    # formatting, no LLM call, surfacing a disagreement the answer prompt
+    # is instructed to state explicitly rather than silently resolve (see
+    # docs/DECISIONS.md "Contradiction detection").
+    for conflict in unit.potential_conflicts or []:
+        note = conflict.get("note") if isinstance(conflict, dict) else None
+        if note:
+            lines.append(f"[Conflict] {note}")
     return "\n".join(lines)
 
 

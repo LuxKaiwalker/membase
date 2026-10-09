@@ -21,7 +21,9 @@ these in.
 from app.ingestion.pipeline import (
     create_capture,
     finish_attachment_chunking,
+    finish_image_captioning,
     finish_unit_processing,
+    is_uncaptioned_image,
     resolve_clarification,
 )
 
@@ -34,6 +36,14 @@ async def _finish_processing(db, llm, *units) -> None:
         db.expire_all()  # pick up what finish_unit_processing's own session committed
 
 
+async def _finish_captioning(db, llm, *attachments) -> None:
+    for attachment in attachments:
+        if is_uncaptioned_image(attachment):
+            await finish_image_captioning(attachment.id, llm=llm)
+    if attachments:
+        db.expire_all()  # pick up what finish_image_captioning's own session committed
+
+
 async def _finish_chunking(db, llm, *attachments) -> None:
     for attachment in attachments:
         await finish_attachment_chunking(attachment.id, llm=llm)
@@ -42,11 +52,15 @@ async def _finish_chunking(db, llm, *attachments) -> None:
 
 
 async def create_capture_and_finish(db, llm, *, text, uploads=None):
-    """create_capture() + synchronously finish background enrichment for
-    every unit that doesn't have a clarification question pending, and
-    background chunk-indexing for every attachment."""
+    """create_capture() + synchronously finish every backgrounded step:
+    unit enrichment for every unit without a clarification question
+    pending, image captioning, and chunk-indexing -- in that order, since
+    whether a (now-captioned) attachment needs chunking at all depends on
+    its caption length (see docs/DECISIONS.md "Lazy attachment
+    chunking")."""
     capture = await create_capture(db, llm, text=text, uploads=uploads or [])
     await _finish_processing(db, llm, *capture.units)
+    await _finish_captioning(db, llm, *capture.attachments)
     await _finish_chunking(db, llm, *capture.attachments)
     db.refresh(capture)
     return capture

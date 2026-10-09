@@ -10,13 +10,22 @@
   <header>
     <div class="brand">membase</div>
     <nav>
-      <a href="/">Remember</a>
-      <a href="/recall">Recall</a>
+      <a href="/">Store</a>
+      <a href="/recall">Remember</a>
       <a href="/captures">Browse</a>
     </nav>
     <div class="settings">
       <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" title="Settings">&#9881;</button>
       <div id="settings-menu" class="settings-menu hidden">
+        <label class="settings-row">
+          <input type="checkbox" id="setting-disable-followup-questions" />
+          Disable follow-up questions
+        </label>
+        <p class="muted settings-hint">
+          When on, a new memory is never held up waiting for an answer --
+          it's stored and processed right away, even if something about
+          it was unclear or conflicted with what you entered.
+        </p>
         <label class="settings-row">
           <input type="checkbox" id="setting-obligatory-questions" />
           Follow-up questions are obligatory

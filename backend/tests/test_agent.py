@@ -91,3 +91,18 @@ async def test_no_answer_case_abstains_without_any_search_noise(db, fake_llm):
     result = await run_agent(db, fake_llm, "nothing stored matches this at all")
     assert result.abstained is True
     assert result.sources == []
+
+
+@pytest.mark.asyncio
+async def test_query_is_embedded_once_and_reused_for_chunk_search(db, fake_llm):
+    """hybrid_search(query) and hybrid_search_chunks(query) previously
+    each independently called llm.embed(query) -- see docs/DECISIONS.md
+    "Dedupe query embeddings". One round, one query, must mean exactly
+    one embed() call, not two."""
+    await create_capture_and_finish(db, fake_llm, text="foo content here")
+
+    agent_llm = FakeLLMProvider(answer_response={"answer": "about foo", "grounded": True})
+    await run_agent(db, agent_llm, "foo")
+
+    embedded_texts = [t for call in agent_llm.embed_calls for t in call]
+    assert embedded_texts.count("foo") == 1

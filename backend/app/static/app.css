@@ -21,6 +21,26 @@
 
 * { box-sizing: border-box; }
 
+.spinner {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-right: 0.5em;
+  vertical-align: -0.15em;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -164,6 +184,37 @@ button:hover { opacity: 0.9; }
 }
 .capture-row .capture-delete:hover { color: #d6336c; border-color: #d6336c; opacity: 1; }
 
+/* Files picked before saving (see initCreatePage()) -- accumulated
+   across possibly several picker interactions, shown so the user can
+   see and remove from the actual set that will be submitted. */
+.selected-files {
+  list-style: none;
+  padding: 0;
+  margin: 0.25rem 0 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.selected-file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+.selected-file button {
+  margin-top: 0;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.78rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.selected-file button:hover { color: #d6336c; border-color: #d6336c; opacity: 1; }
+
 .status-badge {
   display: inline-block;
   padding: 0.15rem 0.5rem;
@@ -177,3 +228,13 @@ button:hover { opacity: 0.9; }
 .status-badge-failed { color: #d6336c; border-color: #d6336c; }
 .status-badge-awaiting_clarification,
 .status-badge-processing { color: var(--accent); border-color: var(--accent); }
+
+/* The structurer's own progress (see docs/DECISIONS.md "The 'membase
+   structurer'") -- intentionally more muted than the status badges
+   above, since an "unstructured"/"structuring" unit is fully normal
+   and fully searchable, not something needing attention the way
+   "failed" does. */
+.structure-badge-structured { color: #2b8a3e; border-color: #2b8a3e; }
+.structure-badge-failed { color: #d6336c; border-color: #d6336c; }
+.structure-badge-unstructured,
+.structure-badge-structuring { color: var(--muted); border-color: var(--border); }

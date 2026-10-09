@@ -25,15 +25,16 @@ def get_engine():
             # blocking every later request that needs the same rows --
             # observed for real: a stuck connection blocked a later
             # UPDATE for 5+ minutes with no error or timeout anywhere.
-            # 450s is comfortably above the worst legitimate case: up to
-            # five sequential LLM calls can now happen in one ingestion
-            # transaction -- generate_questions, enrich()'s own three
-            # sub-calls (narrative/entities/retrieval-aids, see
-            # app/ingestion/enrichment.py), and embed -- each up to the
-            # configured llm_timeout_seconds (90s by default, see
-            # config.py) -- 5*90s=450s, so this should only ever fire for
-            # a genuinely stuck transaction, not a legitimately slow one.
-            connect_args={"options": "-c idle_in_transaction_session_timeout=450000"},
+            # The streamlined pipeline (see docs/DECISIONS.md "Collapse
+            # ingestion LLM calls") makes at most one LLM call
+            # (analyze_capture/reanalyze_unit) per open transaction --
+            # embedding runs separately, outside any transaction, via the
+            # processing-lease pattern (see _claim_processing). 180s is
+            # comfortably above that one call's llm_timeout_seconds (90s
+            # by default, see config.py) with margin, so this should only
+            # ever fire for a genuinely stuck transaction, not a
+            # legitimately slow one.
+            connect_args={"options": "-c idle_in_transaction_session_timeout=180000"},
         )
     return _engine
 
