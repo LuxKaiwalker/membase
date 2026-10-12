@@ -1,7 +1,5 @@
 import datetime as dt
 
-import pytest
-
 from app.models import MemoryUnit
 from app.retrieval import agent as agent_module
 from app.retrieval.agent import HIGH_CONFIDENCE_FUSED_SCORE, HIGH_CONFIDENCE_MARGIN, _is_high_confidence, automatic_search
@@ -55,7 +53,6 @@ def test_degraded_evidence_is_never_high_confidence_even_at_a_top_score():
     assert _is_high_confidence([_scored(0.99, enrichment_status="unavailable")]) is False
 
 
-@pytest.mark.asyncio
 async def test_automatic_search_skips_evaluate_call_when_high_confidence(db, monkeypatch):
     winner = _scored(0.95)
 
@@ -75,7 +72,6 @@ async def test_automatic_search_skips_evaluate_call_when_high_confidence(db, mon
     assert result.ranked == [winner]
 
 
-@pytest.mark.asyncio
 async def test_automatic_search_still_evaluates_when_not_high_confidence(db, monkeypatch):
     weak = _scored(0.3)
 

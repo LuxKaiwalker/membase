@@ -1,11 +1,9 @@
-import pytest
 
 from app.ingestion.pipeline import create_capture, finish_unit_processing, retry_enrichment
 from app.models import MemoryUnit
 from tests.helpers import create_capture_and_finish
 
 
-@pytest.mark.asyncio
 async def test_unexpected_enrichment_failure_marks_unit_failed_not_silently_ready(db, fake_llm, monkeypatch):
     """Two-phase commit guarantee (docs/ARCHITECTURE.md): authoritative_content
     is committed before derived processing runs, so an unexpected bug in
@@ -43,7 +41,6 @@ async def test_unexpected_enrichment_failure_marks_unit_failed_not_silently_read
     assert recovered.authoritative_content == "Authoritative content must survive a bug"
 
 
-@pytest.mark.asyncio
 async def test_retry_on_an_already_ready_unit_is_a_noop(db, fake_llm):
     """Regression for a race the status guard in api/units.py can't see:
     that guard reads status before calling retry_enrichment(), so it's
@@ -66,7 +63,6 @@ async def test_retry_on_an_already_ready_unit_is_a_noop(db, fake_llm):
     assert result.semantic == original_semantic
 
 
-@pytest.mark.asyncio
 async def test_capture_and_units_survive_a_fresh_session_lookup(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="Durable across a restart")
     unit_id = capture.units[0].id

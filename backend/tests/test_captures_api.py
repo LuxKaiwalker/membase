@@ -1,4 +1,3 @@
-import pytest
 
 from app.api.captures import create
 from tests.fakes import FakeLLMProvider
@@ -16,7 +15,6 @@ class _NoopTasks:
         pass
 
 
-@pytest.mark.asyncio
 async def test_disable_followup_questions_form_field_suppresses_clarification(db):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
 
@@ -28,7 +26,6 @@ async def test_disable_followup_questions_form_field_suppresses_clarification(db
     assert capture.units[0].status != "awaiting_clarification"
 
 
-@pytest.mark.asyncio
 async def test_followup_questions_enabled_by_default_via_api(db):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
 

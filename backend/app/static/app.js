@@ -25,7 +25,14 @@ const membase = (() => {
   function escapeHtml(str) {
     const div = document.createElement("div");
     div.textContent = str ?? "";
-    return div.innerHTML;
+    // The textContent/innerHTML round-trip escapes &, <, > but not
+    // quote characters -- fine for every current call site (plain
+    // text nodes, or a server-generated UUID in a data-* attribute),
+    // but the function's name promises general HTML-escaping safety,
+    // so cover quotes too rather than leave a latent attribute-
+    // injection trap for the next caller that uses this inside a
+    // "..."-delimited attribute with real user text.
+    return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   // Whether follow-up (clarification) questions must be answered is a
@@ -176,7 +183,12 @@ const membase = (() => {
     const deviceInput = document.getElementById("login-device-label");
     const errorEl = document.getElementById("login-error");
     const logoutButton = document.getElementById("logout-button");
-    if (!overlay || !form) return;
+    // All six are static siblings always rendered together in
+    // base.html -- checked together, consistently with how every
+    // other element access in this file degrades gracefully instead
+    // of throwing, rather than guarding only two of the six and
+    // dereferencing the rest unconditionally below.
+    if (!overlay || !form || !passwordInput || !deviceInput || !errorEl || !logoutButton) return;
 
     if (getToken()) {
       hideLoginOverlay();
@@ -202,8 +214,12 @@ const membase = (() => {
         }
         setToken(data.token);
         passwordInput.value = "";
-        hideLoginOverlay();
-        loadSessions();
+        // Reload rather than just hiding the overlay -- whatever page
+        // load already ran before login (create/recall/captures) may
+        // have 401'd and rendered an error with no token to retry
+        // with; a reload re-runs that page's init with the token now
+        // in place instead of leaving stale error text on screen.
+        window.location.reload();
       } catch (err) {
         errorEl.textContent = err.message || "Login failed.";
         show(errorEl);
@@ -212,19 +228,17 @@ const membase = (() => {
       }
     });
 
-    if (logoutButton) {
-      logoutButton.addEventListener("click", async () => {
-        try {
-          await fetchWithTimeout("/api/auth/logout", { method: "POST" });
-        } catch {
-          // Clear the local token regardless -- the point of logging
-          // out is that THIS browser stops acting authenticated, even
-          // if telling the server about it failed (e.g. offline).
-        }
-        clearToken();
-        showLoginOverlay();
-      });
-    }
+    logoutButton.addEventListener("click", async () => {
+      try {
+        await fetchWithTimeout("/api/auth/logout", { method: "POST" });
+      } catch {
+        // Clear the local token regardless -- the point of logging
+        // out is that THIS browser stops acting authenticated, even
+        // if telling the server about it failed (e.g. offline).
+      }
+      clearToken();
+      showLoginOverlay();
+    });
   }
 
   // Present in base.html on every page, so this runs unconditionally --
@@ -324,7 +338,18 @@ const membase = (() => {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      const err = new Error(data.detail ? JSON.stringify(data.detail) : `Request failed (${resp.status})`);
+      // A plain-string `detail` (the common FastAPI HTTPException
+      // shape) displays as-is; only a non-string shape (e.g. the
+      // list-of-dicts validation-error format) gets JSON.stringify'd --
+      // stringifying a plain string would wrap it in literal quote
+      // characters the user would see on screen.
+      const message =
+        typeof data.detail === "string"
+          ? data.detail
+          : data.detail
+            ? JSON.stringify(data.detail)
+            : `Request failed (${resp.status})`;
+      const err = new Error(message);
       // Marks this as "the server responded, just with an error status" --
       // distinct from a timeout or a connection that never got a response
       // at all. See describeError().

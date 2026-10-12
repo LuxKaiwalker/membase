@@ -9,6 +9,6 @@ set -euo pipefail
 export PGDATABASE=membase_eval
 export DATABASE_URL="postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST_DIR&port=$PGPORT"
 
-scripts/dev-db.sh start
-(cd backend && alembic upgrade head)
-python3 eval/benchmark_recall_latency.py
+"$MEMBASE_ROOT/scripts/dev-db.sh" start
+(cd "$MEMBASE_ROOT/backend" && alembic upgrade head)
+python3 "$MEMBASE_ROOT/eval/benchmark_recall_latency.py"

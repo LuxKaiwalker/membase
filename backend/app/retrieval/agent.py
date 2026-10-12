@@ -23,8 +23,10 @@ logger = logging.getLogger(__name__)
 # Bounded deterministic state machine (spec section 29), not a general
 # tool-calling agent framework: the loop itself is the orchestration, the
 # LLM only ever makes narrow structured decisions within it (sufficient?
-# what else to search?). 3 search rounds, up to 2 reformulated queries
-# per round -- hand-picked, not tuned; see docs/TODO.md. This is the
+# what else to search?). MAX_AGENT_ITERATIONS search rounds, up to
+# MAX_REFORMULATIONS_PER_ROUND reformulated queries per round (see the
+# streamlining note below for the current values and why) -- hand-picked,
+# not tuned; see docs/TODO.md. This is the
 # "automatic iteration" layer (spec section 9/20): fast, bounded,
 # no-user-interaction. app/retrieval/session.py wraps repeated calls to
 # automatic_search() in user-mediated rounds for the full iterative-recall

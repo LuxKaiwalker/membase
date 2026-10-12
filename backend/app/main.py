@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import auth as auth_api
 from app.api import captures, recall, units
 from app.auth import require_auth
+from app.llm import get_llm_provider
 from app.llm.base import LLMError
 from app.web import routes as web_routes
 
@@ -46,6 +47,18 @@ async def llm_error_handler(request: Request, exc: LLMError):
         status_code=503,
         content={"detail": "The local LLM is temporarily unavailable. Please try again."},
     )
+
+
+@app.on_event("shutdown")
+async def _close_llm_provider() -> None:
+    # get_llm_provider() is @lru_cache'd -- this closes the same
+    # singleton's httpx.AsyncClient connection pool the app has been
+    # using the whole time, rather than leaving it to the process exit
+    # to clean up. aclose() is OllamaProvider-specific, not part of
+    # the LLMProvider interface (a test double has no need for it).
+    aclose = getattr(get_llm_provider(), "aclose", None)
+    if aclose is not None:
+        await aclose()
 
 
 if __name__ == "__main__":

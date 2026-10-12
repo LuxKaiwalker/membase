@@ -135,10 +135,6 @@ class RecallSessionOut(BaseModel):
     updated_at: datetime
 
 
-class ErrorResponse(BaseModel):
-    detail: str
-
-
 class LoginRequest(BaseModel):
     password: str
     # e.g. "iPhone", "work laptop" -- purely a label shown back in the

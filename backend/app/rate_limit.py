@@ -11,8 +11,22 @@ one process to hold this state. A restart resets everyone's counters,
 which is an acceptable loosening of the limit, not a security hole.
 """
 
+import threading
 import time
 from collections import defaultdict
+
+# login() (app/api/auth.py) is a plain `def`, so FastAPI genuinely
+# thread-pools concurrent calls to it -- meaning the check-then-act
+# pattern below (read the counters, decide, then record) is a real
+# race across truly-simultaneous requests without this lock: several
+# concurrent callers could all pass a seconds_until_allowed() check
+# before any of them records, transiently exceeding the limit by up
+# to the concurrency level. login() holds this for its entire
+# rate-limit-sensitive section (both checks through recording the
+# outcome), serializing login attempts -- an acceptable cost given
+# this app's single-user, single-worker scope; the alternative (a
+# lock-free, truly concurrent limiter) isn't worth the complexity here.
+LOGIN_LOCK = threading.Lock()
 
 # 10 failed attempts per 15 minutes per source IP, then locked out
 # until the oldest failure in the window ages out. A single trusted
@@ -39,8 +53,19 @@ def seconds_until_allowed(key: str) -> float | None:
     """None if `key` may attempt a login right now; otherwise how many
     seconds until it may."""
     now = time.monotonic()
-    attempts = _failures[key]
+    # .get(), not _failures[key] -- a key that's never failed (the
+    # overwhelmingly common case: a legitimate device logging in, or a
+    # scanner that gets globally throttled first) should never gain a
+    # permanent dict entry just from being checked.
+    attempts = _failures.get(key)
+    if attempts is None:
+        return None
     attempts[:] = [t for t in attempts if now - t < _WINDOW_SECONDS]
+    if not attempts:
+        # Aged out completely -- drop the entry instead of leaving an
+        # empty list sitting in the dict forever.
+        del _failures[key]
+        return None
     if len(attempts) < _MAX_ATTEMPTS:
         return None
     return _WINDOW_SECONDS - (now - attempts[0])

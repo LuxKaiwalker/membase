@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.llm.base import LLMError, LLMProvider
-from app.models import AttachmentChunk, MemoryUnit
+from app.models import Attachment, AttachmentChunk, Capture, MemoryUnit
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +342,16 @@ async def hybrid_search_chunks(
         return []
 
     ranked_ids = sorted(relevant_ids, key=lambda cid: fused[cid][2], reverse=True)[:limit]
-    chunks = {c.id: c for c in db.query(AttachmentChunk).filter(AttachmentChunk.id.in_(ranked_ids)).all()}
+    # Eager-load attachment -> capture -> units: _format_chunk (below)
+    # walks that whole chain for every chunk, and without this each
+    # chunk would cost 2 extra lazy-loaded round-trips.
+    chunks = {
+        c.id: c
+        for c in db.query(AttachmentChunk)
+        .options(selectinload(AttachmentChunk.attachment).selectinload(Attachment.capture).selectinload(Capture.units))
+        .filter(AttachmentChunk.id.in_(ranked_ids))
+        .all()
+    }
     return [
         ScoredChunk(chunk=chunks[cid], vector_score=fused[cid][0], fts_score=fused[cid][1], fused_score=fused[cid][2])
         for cid in ranked_ids
@@ -364,6 +373,12 @@ def sibling_context(db: Session, primary: list[ScoredUnit]) -> list[MemoryUnit]:
         db.query(MemoryUnit)
         .filter(MemoryUnit.capture_id.in_(capture_ids), MemoryUnit.status == "ready")
         .filter(~MemoryUnit.id.in_(primary_ids))
+        # Deterministic order -- the loop below truncates to
+        # MAX_CONTEXT_PER_PRIMARY per capture, and without an ORDER BY
+        # Postgres gives no guarantee which siblings survive that
+        # truncation, making answer context non-deterministic across
+        # otherwise-identical calls.
+        .order_by(MemoryUnit.created_at)
         .all()
     )
 

@@ -3,7 +3,7 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
 from app.ingestion.pipeline import (
@@ -33,6 +33,12 @@ def _get_capture_or_404(db: Session, capture_id: uuid.UUID) -> Capture:
     return capture
 
 
+async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    """Files with no filename are browser artifacts from an empty file
+    input, not real uploads -- dropped rather than stored."""
+    return [(f.filename or "upload", await f.read()) for f in files if f.filename]
+
+
 @router.post("", response_model=CaptureOut, status_code=201)
 async def create(
     background_tasks: BackgroundTasks,
@@ -53,7 +59,7 @@ async def create(
     round-trip from this capture's storage cycle entirely -- see
     docs/DECISIONS.md "Disable follow-up questions".
     """
-    uploads = [(f.filename or "upload", await f.read()) for f in files if f.filename]
+    uploads = await _read_uploads(files)
     explicit_metadata = {}
     if metadata:
         try:
@@ -101,20 +107,24 @@ async def create(
 
 
 @router.get("", response_model=list[CaptureOut])
-async def list_captures(db: Session = Depends(get_db)):
+def list_captures(db: Session = Depends(get_db)):
     """Newest first, no pagination -- a single-user localhost MVP's
     capture volume doesn't warrant it yet (see docs/TODO.md)."""
-    captures = db.scalars(select(Capture).order_by(Capture.created_at.desc())).all()
+    captures = db.scalars(
+        select(Capture)
+        .options(selectinload(Capture.units), selectinload(Capture.attachments))
+        .order_by(Capture.created_at.desc())
+    ).all()
     return list(captures)
 
 
 @router.get("/{capture_id}", response_model=CaptureOut)
-async def get(capture_id: uuid.UUID, db: Session = Depends(get_db)):
+def get(capture_id: uuid.UUID, db: Session = Depends(get_db)):
     return _get_capture_or_404(db, capture_id)
 
 
 @router.delete("/{capture_id}", status_code=204)
-async def delete(capture_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete(capture_id: uuid.UUID, db: Session = Depends(get_db)):
     capture = _get_capture_or_404(db, capture_id)
     delete_capture(db, capture)
 
@@ -133,7 +143,7 @@ async def add_attachment_endpoint(
     reconcile.
     """
     capture = _get_capture_or_404(db, capture_id)
-    uploads = [(f.filename or "upload", await f.read()) for f in files if f.filename]
+    uploads = await _read_uploads(files)
     if not uploads:
         raise HTTPException(status_code=400, detail="No files provided")
     try:

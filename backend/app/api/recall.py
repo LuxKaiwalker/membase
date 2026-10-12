@@ -106,7 +106,7 @@ async def create_session(
 
 
 @router.get("/recall/sessions/{session_id}", response_model=RecallSessionOut)
-async def get_session(session_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_session(session_id: uuid.UUID, db: Session = Depends(get_db)):
     return _session_out(_get_session_or_404(db, session_id))
 
 
@@ -131,7 +131,7 @@ async def post_message(
 
 
 @router.post("/recall/sessions/{session_id}/cancel", response_model=RecallSessionOut)
-async def cancel(session_id: uuid.UUID, db: Session = Depends(get_db)):
+def cancel(session_id: uuid.UUID, db: Session = Depends(get_db)):
     session = _get_session_or_404(db, session_id)
     try:
         session = cancel_session(db, session)

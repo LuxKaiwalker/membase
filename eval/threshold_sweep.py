@@ -27,7 +27,7 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from _helpers import finish_processing  # noqa: E402
+from _helpers import assert_eval_database, finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.ingestion.pipeline import create_capture, resolve_clarification  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
@@ -97,6 +97,7 @@ async def score_threshold(db, llm, ingested: list[dict], threshold: float) -> tu
 async def main() -> int:
     cases = yaml.safe_load((Path(__file__).parent / "cases.yaml").read_text())
     db = get_sessionmaker()()
+    assert_eval_database(db)
     llm = get_llm_provider()
 
     db.execute(sql_text("TRUNCATE captures, memory_units, attachments, attachment_chunks"))

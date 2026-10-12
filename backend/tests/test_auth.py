@@ -47,7 +47,6 @@ def test_verify_password_rejects_anything_else():
     assert verify_password(_configured_password() + "x") is False
 
 
-@pytest.mark.asyncio
 async def test_login_with_correct_password_issues_a_usable_token(db):
     response = login(
         LoginRequest(password=_configured_password(), device_label="unit test"),
@@ -58,11 +57,10 @@ async def test_login_with_correct_password_issues_a_usable_token(db):
     assert response.token
     assert response.session.device_label == "unit test"
     # The returned token must actually authenticate.
-    token_row = await require_auth(db, _bearer(response.token))
+    token_row = require_auth(db, _bearer(response.token))
     assert token_row.id == response.session.id
 
 
-@pytest.mark.asyncio
 async def test_login_with_wrong_password_is_rejected(db):
     with pytest.raises(HTTPException) as exc_info:
         login(LoginRequest(password="definitely-wrong", device_label=""), _FakeRequest(), db)
@@ -153,41 +151,36 @@ def test_global_rate_limit_resets_after_its_window(db, monkeypatch):
     assert response.token
 
 
-@pytest.mark.asyncio
 async def test_require_auth_rejects_missing_credentials(db):
     with pytest.raises(HTTPException) as exc_info:
-        await require_auth(db, None)
+        require_auth(db, None)
     assert exc_info.value.status_code == 401
 
 
-@pytest.mark.asyncio
 async def test_require_auth_rejects_an_unknown_token(db):
     with pytest.raises(HTTPException) as exc_info:
-        await require_auth(db, _bearer("not-a-real-token"))
+        require_auth(db, _bearer("not-a-real-token"))
     assert exc_info.value.status_code == 401
 
 
-@pytest.mark.asyncio
 async def test_require_auth_rejects_a_revoked_token(db):
     raw_token, token = issue_token(db, "doomed device")
     logout(current=token, db=db)
 
     with pytest.raises(HTTPException) as exc_info:
-        await require_auth(db, _bearer(raw_token))
+        require_auth(db, _bearer(raw_token))
     assert exc_info.value.status_code == 401
 
 
-@pytest.mark.asyncio
 async def test_require_auth_updates_last_used_at(db):
     raw_token, token = issue_token(db, "my phone")
     assert token.last_used_at is None
 
-    await require_auth(db, _bearer(raw_token))
+    require_auth(db, _bearer(raw_token))
     db.refresh(token)
     assert token.last_used_at is not None
 
 
-@pytest.mark.asyncio
 async def test_logout_revokes_only_the_current_token(db):
     _raw_a, token_a = issue_token(db, "device a")
     raw_b, token_b = issue_token(db, "device b")
@@ -197,10 +190,9 @@ async def test_logout_revokes_only_the_current_token(db):
     assert token_a.revoked_at is not None
     assert token_b.revoked_at is None
     # device b's token still works.
-    await require_auth(db, _bearer(raw_b))
+    require_auth(db, _bearer(raw_b))
 
 
-@pytest.mark.asyncio
 async def test_list_sessions_excludes_revoked_tokens(db):
     _raw_a, token_a = issue_token(db, "kept")
     raw_b, token_b = issue_token(db, "revoked")
@@ -213,7 +205,6 @@ async def test_list_sessions_excludes_revoked_tokens(db):
     assert "revoked" not in labels
 
 
-@pytest.mark.asyncio
 async def test_revoke_session_by_id(db):
     _raw_a, token_a = issue_token(db, "caller")
     _raw_b, token_b = issue_token(db, "target")
@@ -224,7 +215,6 @@ async def test_revoke_session_by_id(db):
     assert token_b.revoked_at is not None
 
 
-@pytest.mark.asyncio
 async def test_revoke_session_rejects_an_already_revoked_or_unknown_id(db):
     import uuid
 

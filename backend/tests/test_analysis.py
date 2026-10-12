@@ -1,4 +1,3 @@
-import pytest
 
 from app.ingestion.analysis import (
     MAX_ANALYSIS_CHARS_PER_CALL,
@@ -21,7 +20,6 @@ from tests.fakes import FakeLLMProvider
 # against the new unified module.
 
 
-@pytest.mark.asyncio
 async def test_no_split_by_default(fake_llm):
     text = "An atomic fact about one thing."
     units = await analyze_capture(fake_llm, text)
@@ -29,7 +27,6 @@ async def test_no_split_by_default(fake_llm):
     assert units[0].content == text
 
 
-@pytest.mark.asyncio
 async def test_model_proposed_split_is_honored_when_verbatim():
     text = "Fact A. Fact B. Fact C."
     llm = FakeLLMProvider(
@@ -45,7 +42,6 @@ async def test_model_proposed_split_is_honored_when_verbatim():
     assert [u.content for u in units] == ["Fact A.", "Fact B.", "Fact C."]
 
 
-@pytest.mark.asyncio
 async def test_non_verbatim_unit_falls_back_to_sentence_split():
     """A non-verbatim proposal degrades to a deterministic *sentence*
     split, not one giant blob covering the whole text -- see
@@ -75,7 +71,6 @@ def test_word_boundary_violating_candidate_rejected_as_non_verbatim():
     assert is_verbatim("dog ate food", "my dog ate food happily")
 
 
-@pytest.mark.asyncio
 async def test_word_boundary_violating_unit_rejected_end_to_end():
     text = "my dog ate food happily"
     llm = FakeLLMProvider(segmentation_response={"units": [{"content": "y dog ate foo"}]})
@@ -84,7 +79,6 @@ async def test_word_boundary_violating_unit_rejected_end_to_end():
     assert units[0].content == text
 
 
-@pytest.mark.asyncio
 async def test_analysis_unavailable_falls_back_to_whole_text():
     text = "Some memory text."
     llm = FakeLLMProvider(fail="unavailable")
@@ -94,7 +88,6 @@ async def test_analysis_unavailable_falls_back_to_whole_text():
     assert units[0].semantic["enrichment_status"] == "unavailable"
 
 
-@pytest.mark.asyncio
 async def test_too_many_units_capped_at_max():
     words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
     text = " ".join(words)
@@ -103,7 +96,6 @@ async def test_too_many_units_capped_at_max():
     assert len(units) <= MAX_SEGMENT_UNITS
 
 
-@pytest.mark.asyncio
 async def test_coherent_compound_memory_stays_one_unit_end_to_end(db):
     llm = FakeLLMProvider(
         segmentation_response={
@@ -116,7 +108,6 @@ async def test_coherent_compound_memory_stays_one_unit_end_to_end(db):
     assert len(capture.units) == 1
 
 
-@pytest.mark.asyncio
 async def test_multiple_unrelated_facts_become_multiple_units_end_to_end(db):
     llm = FakeLLMProvider(
         segmentation_response={
@@ -133,7 +124,6 @@ async def test_multiple_unrelated_facts_become_multiple_units_end_to_end(db):
     assert capture.units[0].authoritative_content != capture.units[1].authoritative_content
 
 
-@pytest.mark.asyncio
 async def test_analyze_capture_degrades_to_unavailable_on_llm_failure():
     llm = FakeLLMProvider(fail="unavailable")
     units = await analyze_capture(llm, "Some memory text.")
@@ -141,7 +131,6 @@ async def test_analyze_capture_degrades_to_unavailable_on_llm_failure():
     assert units[0].semantic["meaning"] == ""
 
 
-@pytest.mark.asyncio
 async def test_analyze_capture_filters_malformed_definitions_and_relations():
     llm = FakeLLMProvider(
         enrichment_response={
@@ -161,7 +150,6 @@ async def test_analyze_capture_filters_malformed_definitions_and_relations():
     assert units[0].semantic["relations"] == [{"subject": "I", "predicate": "met", "object": "Anna"}]
 
 
-@pytest.mark.asyncio
 async def test_literal_null_string_from_model_is_treated_as_empty():
     """Observed for real against the production model: for an unset
     field it sometimes emits the literal string "null" instead of ""
@@ -213,7 +201,6 @@ class _PromptCapturingLLM(LLMProvider):
         return 1
 
 
-@pytest.mark.asyncio
 async def test_analyze_capture_includes_attachment_text_in_prompt():
     llm = _PromptCapturingLLM({"units": [{"content": "I like shoes of this colour."}]})
     await analyze_capture(llm, "I like shoes of this colour.", "a photograph of a red running shoe")
@@ -221,21 +208,18 @@ async def test_analyze_capture_includes_attachment_text_in_prompt():
     assert "a photograph of a red running shoe" in llm.prompts[0]
 
 
-@pytest.mark.asyncio
 async def test_analyze_capture_includes_prior_context_in_prompt():
     llm = _PromptCapturingLLM({"units": [{"content": "Made progress on Foobar today."}]})
     await analyze_capture(llm, "Made progress on Foobar today.", prior_context=["Project Foobar refers to the new API migration."])
     assert "Project Foobar refers to the new API migration." in llm.prompts[0]
 
 
-@pytest.mark.asyncio
 async def test_reanalyze_unit_degrades_to_unavailable_on_llm_failure():
     llm = FakeLLMProvider(fail="unavailable")
     result = await reanalyze_unit(llm, "Some memory text.", [], "")
     assert result.semantic["enrichment_status"] == "unavailable"
 
 
-@pytest.mark.asyncio
 async def test_reanalyze_unit_includes_clarification_history_in_prompt():
     llm = _PromptCapturingLLM({"meaning": "x"})
     await reanalyze_unit(
@@ -290,7 +274,6 @@ def test_build_retrieval_text_includes_clarifications():
 _MANY_SENTENCES = " ".join(f"Fact number {i} is independently true and stands on its own." for i in range(20))
 
 
-@pytest.mark.asyncio
 async def test_short_capture_is_still_exactly_one_call(fake_llm):
     """Ordinary short captures must be completely unaffected by
     chunking -- same single call as before."""
@@ -300,7 +283,6 @@ async def test_short_capture_is_still_exactly_one_call(fake_llm):
     assert fake_llm.calls.count("analyze_capture") == 1
 
 
-@pytest.mark.asyncio
 async def test_long_capture_is_split_into_multiple_calls(fake_llm):
     assert len(_MANY_SENTENCES) > MAX_ANALYSIS_CHARS_PER_CALL
     units = await analyze_capture(fake_llm, _MANY_SENTENCES)
@@ -311,7 +293,6 @@ async def test_long_capture_is_split_into_multiple_calls(fake_llm):
     assert len(units) <= MAX_SEGMENT_UNITS
 
 
-@pytest.mark.asyncio
 async def test_total_llm_outage_on_a_long_capture_degrades_per_sentence_not_to_one_blob():
     """The bug this fixes: a long capture whose analysis call(s) fail
     entirely must NOT collapse into one giant empty-semantics unit --
@@ -325,7 +306,6 @@ async def test_total_llm_outage_on_a_long_capture_degrades_per_sentence_not_to_o
         assert u.content in _MANY_SENTENCES
 
 
-@pytest.mark.asyncio
 async def test_malformed_output_on_a_long_capture_degrades_per_sentence_not_to_one_blob():
     """Same guarantee as above, for the specific failure mode observed
     live: the model's JSON came back truncated/invalid (not a
@@ -338,7 +318,6 @@ async def test_malformed_output_on_a_long_capture_degrades_per_sentence_not_to_o
         assert u.content in _MANY_SENTENCES
 
 
-@pytest.mark.asyncio
 async def test_a_single_chunks_failure_does_not_affect_other_chunks(fake_llm):
     """Chunking also bounds the blast radius of a failure: only the
     chunk whose own call failed degrades, the rest keep their real

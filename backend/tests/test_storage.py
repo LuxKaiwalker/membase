@@ -5,7 +5,6 @@ from app.models import Capture
 from tests.helpers import create_capture_and_finish
 
 
-@pytest.mark.asyncio
 async def test_create_capture_persists(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="Test memory")
     assert capture.id is not None
@@ -21,13 +20,11 @@ async def test_create_capture_persists(db, fake_llm):
     assert fetched.units[0].status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_create_capture_rejects_empty_text(db, fake_llm):
     with pytest.raises(IngestionError):
         await create_capture(db, fake_llm, text="   ", uploads=[])
 
 
-@pytest.mark.asyncio
 async def test_attachment_persists_on_capture(db, fake_llm):
     capture = await create_capture_and_finish(
         db, fake_llm, text="Has an attachment", uploads=[("notes.txt", b"hello world")]
@@ -38,7 +35,6 @@ async def test_attachment_persists_on_capture(db, fake_llm):
     assert "hello world" in capture.units[0].searchable_text
 
 
-@pytest.mark.asyncio
 async def test_create_capture_rejects_unsupported_file(db, fake_llm):
     with pytest.raises(IngestionError):
         await create_capture(
@@ -49,7 +45,6 @@ async def test_create_capture_rejects_unsupported_file(db, fake_llm):
         )
 
 
-@pytest.mark.asyncio
 async def test_create_capture_rejects_empty_file(db, fake_llm):
     with pytest.raises(IngestionError):
         await create_capture(db, fake_llm, text="empty file", uploads=[("empty.txt", b"")])

@@ -13,21 +13,18 @@ from tests.helpers import create_capture_and_finish
 # arbitrarily large body. These tests lock in the fix.
 
 
-@pytest.mark.asyncio
 async def test_capture_text_over_limit_is_rejected(db, fake_llm):
     max_chars = get_settings().membase_max_text_chars
     with pytest.raises(IngestionError):
         await create_capture(db, fake_llm, text="x" * (max_chars + 1), uploads=[])
 
 
-@pytest.mark.asyncio
 async def test_capture_text_at_limit_is_accepted(db, fake_llm):
     max_chars = get_settings().membase_max_text_chars
     capture = await create_capture(db, fake_llm, text="x" * max_chars, uploads=[])
     assert capture.units
 
 
-@pytest.mark.asyncio
 async def test_correction_over_limit_is_rejected(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="A short memory.", uploads=[])
     unit = capture.units[0]
@@ -36,7 +33,6 @@ async def test_correction_over_limit_is_rejected(db, fake_llm):
         await correct_unit(db, fake_llm, unit, "x" * (max_chars + 1))
 
 
-@pytest.mark.asyncio
 async def test_clarification_answer_over_limit_is_rejected(db):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
     capture = await create_capture(db, llm, text="My Flimvex PIN is 42.", uploads=[])
@@ -46,14 +42,12 @@ async def test_clarification_answer_over_limit_is_rejected(db):
         await resolve_clarification(db, llm, unit, "x" * (max_chars + 1))
 
 
-@pytest.mark.asyncio
 async def test_recall_query_over_limit_is_rejected(db, fake_llm):
     max_chars = get_settings().membase_max_text_chars
     with pytest.raises(RecallSessionError):
         await start_session(db, fake_llm, "x" * (max_chars + 1))
 
 
-@pytest.mark.asyncio
 async def test_recall_session_message_over_limit_is_rejected(db, fake_llm):
     session = await start_session(db, fake_llm, "something I can't quite recall")
     max_chars = get_settings().membase_max_text_chars

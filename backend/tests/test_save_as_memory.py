@@ -14,7 +14,6 @@ from app.schemas import SaveAsMemoryRequest
 # never bypass it.
 
 
-@pytest.mark.asyncio
 async def test_saving_a_users_own_message_creates_a_normal_capture(db, fake_llm):
     session = await start_session(db, fake_llm, "something I can't quite recall")
 
@@ -27,7 +26,6 @@ async def test_saving_a_users_own_message_creates_a_normal_capture(db, fake_llm)
     assert db.query(Capture).filter(Capture.id == capture.id).count() == 1
 
 
-@pytest.mark.asyncio
 async def test_saving_a_cue_the_user_supplied_mid_session_creates_a_normal_capture(db, fake_llm):
     """Session-round mechanics (how a cue ends up on session.cues) are
     already covered by test_recall_session.py -- this only needs a cue
@@ -46,7 +44,6 @@ async def test_saving_a_cue_the_user_supplied_mid_session_creates_a_normal_captu
     assert capture.raw_text == "It was Markus, not Anna"
 
 
-@pytest.mark.asyncio
 async def test_arbitrary_text_not_said_in_the_session_is_rejected(db, fake_llm):
     session = await start_session(db, fake_llm, "something I can't quite recall")
 

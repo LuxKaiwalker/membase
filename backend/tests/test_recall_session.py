@@ -101,7 +101,6 @@ async def _make_two_candidates(db) -> tuple[MemoryUnit, MemoryUnit]:
     return cap_a.units[0], cap_b.units[0]
 
 
-@pytest.mark.asyncio
 async def test_ambiguous_candidates_prompt_then_resolve(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
 
@@ -141,7 +140,6 @@ async def test_ambiguous_candidates_prompt_then_resolve(db, monkeypatch):
     assert db.query(MemoryUnit).count() == 2
 
 
-@pytest.mark.asyncio
 async def test_negative_cue_excludes_candidate(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
 
@@ -174,7 +172,6 @@ async def test_negative_cue_excludes_candidate(db, monkeypatch):
     assert any(c["text"] == "Anna" and c["polarity"] == "negative" for c in session.cues)
 
 
-@pytest.mark.asyncio
 async def test_uncertain_cue_is_search_signal_not_hard_filter(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
     ambiguous = AutomaticSearchResult(
@@ -206,7 +203,6 @@ async def test_uncertain_cue_is_search_signal_not_hard_filter(db, monkeypatch):
     assert before == 2  # nothing about this ever created/altered a memory
 
 
-@pytest.mark.asyncio
 async def test_hypotheses_recorded_but_never_become_memory(db, monkeypatch):
     unit_a, _unit_b = await _make_two_candidates(db)
     result = AutomaticSearchResult(
@@ -226,7 +222,6 @@ async def test_hypotheses_recorded_but_never_become_memory(db, monkeypatch):
     assert db.query(MemoryUnit).count() == before  # hypothesis never persisted as a memory
 
 
-@pytest.mark.asyncio
 async def test_exhausted_when_nothing_found(db, monkeypatch):
     empty = AutomaticSearchResult(ranked=[], ranked_chunks=[], tried_queries=set(), hypotheses=[])
     _patch_rounds(monkeypatch, [empty])
@@ -238,7 +233,6 @@ async def test_exhausted_when_nothing_found(db, monkeypatch):
     assert session.final_answer is None
 
 
-@pytest.mark.asyncio
 async def test_cancel_then_reject_continue(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
     ambiguous = AutomaticSearchResult(
@@ -259,7 +253,6 @@ async def test_cancel_then_reject_continue(db, monkeypatch):
         cancel_session(db, session)
 
 
-@pytest.mark.asyncio
 async def test_original_query_preserved_across_rounds(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
     ambiguous = AutomaticSearchResult(
@@ -286,7 +279,6 @@ async def test_original_query_preserved_across_rounds(db, monkeypatch):
     assert session.status == STATUS_NEEDS_USER_CUE
 
 
-@pytest.mark.asyncio
 async def test_avoids_repeating_the_same_discriminating_question(db, monkeypatch):
     unit_a, unit_b = await _make_two_candidates(db)
     ambiguous = AutomaticSearchResult(
@@ -323,7 +315,14 @@ def test_discriminate_ambiguity_and_question_are_pure_heuristics():
 
     q = generate_discriminating_question([a, b], already_asked=[])
     assert q is not None and ("Anna" in q or "ETH" in q or "Markus" in q or "Paris" in q)
-    assert generate_discriminating_question([a, b], already_asked=[q]) is not None or True
+
+    # Excluding q still leaves 3 other equally-distinguishing attributes
+    # (the other three terms) -- this must return a *different*,
+    # still-valid question, not None and not a repeat of q.
+    q2 = generate_discriminating_question([a, b], already_asked=[q])
+    assert q2 is not None
+    assert q2 != q
+    assert "Anna" in q2 or "ETH" in q2 or "Markus" in q2 or "Paris" in q2
 
     filtered = apply_negative_cues([a, b], ["Anna"])
     assert [s for s in filtered] == [b]
@@ -336,7 +335,6 @@ def test_discriminate_ambiguity_and_question_are_pure_heuristics():
     assert apply_positive_cue_boost([a, b], []) == [a, b]
 
 
-@pytest.mark.asyncio
 async def test_cue_extraction_degrades_on_malformed_llm_output():
     from app.retrieval.cues import extract_cues
 
@@ -345,7 +343,6 @@ async def test_cue_extraction_degrades_on_malformed_llm_output():
     assert cues == [{"text": "it was definitely at ETH", "confidence": "uncertain", "polarity": "positive"}]
 
 
-@pytest.mark.asyncio
 async def test_session_state_reloadable_from_db(db, monkeypatch):
     """Simulates surviving a restart: a fresh query for the same row by
     id must see the same persisted state (spec section 27/J)."""

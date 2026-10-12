@@ -6,7 +6,6 @@ from tests.fakes import FakeLLMProvider
 from tests.helpers import create_capture_and_finish
 
 
-@pytest.mark.asyncio
 async def test_delete_capture_removes_row_and_file(db, fake_llm, tmp_path, monkeypatch):
     from app import config as config_module
 
@@ -21,7 +20,6 @@ async def test_delete_capture_removes_row_and_file(db, fake_llm, tmp_path, monke
     assert not capture_dir.exists()
 
 
-@pytest.mark.asyncio
 async def test_correction_updates_semantic_representation(db):
     # Two separate LLM instances (one for the initial analyze_capture
     # call, one for correct_unit's reanalyze_unit call) keep this test's
@@ -64,7 +62,6 @@ async def test_correction_updates_semantic_representation(db):
     assert corrected.clarification_round == 0
 
 
-@pytest.mark.asyncio
 async def test_correction_rejects_empty_text(db, fake_llm):
     capture = await create_capture(db, fake_llm, text="Something.", uploads=[])
     from app.ingestion.pipeline import IngestionError

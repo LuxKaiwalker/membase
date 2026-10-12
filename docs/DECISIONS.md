@@ -1718,3 +1718,162 @@ component -- a reverse proxy that doesn't forward the real client IP
 guard either useless or overly broad; out of scope for a single-user,
 `127.0.0.1`-bound deployment. No alerting/logging on repeated
 lockouts beyond the 429 response itself.
+
+---
+
+## Full-codebase audit and fix pass
+
+**Decision:** User requested an in-depth audit of the entire codebase
+for bugs, engineering quality, and structural cleanliness, then asked
+to fix everything relevant and reach a state safe to deploy. Five
+parallel audits covered `app/ingestion/`, `app/retrieval/`, the API/
+models/LLM layer, the frontend (`app.js`/`app.css`/`base.html`), and
+`tests/`/`scripts/`/migrations; a sixth covered `eval/` and
+`scripts/reembed.py`. 27 findings came back from the first five, plus
+one more (the eval database-isolation guard, below) from the sixth.
+Nearly all were fixed in this same pass; what follows groups them by
+theme. Two were deliberately deferred (see "Not done").
+
+**Fixed -- correctness bugs with a real, live failure mode:**
+- The login overlay (`app/static/app.css`) could never actually be
+  hidden: `.hidden { display: none }` and `.login-overlay { display:
+  flex }` had identical specificity, and source order favored
+  `.login-overlay`, so every page load left the full-viewport overlay
+  on screen regardless of auth state. This had already shipped and
+  was never caught because the earlier verification of that feature
+  was curl + `node --check` only (no real browser available that
+  session). Fixed with a two-class `.login-overlay.hidden` rule, which
+  reliably wins the cascade regardless of source order.
+- `/api/auth/login`'s rate limiter (`app/rate_limit.py`) had a real
+  TOCTOU race: `login()` is a plain `def`, so FastAPI genuinely
+  thread-pools concurrent calls to it, and the check-then-record
+  sequence for both the global and per-IP counters was unsynchronized.
+  Fixed with `rate_limit.LOGIN_LOCK`, a `threading.Lock` held across
+  the whole check-verify-record sequence in `login()` -- serializing
+  login attempts, an acceptable cost given this app's single-user,
+  single-worker scope.
+- The login overlay's success handler never re-ran whatever page-level
+  data fetch had already 401'd before login, leaving stale error text
+  on screen. Fixed by reloading the page on successful login instead
+  of just hiding the overlay.
+- `discriminate.py`'s cue-matching substring fallback (`_matches_cue`)
+  had no word-boundary awareness, so a short cue like "Ann" could match
+  inside unrelated words ("annual", "banner"). Fixed with a
+  `\b`-bounded regex.
+- `sibling_context()` (`app/retrieval/pipeline.py`) queried a capture's
+  sibling units with no `ORDER BY` before truncating to
+  `MAX_CONTEXT_PER_PRIMARY`, making which siblings survive the
+  truncation non-deterministic. Fixed with `.order_by(MemoryUnit.created_at)`.
+- `_CANDIDATE_TERM_RE` (`app/ingestion/pipeline.py`) only matched ASCII
+  letters, so related-context lookup silently found nothing for
+  capitalized names with accented characters ("Zürich", "Müller",
+  "François"). Fixed with a Unicode-aware character class
+  (`[^\W\d_]`) plus a post-match uppercase-start check in Python
+  (stdlib `re` has no portable Unicode-uppercase character class).
+- `finish_image_captioning`, `finish_attachment_chunking`, and
+  `_finalize_structuring` had no catch-all for unexpected (non-
+  `LLMError`) exceptions, unlike `_finalize_unit`'s existing pattern --
+  e.g. a missing file on disk would crash the background task silently
+  with no record anywhere, and for structuring specifically, leave the
+  unit's `structure_token` lease stuck forever. All three now log and,
+  where there's a lease to release (`_finalize_structuring`), mark it
+  `"failed"`, mirroring `_finalize_unit`.
+- Two test assertions couldn't actually fail regardless of the real
+  outcome: `test_backfill.py`'s `"stale / " in result.stdout` fallback
+  (satisfied by `"0 stale / 1 total"` too) and
+  `test_recall_session.py`'s `... is not None or True`. Both now assert
+  on the exact expected string/behavior.
+
+**Fixed -- a real data-safety gap in developer tooling (`eval/`):**
+- None of the six eval/benchmark entry points (`eval/run_eval.py`,
+  `run_session_eval.py`, `threshold_sweep.py`,
+  `benchmark_recall_latency.py`, `run_interactive_benchmark.py`,
+  `trace_interactive_benchmark.py`) verified they were actually
+  connected to the isolated `membase_eval` database before running
+  `TRUNCATE captures, memory_units, ...` -- that isolation was enforced
+  *only* by the wrapping `scripts/*.sh` exporting `PGDATABASE`/
+  `DATABASE_URL` first. Running any of these directly (e.g. `python3
+  eval/run_eval.py` from inside `nix develop`, by habit or an IDE "Run"
+  button) would silently truncate and overwrite real stored captures/
+  memory units, with no recovery path given `.data/` has no separate
+  backup anywhere in this project. Fixed with
+  `eval/_helpers.py`'s `assert_eval_database(db)`, which checks `SELECT
+  current_database()` on the live connection itself (not an env var
+  that could diverge from it) and refuses to run otherwise. Called at
+  the top of every entry point's `main()`, right after the DB session
+  opens.
+
+**Fixed -- blocking sync DB calls on the event loop:**
+`require_auth` (`app/auth.py`, run on every authenticated request),
+`discard_unit` (`app/ingestion/pipeline.py`), and the pure-lookup
+routes with no real `await` inside (`units.get`, `captures.list_captures`/
+`get`/`delete`, `recall.get_session`/`cancel`) were all `async def` with
+synchronous SQLAlchemy calls and nothing to actually await -- meaning
+FastAPI ran their blocking DB work directly on the event-loop thread
+instead of off-loading it to the thread pool, stalling every other
+concurrent request (including a second device's request -- the exact
+multi-device use case the auth system was built for) for the duration.
+Converted all of them to plain `def`, which FastAPI thread-pools
+correctly, matching the pattern `app/api/auth.py`'s own routes already
+used. `GET /api/captures` was also missing eager-loading on its
+`units`/`attachments` relationships (N+1: ~1001 queries for 500
+captures instead of 3) and `_format_chunk`'s `chunk.attachment.capture.units`
+traversal had the same problem for up to `TOP_K_FOR_ANSWER` chunks per
+answer -- both fixed with `selectinload()`.
+
+**Fixed -- smaller cleanliness items:** removed the never-called
+duplicate upload-filename-filtering comprehension in `captures.py`
+(now a shared `_read_uploads()`); removed dead `ErrorResponse` schema;
+added a FastAPI shutdown hook that closes `OllamaProvider`'s
+`httpx.AsyncClient` pool (`aclose()` existed but nothing called it);
+fixed a stale module docstring in `agent.py` that still claimed "3
+search rounds, up to 2 reformulated queries" after the streamlining
+pass had already changed those constants to 2/1; batched
+`_refresh_ready_units_with_attachment_excerpt`'s N sequential
+`llm.embed()` calls (one per ready sibling) into one call across all
+siblings, consistent with the rest of this codebase's LLM-call-count
+discipline; fixed `postJSON` (`app.js`) wrapping a plain-string error
+`detail` in literal quote characters; made `escapeHtml` also escape
+quote characters, closing a latent attribute-injection trap for any
+future caller (no current call site was exploitable); made
+`initAuth()`'s element-presence check cover all six elements it
+touches, not just two, consistent with every other element access in
+the file degrading gracefully instead of throwing; fixed
+`scripts/run-eval.sh`/`run-session-eval.sh`/`sweep-threshold.sh`/
+`benchmark-recall-latency.sh`/`run-interactive-benchmark.sh` resolving
+`backend/`/`eval/` relative to cwd instead of `$MEMBASE_ROOT` (the
+exact footgun CLAUDE.md #7 documents, already fixed in
+`run-dev.sh`/`run-prod.sh` but not propagated to these); removed 138
+now-redundant `@pytest.mark.asyncio` decorators across the test suite
+(`pyproject.toml` already sets `asyncio_mode = "auto"`, making the
+marker a no-op) and the resulting 13 unused `import pytest` lines;
+fixed `scripts/dev-db.sh` interpolating `$PGDATABASE` unescaped into a
+SQL string (now doubles embedded single quotes, standard SQL-literal
+escaping -- not exploitable today since the value comes from the
+flake's own trusted env, but worth doing right; psql's `:'var'`
+substitution looked like the more obvious fix but does not apply to
+`-c` command strings, confirmed by testing it directly).
+
+**Not done, deliberately deferred:**
+- The remaining async routes that genuinely `await` real LLM work
+  (`create`, `clarify`, `retry`, `correct`, etc.) still interleave
+  blocking sync SQLAlchemy calls with those awaits. Fully correct
+  async behavior would mean either migrating to SQLAlchemy's async
+  engine or wrapping every blocking DB call in
+  `run_in_threadpool`/`anyio.to_thread` -- both substantial, risky
+  refactors touching most of `app/ingestion/` and `app/retrieval/`.
+  Given this app's single-worker, single-user, localhost-Postgres
+  scope (sub-millisecond query latency in practice), the cost/risk of
+  that refactor isn't justified by this pass's "fix and ship safely"
+  goal; the highest-value instance (`require_auth`, on every request)
+  and every trivially-fixable pure-sync route were already converted
+  above. Revisit if this app ever needs to serve more than one
+  concurrent user meaningfully.
+- Two low-severity duplication findings were reviewed and left as-is
+  rather than risk introducing a subtle bug under time pressure:
+  the ~6-line "embed, set fields, log-and-skip on LLMError" pattern
+  repeated across 4 call sites in `app/ingestion/pipeline.py`, and
+  `structurer.py` hand-redefining the same semantic-fields JSON schema
+  `analysis.py` already defines instead of deriving from it. Both are
+  real but cosmetic; revisit opportunistically next time either file
+  is touched for an unrelated reason.

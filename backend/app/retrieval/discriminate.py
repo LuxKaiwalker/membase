@@ -1,3 +1,4 @@
+import re
 import uuid
 
 from app.retrieval.pipeline import ScoredUnit
@@ -130,7 +131,12 @@ def _matches_cue(unit, cue_lower: str) -> bool:
         return True
     if len(cue_lower) < 3:
         return False
-    return cue_lower in (getattr(unit, "retrieval_text", "") or "").lower()
+    # Word-boundary match, not a raw substring check -- a plain `in`
+    # here would let a short cue like "Ann" match inside unrelated
+    # words ("annual", "banner"), wrongly including or excluding
+    # candidates that have nothing to do with the cued entity.
+    text = (getattr(unit, "retrieval_text", "") or "").lower()
+    return re.search(rf"\b{re.escape(cue_lower)}\b", text) is not None
 
 
 def apply_negative_cues(ranked: list[ScoredUnit], negative_cue_texts: list[str]) -> list[ScoredUnit]:

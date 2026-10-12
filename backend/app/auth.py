@@ -83,7 +83,7 @@ def issue_token(db: Session, device_label: str) -> tuple[str, AuthToken]:
     return raw_token, token
 
 
-async def require_auth(
+def require_auth(
     db: Session = Depends(get_db),
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> AuthToken:
@@ -92,6 +92,15 @@ async def require_auth(
     AuthToken row (not just None/True) so a caller that wants to know
     *which* device made this request can -- nothing currently does, but
     the shape costs nothing and avoids a second lookup if that changes.
+
+    Plain `def`, not `async def`, on purpose: this runs on every single
+    authenticated request and does nothing but synchronous DB work --
+    declaring it async with no `await` inside would make FastAPI run
+    that blocking work directly on the event-loop thread instead of
+    off-loading it to the thread pool, stalling every other concurrent
+    request (including, notably, a second device's request -- the exact
+    multi-device use case this auth system was built for) for the
+    duration of this function's DB round-trips.
     """
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Not authenticated")

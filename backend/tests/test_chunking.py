@@ -62,7 +62,6 @@ def no_min_chunk_chars(monkeypatch):
     monkeypatch.setattr(config_module.get_settings(), "membase_min_chars_for_chunking", 0)
 
 
-@pytest.mark.asyncio
 async def test_chunks_are_created_and_embedded_on_ingestion(db, fake_llm, no_min_chunk_chars):
     """Chunk-indexing is backgrounded (see docs/DECISIONS.md "offloading
     to background processing") -- create_capture_and_finish() drives it
@@ -77,7 +76,6 @@ async def test_chunks_are_created_and_embedded_on_ingestion(db, fake_llm, no_min
     assert "launch date" in chunks[0].text
 
 
-@pytest.mark.asyncio
 async def test_chunks_are_searchable_via_hybrid_search_chunks(db, fake_llm, no_min_chunk_chars):
     # Chunks only clear the same status gate memory_units do (see
     # test_chunk_search_is_gated_until_a_sibling_unit_is_ready below) --
@@ -90,7 +88,6 @@ async def test_chunks_are_searchable_via_hybrid_search_chunks(db, fake_llm, no_m
     assert scored[0].chunk.attachment.capture_id == capture.id
 
 
-@pytest.mark.asyncio
 async def test_chunk_search_is_gated_until_a_sibling_unit_is_ready(db, no_min_chunk_chars):
     """Attachment chunks have no status column of their own -- they're
     indexed as soon as the attachment is uploaded, before segmentation or
@@ -119,7 +116,6 @@ async def test_chunk_search_is_gated_until_a_sibling_unit_is_ready(db, no_min_ch
     assert scored == [], "a chunk must not be searchable while every sibling unit is still gated"
 
 
-@pytest.mark.asyncio
 async def test_posthoc_attachment_chunks_are_also_indexed(db, fake_llm, no_min_chunk_chars):
     capture = await create_capture(db, fake_llm, text="Meeting notes.", uploads=[])
     capture = await add_attachment(db, fake_llm, capture, "later.txt", b"the budget is 50000 dollars")
@@ -128,7 +124,6 @@ async def test_posthoc_attachment_chunks_are_also_indexed(db, fake_llm, no_min_c
     assert chunks[0].embedding is not None
 
 
-@pytest.mark.asyncio
 async def test_multiple_files_can_be_attached_in_one_call(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="Meeting notes.", uploads=[])
 
@@ -141,7 +136,6 @@ async def test_multiple_files_can_be_attached_in_one_call(db, fake_llm):
     assert db.query(Attachment).filter(Attachment.capture_id == capture.id).count() == 3
 
 
-@pytest.mark.asyncio
 async def test_multiple_files_only_re_embed_sibling_units_once(db, fake_llm):
     """Attaching N files must not re-embed every ready sibling unit N
     times -- see docs/DECISIONS.md "Multi-file posthoc attachment":
@@ -160,7 +154,6 @@ async def test_multiple_files_only_re_embed_sibling_units_once(db, fake_llm):
     assert len(fake_llm.embed_calls) - embeds_before == 1
 
 
-@pytest.mark.asyncio
 async def test_one_bad_file_in_a_batch_attaches_none_of_them(db, fake_llm):
     """Validation is atomic across the batch (see docs/DECISIONS.md) --
     a rejected file must not leave the other, otherwise-valid files of
@@ -176,7 +169,6 @@ async def test_one_bad_file_in_a_batch_attaches_none_of_them(db, fake_llm):
     assert db.query(Attachment).filter(Attachment.capture_id == capture.id).count() == 0
 
 
-@pytest.mark.asyncio
 async def test_short_attachment_is_not_chunked_but_still_searchable(db, fake_llm):
     """Default threshold, no monkeypatch: a short attachment gets no
     AttachmentChunk rows at all -- the parent unit's full-text/embedding
@@ -192,7 +184,6 @@ async def test_short_attachment_is_not_chunked_but_still_searchable(db, fake_llm
     assert scored and scored[0].unit.capture_id == capture.id
 
 
-@pytest.mark.asyncio
 async def test_uploaded_image_is_captioned_and_becomes_searchable(db):
     """No OCR/vision model exists separately -- the generation model's
     native multimodal understanding is what makes an uploaded image
@@ -215,7 +206,6 @@ async def test_uploaded_image_is_captioned_and_becomes_searchable(db):
     assert scored and scored[0].unit.capture_id == capture.id
 
 
-@pytest.mark.asyncio
 async def test_image_captioning_failure_leaves_image_stored_but_uncaptioned(db):
     """Best-effort, same tolerance as every other derived LLM step in
     this pipeline -- and, per the streamlining mandate, captioning can't
@@ -234,7 +224,6 @@ async def test_image_captioning_failure_leaves_image_stored_but_uncaptioned(db):
     assert attachment.extracted_text is None
 
 
-@pytest.mark.asyncio
 async def test_image_caption_response_accepts_a_list_for_per_image_captions(db):
     """Regression: unlike every other FakeLLMProvider *_response param,
     image_caption_response previously only wrapped a plain string into

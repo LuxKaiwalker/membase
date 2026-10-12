@@ -10,7 +10,32 @@ stays in status="processing" forever and is invisible to hybrid_search()
 (which only returns status="ready" units) -- see docs/DECISIONS.md.
 """
 
+from sqlalchemy import text as sql_text
+
 from app.ingestion.pipeline import finish_unit_processing
+
+# Every eval entry point TRUNCATEs its tables per case/run. That's safe
+# against the isolated `membase_eval` database the scripts/*.sh wrappers
+# point at (PGDATABASE/DATABASE_URL set before Python ever starts), but
+# nothing stops someone from running e.g. `python3 eval/run_eval.py`
+# directly inside `nix develop`, where DATABASE_URL defaults to the real
+# dev database -- that would silently destroy real stored captures/
+# memory units with no recovery path (.data/ isn't backed up anywhere
+# else in this project). assert_eval_database() checks the live
+# connection itself, not just an env var, so it can't be fooled by how
+# the connection was established.
+_EVAL_DATABASE_NAME = "membase_eval"
+
+
+def assert_eval_database(db) -> None:
+    name = db.execute(sql_text("SELECT current_database()")).scalar()
+    if name != _EVAL_DATABASE_NAME:
+        raise RuntimeError(
+            f"Refusing to run: connected to database {name!r}, expected "
+            f"{_EVAL_DATABASE_NAME!r}. Run this via its scripts/*.sh "
+            "wrapper, not directly -- see docs/DECISIONS.md \"Eval database-"
+            "isolation guard\" for why."
+        )
 
 
 async def finish_processing(db, llm, *captures) -> None:

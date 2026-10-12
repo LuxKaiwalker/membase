@@ -1,4 +1,3 @@
-import pytest
 
 from app.ingestion.pipeline import create_capture
 from app.retrieval.agent import MAX_AGENT_ITERATIONS, run_agent
@@ -8,7 +7,6 @@ from tests.helpers import create_capture_and_finish
 _ABSTENTION = "I don't have a stored memory about this."
 
 
-@pytest.mark.asyncio
 async def test_direct_search_stops_after_one_round_when_sufficient(db, fake_llm):
     cap_foo = await create_capture_and_finish(db, fake_llm, text="foo content here")
     await create_capture_and_finish(db, fake_llm, text="bar content elsewhere")
@@ -23,7 +21,6 @@ async def test_direct_search_stops_after_one_round_when_sufficient(db, fake_llm)
     assert all(s.unit.capture_id == cap_foo.id for s in result.sources)
 
 
-@pytest.mark.asyncio
 async def test_reformulation_pulls_in_additional_evidence(db, fake_llm):
     cap_foo = await create_capture_and_finish(db, fake_llm, text="foo content here")
     cap_bar = await create_capture_and_finish(db, fake_llm, text="bar content elsewhere")
@@ -42,7 +39,6 @@ async def test_reformulation_pulls_in_additional_evidence(db, fake_llm):
     assert cap_bar.id in found_captures, "reformulated query 'bar' should have been searched and merged in"
 
 
-@pytest.mark.asyncio
 async def test_iteration_limit_is_bounded(db, fake_llm):
     await create_capture_and_finish(db, fake_llm, text="foo content here")
 
@@ -61,7 +57,6 @@ async def test_iteration_limit_is_bounded(db, fake_llm):
     assert result.abstained is False
 
 
-@pytest.mark.asyncio
 async def test_malformed_evaluate_output_degrades_to_best_effort_answer(db, fake_llm):
     await create_capture_and_finish(db, fake_llm, text="foo content here")
 
@@ -73,7 +68,6 @@ async def test_malformed_evaluate_output_degrades_to_best_effort_answer(db, fake
     assert result.answer == _ABSTENTION
 
 
-@pytest.mark.asyncio
 async def test_unavailable_llm_degrades_to_fulltext_then_abstains_or_answers(db, fake_llm):
     await create_capture_and_finish(db, fake_llm, text="findable by fulltext only")
 
@@ -86,14 +80,12 @@ async def test_unavailable_llm_degrades_to_fulltext_then_abstains_or_answers(db,
     assert result.answer == _ABSTENTION
 
 
-@pytest.mark.asyncio
 async def test_no_answer_case_abstains_without_any_search_noise(db, fake_llm):
     result = await run_agent(db, fake_llm, "nothing stored matches this at all")
     assert result.abstained is True
     assert result.sources == []
 
 
-@pytest.mark.asyncio
 async def test_query_is_embedded_once_and_reused_for_chunk_search(db, fake_llm):
     """hybrid_search(query) and hybrid_search_chunks(query) previously
     each independently called llm.embed(query) -- see docs/DECISIONS.md

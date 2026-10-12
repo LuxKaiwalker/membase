@@ -1,4 +1,3 @@
-import pytest
 
 from app.ingestion.pipeline import MAX_CLARIFICATION_ROUNDS, create_capture, resolve_clarification
 from app.retrieval.pipeline import hybrid_search
@@ -23,7 +22,6 @@ _GYM_SEMANTICS_NO_QUESTION = {
 }
 
 
-@pytest.mark.asyncio
 async def test_clarification_question_generated_and_surfaced(db):
     """The unified analyze_capture() call decides both the semantics AND
     whether a question is needed, in one shot -- there's no separate
@@ -40,7 +38,6 @@ async def test_clarification_question_generated_and_surfaced(db):
     assert llm.calls == ["analyze_capture"]
 
 
-@pytest.mark.asyncio
 async def test_clarification_answer_is_persisted(db):
     llm = FakeLLMProvider(enrichment_response=[_ZORBLEX_QUESTION, _GYM_SEMANTICS_NO_QUESTION])
     capture = await create_capture(db, llm, text="My Zorblex code is 42.", uploads=[])
@@ -62,7 +59,6 @@ async def test_clarification_answer_is_persisted(db):
     assert unit.status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_blank_clarification_answer_skips_without_recording(db):
     """Answering is optional (soft-guarded client-side only, see
     docs/DECISIONS.md) -- a blank/omitted answer must still unblock the
@@ -79,7 +75,6 @@ async def test_blank_clarification_answer_skips_without_recording(db):
     assert unit.status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_clarification_rounds_are_bounded(db):
     """The model keeps wanting to ask more questions every round, but
     MAX_CLARIFICATION_ROUNDS caps it -- see docs/DECISIONS.md. Each round
@@ -102,7 +97,6 @@ async def test_clarification_rounds_are_bounded(db):
     assert unit.status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_declined_or_unknown_field_is_never_reasked(db):
     """A hard-coded guarantee, not just a prompt instruction: once the
     user has said "I don't know" (or declined) about a field, the system
@@ -122,7 +116,6 @@ async def test_declined_or_unknown_field_is_never_reasked(db):
     assert unit.status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_answer_can_trigger_a_new_round_of_questions(db):
     """Iterative: if answering the first question reveals something else
     worth asking about, a new round is opened (bounded by
@@ -149,7 +142,6 @@ async def test_answer_can_trigger_a_new_round_of_questions(db):
     assert len(unit.clarifications) == 2
 
 
-@pytest.mark.asyncio
 async def test_retrieval_succeeds_via_clarification_derived_alias(db):
     """The core alias-retrieval property (spec's AHV acceptance test,
     generalized): a term introduced only during clarification must become
@@ -167,7 +159,6 @@ async def test_retrieval_succeeds_via_clarification_derived_alias(db):
     assert scored and scored[0].unit.id == unit.id
 
 
-@pytest.mark.asyncio
 async def test_unit_awaiting_clarification_is_not_searchable(db):
     """The gate itself: before the question is answered, the unit must
     not surface in recall at all -- not even via an exact keyword match
@@ -186,7 +177,6 @@ async def test_unit_awaiting_clarification_is_not_searchable(db):
     assert fetched.authoritative_content == "My Zorblex code is 42."
 
 
-@pytest.mark.asyncio
 async def test_explicit_metadata_conflict_surfaces_as_clarification(db):
     """Explicit user-entered metadata always has higher authority than
     LLM-inferred metadata, but a genuine conflict (both sides non-empty
@@ -208,7 +198,6 @@ async def test_explicit_metadata_conflict_surfaces_as_clarification(db):
     assert set(unit.semantic["locations"]) == {"Geneva", "Zürich"}
 
 
-@pytest.mark.asyncio
 async def test_explicit_metadata_with_no_conflict_is_applied_silently(db):
     """No disagreement -- explicit metadata is just folded into the
     semantic representation with no clarification needed."""
@@ -230,7 +219,6 @@ async def test_explicit_metadata_with_no_conflict_is_applied_silently(db):
 # may ever reach "awaiting_clarification", regardless of source.
 
 
-@pytest.mark.asyncio
 async def test_disabled_clarification_skips_a_model_proposed_question(db):
     llm = FakeLLMProvider(enrichment_response=_ZORBLEX_QUESTION)
 
@@ -244,7 +232,6 @@ async def test_disabled_clarification_skips_a_model_proposed_question(db):
     assert unit.status == "processing"
 
 
-@pytest.mark.asyncio
 async def test_disabled_clarification_skips_an_explicit_metadata_conflict(db):
     llm = FakeLLMProvider(enrichment_response={"locations": ["Geneva"]})
 
@@ -261,7 +248,6 @@ async def test_disabled_clarification_skips_an_explicit_metadata_conflict(db):
     assert set(unit.semantic["locations"]) == {"Geneva", "Zürich"}
 
 
-@pytest.mark.asyncio
 async def test_clarification_enabled_by_default(db):
     """allow_clarification defaults to True -- existing callers that
     don't pass it keep today's behavior unchanged."""

@@ -46,7 +46,7 @@ def _schedule_if_processing(background_tasks: BackgroundTasks, unit: MemoryUnit)
 
 
 @router.get("/{unit_id}", response_model=MemoryUnitOut)
-async def get(unit_id: uuid.UUID, db: Session = Depends(get_db)):
+def get(unit_id: uuid.UUID, db: Session = Depends(get_db)):
     return _get_unit_or_404(db, unit_id)
 
 
@@ -126,10 +126,10 @@ async def correct(
 
 
 @router.post("/{unit_id}/discard", response_model=MemoryUnitOut)
-async def discard(unit_id: uuid.UUID, db: Session = Depends(get_db)):
+def discard(unit_id: uuid.UUID, db: Session = Depends(get_db)):
     """Cancel a unit awaiting clarification (spec section 3: the user may
     cancel/discard a draft rather than answer)."""
     unit = _get_unit_or_404(db, unit_id)
     if unit.status != "awaiting_clarification":
         raise HTTPException(status_code=400, detail=f"Unit is '{unit.status}', nothing to discard")
-    return await discard_unit(db, unit)
+    return discard_unit(db, unit)

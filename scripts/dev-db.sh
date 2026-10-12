@@ -27,9 +27,15 @@ start() {
   else
     pg_ctl -D "$PGDATA" -l "$PGDATA/log.txt" -o "-p $PGPORT -k $PGHOST_DIR -h ''" start
   fi
-  # Idempotent: create db + extensions if missing.
+  # Idempotent: create db + extensions if missing. Single quotes
+  # doubled (standard SQL string-literal escaping) before
+  # interpolating into the query string -- not exploitable today since
+  # the value comes from the flake's own trusted env, but worth doing
+  # right regardless. (psql's `:'var'` substitution looks like the
+  # more obvious fix but does not apply to -c command strings.)
+  db_literal=${PGDATABASE//\'/\'\'}
   psql -h "$PGHOST_DIR" -p "$PGPORT" -U "$PGUSER" -d postgres -tc \
-    "SELECT 1 FROM pg_database WHERE datname = '$PGDATABASE'" | grep -q 1 || \
+    "SELECT 1 FROM pg_database WHERE datname = '$db_literal'" | grep -q 1 || \
     createdb -h "$PGHOST_DIR" -p "$PGPORT" -U "$PGUSER" "$PGDATABASE"
   psql -h "$PGHOST_DIR" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
     -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null

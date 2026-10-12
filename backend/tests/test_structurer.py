@@ -11,7 +11,6 @@ from tests.helpers import create_capture_and_finish
 # structuring, in success or failure.
 
 
-@pytest.mark.asyncio
 async def test_structuring_upgrades_semantics_without_touching_status(db):
     llm = FakeLLMProvider(enrichment_response={"topics": ["gym"]})
     capture = await create_capture_and_finish(db, llm, text="My gym locker combination is 42.", uploads=[])
@@ -31,7 +30,6 @@ async def test_structuring_upgrades_semantics_without_touching_status(db):
     assert unit.embedding is not None
 
 
-@pytest.mark.asyncio
 async def test_structuring_skips_a_unit_that_is_not_ready(db, fake_llm):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
     capture = await create_capture_and_finish(db, llm, text="My Flimvex PIN is 42.", uploads=[])
@@ -44,7 +42,6 @@ async def test_structuring_skips_a_unit_that_is_not_ready(db, fake_llm):
     assert unit.structure_status == "unstructured"  # never claimed
 
 
-@pytest.mark.asyncio
 async def test_structuring_is_a_noop_if_already_structured(db):
     llm = FakeLLMProvider(enrichment_response={"topics": ["gym"]})
     capture = await create_capture_and_finish(db, llm, text="My gym locker combination is 42.", uploads=[])
@@ -61,7 +58,6 @@ async def test_structuring_is_a_noop_if_already_structured(db):
     assert unit.semantic["topics"] == ["first pass"]  # untouched by the second call
 
 
-@pytest.mark.asyncio
 async def test_structuring_failure_leaves_existing_representation_untouched(db):
     llm = FakeLLMProvider(enrichment_response={"topics": ["gym"]})
     capture = await create_capture_and_finish(db, llm, text="My gym locker combination is 42.", uploads=[])
@@ -80,7 +76,6 @@ async def test_structuring_failure_leaves_existing_representation_untouched(db):
     assert unit.semantic["topics"] == ["gym"]  # never overwritten with empty/degraded data
 
 
-@pytest.mark.asyncio
 async def test_related_candidates_are_recorded_as_advisory_links(db):
     llm_a = FakeLLMProvider(enrichment_response={"topics": ["robotics"]})
     capture_a = await create_capture_and_finish(db, llm_a, text="Anna recommended a robotics paper.", uploads=[])
@@ -97,7 +92,6 @@ async def test_related_candidates_are_recorded_as_advisory_links(db):
     assert str(unit_a.id) in unit_b.related_unit_ids
 
 
-@pytest.mark.asyncio
 async def test_related_candidates_match_on_partial_overlap_not_every_term(db):
     """websearch_to_tsquery ANDs bare terms by default -- joining
     several about-terms with a plain space would require a related
@@ -119,7 +113,6 @@ async def test_related_candidates_match_on_partial_overlap_not_every_term(db):
     assert str(unit_a.id) in unit_b.related_unit_ids
 
 
-@pytest.mark.asyncio
 async def test_retry_structuring_rejects_a_unit_not_yet_ready(db, fake_llm):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
     capture = await create_capture_and_finish(db, llm, text="My Flimvex PIN is 42.", uploads=[])
@@ -129,7 +122,6 @@ async def test_retry_structuring_rejects_a_unit_not_yet_ready(db, fake_llm):
         await retry_structuring(db, fake_llm, unit)
 
 
-@pytest.mark.asyncio
 async def test_retry_structuring_reclaims_a_failed_unit(db):
     llm = FakeLLMProvider(enrichment_response={"topics": ["gym"]})
     capture = await create_capture_and_finish(db, llm, text="My gym locker combination is 42.", uploads=[])
@@ -147,7 +139,6 @@ async def test_retry_structuring_reclaims_a_failed_unit(db):
     assert updated.semantic["topics"] == ["recovered"]
 
 
-@pytest.mark.asyncio
 async def test_retry_structuring_leaves_a_fresh_in_flight_lease_alone(db):
     from app.ingestion.pipeline import _claim_structuring
 

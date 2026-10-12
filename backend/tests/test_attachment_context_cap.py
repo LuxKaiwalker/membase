@@ -1,4 +1,3 @@
-import pytest
 
 from app.ingestion.pipeline import MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS, create_capture
 from app.llm.base import LLMProvider
@@ -42,7 +41,6 @@ class _PromptCapturingLLM(LLMProvider):
         return 768
 
 
-@pytest.mark.asyncio
 async def test_create_capture_caps_attachment_text_in_analysis_prompt(db):
     huge_text = "X" * 5000
     llm = _PromptCapturingLLM({"units": [{"content": "A short memory."}]})
@@ -57,7 +55,6 @@ async def test_create_capture_caps_attachment_text_in_analysis_prompt(db):
     assert "X" * (MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS + 1) not in prompt
 
 
-@pytest.mark.asyncio
 async def test_resolve_clarification_caps_attachment_text_in_reanalysis_prompt(db):
     huge_text = "Y" * 5000
     llm = _PromptCapturingLLM(

@@ -52,7 +52,6 @@ async def real_llm():
     await llm.aclose()
 
 
-@pytest.mark.asyncio
 async def test_acceptance_clarification_alias_retrieval(db, real_llm):
     """The spec's canonical acceptance test, using an invented term (not
     AHV) so the model genuinely cannot answer from world knowledge and
@@ -72,7 +71,6 @@ async def test_acceptance_clarification_alias_retrieval(db, real_llm):
     assert any(s.unit.id == unit.id for s in result.sources)
 
 
-@pytest.mark.asyncio
 async def test_segmentation_acceptance_compound_vs_coherent(db, real_llm):
     compound = await create_capture(
         db,
@@ -91,7 +89,6 @@ async def test_segmentation_acceptance_compound_vs_coherent(db, real_llm):
     assert len(coherent.units) == 1, "a single coherent episode may remain one contextual unit"
 
 
-@pytest.mark.asyncio
 async def test_paraphrased_query_retrieves_relevant_memory(db, real_llm):
     await create_capture_and_finish(
         db,
@@ -107,7 +104,6 @@ async def test_paraphrased_query_retrieves_relevant_memory(db, real_llm):
     assert any(s.unit.authoritative_content.startswith("My trip to Japan") for s in result.sources)
 
 
-@pytest.mark.asyncio
 async def test_indirect_multiconcept_relationship_query(db, real_llm):
     await create_capture_and_finish(
         db,
@@ -124,7 +120,6 @@ async def test_indirect_multiconcept_relationship_query(db, real_llm):
     assert "anna" in result.answer.lower()
 
 
-@pytest.mark.asyncio
 async def test_no_answer_case_abstains(db, real_llm):
     await create_capture_and_finish(db, real_llm, text="Bought a new pair of running shoes.")
     result = await run_agent(db, real_llm, "What is my favorite pizza topping?")

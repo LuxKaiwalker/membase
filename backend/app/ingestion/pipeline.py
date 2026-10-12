@@ -113,7 +113,14 @@ def _attachment_text_for_analysis(capture: Capture) -> str:
 # the new text. Context only, injected into the analysis prompt; never
 # authoritative over what the user is currently saying (see
 # docs/DECISIONS.md "Prior memory is context, not authority").
-_CANDIDATE_TERM_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,}){0,2}\b")
+# [^\W\d_]: any Unicode letter (word char minus digits/underscore) --
+# NOT [a-zA-Z], which is ASCII-only and would silently find zero
+# candidate terms in capitalized names with accented characters
+# ("Zürich", "Müller", "François"). The per-word uppercase-start check
+# that [A-Z] used to enforce inline now happens in _candidate_terms
+# below, since there's no portable Unicode "uppercase letter" character
+# class in stdlib `re` (only the third-party `regex` package has one).
+_CANDIDATE_TERM_RE = re.compile(r"\b[^\W\d_]{3,}(?:\s+[^\W\d_]{3,}){0,2}\b")
 _PRIOR_CONTEXT_SNIPPET_CHARS = 300
 _PRIOR_CONTEXT_LIMIT = 3
 
@@ -121,7 +128,9 @@ _PRIOR_CONTEXT_LIMIT = 3
 def _candidate_terms(raw_text: str) -> list[str]:
     seen: dict[str, None] = {}
     for m in _CANDIDATE_TERM_RE.finditer(raw_text):
-        seen.setdefault(m.group(0), None)
+        term = m.group(0)
+        if all(word[:1].isupper() for word in term.split()):
+            seen.setdefault(term, None)
     return list(seen)
 
 
@@ -261,25 +270,32 @@ async def finish_image_captioning(attachment_id: uuid.UUID, llm: LLMProvider | N
         attachment = db.get(Attachment, attachment_id)
         if attachment is None or not is_uncaptioned_image(attachment):
             return
-        data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
-        description = await _describe_image(llm, data)
-        if not description:
-            return
-        attachment.extracted_text = description
-        attachment.extraction_status = "ok"
-        db.commit()
+        try:
+            data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+            description = await _describe_image(llm, data)
+            if not description:
+                return
+            attachment.extracted_text = description
+            attachment.extraction_status = "ok"
+            db.commit()
 
-        if should_chunk(description):
-            processed = ProcessedFile(
-                stored_path=attachment.stored_path,
-                content_type=attachment.content_type,
-                size_bytes=attachment.size_bytes,
-                extracted_text=description,
-                extraction_status="ok",
-                pages=None,
-            )
-            await _index_attachment_chunks(db, llm, attachment, processed)
-        await _refresh_ready_units_with_attachment_excerpt(db, llm, attachment.capture)
+            if should_chunk(description):
+                processed = ProcessedFile(
+                    stored_path=attachment.stored_path,
+                    content_type=attachment.content_type,
+                    size_bytes=attachment.size_bytes,
+                    extracted_text=description,
+                    extraction_status="ok",
+                    pages=None,
+                )
+                await _index_attachment_chunks(db, llm, attachment, processed)
+            await _refresh_ready_units_with_attachment_excerpt(db, llm, attachment.capture)
+        except Exception:
+            # Fire-and-forget background task -- an unhandled exception
+            # here (e.g. the file went missing on disk between upload
+            # and now) would otherwise vanish silently with no record
+            # anywhere that this attachment's captioning never finished.
+            logger.exception("Unexpected failure captioning attachment %s", attachment_id)
     finally:
         db.close()
 
@@ -304,25 +320,32 @@ async def finish_attachment_chunking(attachment_id: uuid.UUID, llm: LLMProvider 
             return
         if not should_chunk(attachment.extracted_text):
             return
-        pages = None
-        if attachment.content_type == "application/pdf":
-            try:
-                data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
-                pages = extract_pdf_pages(data)
-            except Exception:
-                logger.exception(
-                    "Could not re-extract PDF pages for attachment %s; chunking without page numbers",
-                    attachment.id,
-                )
-        processed = ProcessedFile(
-            stored_path=attachment.stored_path,
-            content_type=attachment.content_type,
-            size_bytes=attachment.size_bytes,
-            extracted_text=attachment.extracted_text,
-            extraction_status=attachment.extraction_status,
-            pages=pages,
-        )
-        await _index_attachment_chunks(db, llm, attachment, processed)
+        try:
+            pages = None
+            if attachment.content_type == "application/pdf":
+                try:
+                    data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+                    pages = extract_pdf_pages(data)
+                except Exception:
+                    logger.exception(
+                        "Could not re-extract PDF pages for attachment %s; chunking without page numbers",
+                        attachment.id,
+                    )
+            processed = ProcessedFile(
+                stored_path=attachment.stored_path,
+                content_type=attachment.content_type,
+                size_bytes=attachment.size_bytes,
+                extracted_text=attachment.extracted_text,
+                extraction_status=attachment.extraction_status,
+                pages=pages,
+            )
+            await _index_attachment_chunks(db, llm, attachment, processed)
+        except Exception:
+            # Fire-and-forget background task -- see the matching guard
+            # in finish_image_captioning above for why this needs its
+            # own catch-all rather than letting a surprise failure (e.g.
+            # the file missing on disk) vanish with no record anywhere.
+            logger.exception("Unexpected failure chunking attachment %s", attachment_id)
     finally:
         db.close()
 
@@ -579,44 +602,55 @@ async def _finalize_structuring(db: Session, llm: LLMProvider, unit: MemoryUnit,
     # Joined with explicit "OR" instead -- a real related memory only
     # needs to match *some* of what this one is about, not all of it.
     # Capped at a handful of terms so the query itself stays bounded.
-    semantic = unit.semantic or {}
-    about_terms = [
-        *semantic.get("topics", []), *semantic.get("people", []), *semantic.get("organizations", []),
-        *semantic.get("locations", []), *semantic.get("aliases", []),
-    ][:6]
-    query = " OR ".join(about_terms) if about_terms else unit.authoritative_content
     try:
-        candidate_scored = await hybrid_search(db, llm, query, limit=structurer.MAX_RELATED_CANDIDATES + 1)
-    except LLMError:
-        candidate_scored = []
-    candidates = [(str(s.unit.id), s.unit.retrieval_text[:300]) for s in candidate_scored if s.unit.id != unit.id]
+        semantic = unit.semantic or {}
+        about_terms = [
+            *semantic.get("topics", []), *semantic.get("people", []), *semantic.get("organizations", []),
+            *semantic.get("locations", []), *semantic.get("aliases", []),
+        ][:6]
+        query = " OR ".join(about_terms) if about_terms else unit.authoritative_content
+        try:
+            candidate_scored = await hybrid_search(db, llm, query, limit=structurer.MAX_RELATED_CANDIDATES + 1)
+        except LLMError:
+            candidate_scored = []
+        candidates = [(str(s.unit.id), s.unit.retrieval_text[:300]) for s in candidate_scored if s.unit.id != unit.id]
 
-    result = await structurer.structure_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, candidates)
-    if result.semantic.get("enrichment_status") == "unavailable":
+        result = await structurer.structure_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, candidates)
+        if result.semantic.get("enrichment_status") == "unavailable":
+            _commit_structuring_if_token_matches(db, unit.id, token, {"structure_status": "failed"})
+            return
+
+        semantic = dict(result.semantic)
+        _apply_explicit_metadata(semantic, unit.explicit_metadata)
+        retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
+        searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, retrieval_text)
+        related_unit_ids = [candidates[i][0] for i in result.related_indices]
+
+        values: dict = {
+            "semantic": semantic,
+            "retrieval_text": retrieval_text,
+            "searchable_text": searchable_text,
+            "related_unit_ids": related_unit_ids,
+            "structure_status": "structured",
+            "structured_at": dt.datetime.now(dt.UTC),
+        }
+        try:
+            embedding = await llm.embed([retrieval_text])
+            values["embedding"] = embedding[0]
+            values["embedding_model"] = llm.embedding_model_name
+            values["embedding_dim"] = llm.embedding_dim
+        except LLMError:
+            logger.warning("Structuring embed failed for unit %s; keeping prior embedding", unit.id)
+    except Exception:
+        # Mirrors _finalize_unit's outer guard -- without this, an
+        # unexpected failure here (as opposed to the LLMErrors already
+        # handled above) would leave the unit's structure_token set
+        # forever: the lease is never released, so it's stuck in
+        # structure_status="structuring" with no automatic recovery and
+        # no record of what went wrong.
+        logger.exception("Unexpected failure structuring unit %s", unit.id)
         _commit_structuring_if_token_matches(db, unit.id, token, {"structure_status": "failed"})
         return
-
-    semantic = dict(result.semantic)
-    _apply_explicit_metadata(semantic, unit.explicit_metadata)
-    retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
-    searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, retrieval_text)
-    related_unit_ids = [candidates[i][0] for i in result.related_indices]
-
-    values: dict = {
-        "semantic": semantic,
-        "retrieval_text": retrieval_text,
-        "searchable_text": searchable_text,
-        "related_unit_ids": related_unit_ids,
-        "structure_status": "structured",
-        "structured_at": dt.datetime.now(dt.UTC),
-    }
-    try:
-        embedding = await llm.embed([retrieval_text])
-        values["embedding"] = embedding[0]
-        values["embedding_model"] = llm.embedding_model_name
-        values["embedding_dim"] = llm.embedding_dim
-    except LLMError:
-        logger.warning("Structuring embed failed for unit %s; keeping prior embedding", unit.id)
 
     _commit_structuring_if_token_matches(db, unit.id, token, values)
 
@@ -929,21 +963,34 @@ async def _refresh_ready_units_with_attachment_excerpt(db: Session, llm: LLMProv
     after the unit was already embedded).
     """
     attachment_text = _attachment_text_for(capture)
-    for unit in capture.units:
-        if unit.status != "ready":
-            continue
+    ready_units = [u for u in capture.units if u.status == "ready"]
+    if not ready_units:
+        return
+
+    excerpt = attachment_text[:1000]
+    for unit in ready_units:
         base_retrieval_text = unit.retrieval_text.split(_ATTACHMENT_EXCERPT_MARKER, 1)[0]
-        excerpt = attachment_text[:1000]
         retrieval_text = f"{base_retrieval_text}{_ATTACHMENT_EXCERPT_MARKER}{excerpt}" if excerpt else base_retrieval_text
         unit.retrieval_text = retrieval_text
         unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, retrieval_text)
-        try:
-            embedding = await llm.embed([retrieval_text])
-            unit.embedding = embedding[0]
+
+    # One batched embed call across every ready sibling, not one call
+    # per unit -- consistent with the rest of this codebase's explicit
+    # discipline around minimizing LLM round-trips. Trade-off: a batch
+    # failure leaves every sibling's embedding stale rather than just
+    # the one that would have failed individually, which is acceptable
+    # here since embedding failures are rare and already non-fatal
+    # (the unit stays searchable via full-text, just not vector search).
+    try:
+        embeddings = await llm.embed([u.retrieval_text for u in ready_units])
+        for unit, embedding in zip(ready_units, embeddings, strict=True):
+            unit.embedding = embedding
             unit.embedding_model = llm.embedding_model_name
             unit.embedding_dim = llm.embedding_dim
-        except LLMError:
-            logger.warning("Re-embedding after attachment add failed for unit %s", unit.id)
+    except LLMError:
+        logger.warning(
+            "Re-embedding after attachment add failed for %d unit(s) on capture %s", len(ready_units), capture.id
+        )
     db.commit()
 
 
@@ -1030,9 +1077,11 @@ def delete_capture(db: Session, capture: Capture) -> None:
     shutil.rmtree(capture_dir, ignore_errors=True)
 
 
-async def discard_unit(db: Session, unit: MemoryUnit) -> MemoryUnit:
+def discard_unit(db: Session, unit: MemoryUnit) -> MemoryUnit:
     """Explicit user cancellation of a unit awaiting clarification.
-    Deliberately a status flip, not a hard delete."""
+    Deliberately a status flip, not a hard delete. Plain `def`, not
+    `async def` -- no `await` inside, same reasoning as require_auth
+    in app/auth.py."""
     unit.status = "discarded"
     unit.pending_clarification = None
     db.commit()

@@ -1,7 +1,5 @@
 import datetime as dt
 
-import pytest
-
 from app.ingestion.pipeline import create_capture
 from app.models import MemoryUnit
 from app.retrieval.pipeline import ScoredUnit, format_evidence
@@ -15,7 +13,6 @@ from tests.helpers import create_capture_and_finish
 # only an advisory marker surfaced explicitly at answer time.
 
 
-@pytest.mark.asyncio
 async def test_conflicting_relations_are_marked_on_both_units(db):
     llm_a = FakeLLMProvider(enrichment_response={"relations": [{"subject": "rent", "predicate": "is", "object": "1200 dollars"}]})
     capture_a = await create_capture_and_finish(db, llm_a, text="My rent is 1200 dollars.", uploads=[])
@@ -34,7 +31,6 @@ async def test_conflicting_relations_are_marked_on_both_units(db):
     assert unit_a.potential_conflicts[0]["unit_id"] == str(unit_b.id)
 
 
-@pytest.mark.asyncio
 async def test_agreeing_relations_are_not_marked_as_conflicting(db, fake_llm):
     llm_a = FakeLLMProvider(enrichment_response={"relations": [{"subject": "rent", "predicate": "is", "object": "1200 dollars"}]})
     await create_capture_and_finish(db, llm_a, text="My rent is 1200 dollars.", uploads=[])
@@ -46,7 +42,6 @@ async def test_agreeing_relations_are_not_marked_as_conflicting(db, fake_llm):
     assert unit_b.potential_conflicts == []
 
 
-@pytest.mark.asyncio
 async def test_conflicts_never_delete_or_change_either_units_content(db):
     """Advisory only: a detected conflict must never mutate authoritative
     content, status, or semantics of either side -- see docs/DECISIONS.md

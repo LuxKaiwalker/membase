@@ -48,7 +48,6 @@ def _run_reembed(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.asyncio
 async def test_reembed_backfills_a_null_embedding(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="A memory to test backfill.")
     unit = capture.units[0]
@@ -62,7 +61,11 @@ async def test_reembed_backfills_a_null_embedding(db, fake_llm):
 
     result = _run_reembed("--dry-run")
     assert result.returncode == 0, result.stderr
-    assert "1 stale / 1 total" in result.stdout or "stale / " in result.stdout
+    # Exact match, not a loose "stale / " substring check -- the `db`
+    # fixture truncates memory_units before this test, so exactly one
+    # stale row out of one total is the only correct outcome; a looser
+    # check would also pass if the tool wrongly found zero stale rows.
+    assert "memory_units: 1 stale / 1 total" in result.stdout
 
     result = _run_reembed()
     assert result.returncode == 0, result.stderr
@@ -73,7 +76,6 @@ async def test_reembed_backfills_a_null_embedding(db, fake_llm):
     assert unit.embedding_model is not None
 
 
-@pytest.mark.asyncio
 async def test_reembed_is_idempotent_on_second_run(db, fake_llm):
     await create_capture_and_finish(db, fake_llm, text="Another memory.")
 
@@ -81,4 +83,8 @@ async def test_reembed_is_idempotent_on_second_run(db, fake_llm):
     assert first.returncode == 0, first.stderr
     second = _run_reembed()
     assert second.returncode == 0, second.stderr
-    assert "0 stale" in second.stdout.split("memory_units:")[1].split("\n")[0] or "0/0" in second.stdout
+    # Exact match on the memory_units line specifically -- the previous
+    # "0/0" fallback could be satisfied by an unrelated table's stat
+    # line elsewhere in the output, masking a real idempotency
+    # regression in memory_units specifically.
+    assert "memory_units: 0 stale / 1 total" in second.stdout

@@ -23,7 +23,7 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from _helpers import finish_processing  # noqa: E402
+from _helpers import assert_eval_database, finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.ingestion.pipeline import create_capture, resolve_clarification  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
@@ -114,13 +114,14 @@ async def main() -> int:
     # part is always the LLM calls) -- capping how many cases get
     # ingested keeps this benchmark's setup phase fast without making
     # the actual timing numbers any less representative. Override with
-    # BENCHMARK_CASE_LIMIT=0 (or unset) to use the full set.
+    # Defaults to 8 cases; set BENCHMARK_CASE_LIMIT=0 to use the full set.
     import os
 
     limit = int(os.environ.get("BENCHMARK_CASE_LIMIT", "8") or 0)
     if limit:
         cases = cases[:limit]
     db = get_sessionmaker()()
+    assert_eval_database(db)
     db.execute(sql_text(TRUNCATE))
     db.commit()
 

@@ -19,6 +19,7 @@ from sqlalchemy import text as sql_text
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _helpers import assert_eval_database  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
 from app.retrieval.discriminate import _CUE_MATCH_FIELDS, apply_negative_cues, values_for_field  # noqa: E402
@@ -148,6 +149,7 @@ async def field_coverage_case(db, llm, capture_to_memory: dict) -> dict:
 async def main() -> int:
     data = yaml.safe_load((Path(__file__).parent / "interactive_benchmark.yaml").read_text())
     db = get_sessionmaker()()
+    assert_eval_database(db)
     llm = get_llm_provider()
 
     db.execute(sql_text(TRUNCATE))

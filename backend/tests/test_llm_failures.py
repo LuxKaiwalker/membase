@@ -1,11 +1,9 @@
-import pytest
 
 from app.retrieval.pipeline import hybrid_search
 from tests.fakes import FakeLLMProvider
 from tests.helpers import create_capture_and_finish
 
 
-@pytest.mark.asyncio
 async def test_ingestion_survives_llm_unavailable(db):
     llm = FakeLLMProvider(fail="unavailable")
     capture = await create_capture_and_finish(db, llm, text="Stored even if the LLM is down")
@@ -16,7 +14,6 @@ async def test_ingestion_survives_llm_unavailable(db):
     assert unit.embedding is None
 
 
-@pytest.mark.asyncio
 async def test_ingestion_survives_llm_timeout(db):
     llm = FakeLLMProvider(fail="timeout")
     capture = await create_capture_and_finish(db, llm, text="Stored even if the LLM times out")
@@ -24,7 +21,6 @@ async def test_ingestion_survives_llm_timeout(db):
     assert capture.units[0].status == "ready"
 
 
-@pytest.mark.asyncio
 async def test_ingestion_survives_malformed_structured_output(db):
     # Metadata extraction (generate_structured) fails, but embedding is a
     # separate call and independently succeeds -- the unit should reflect
@@ -37,7 +33,6 @@ async def test_ingestion_survives_malformed_structured_output(db):
     assert unit.embedding is not None
 
 
-@pytest.mark.asyncio
 async def test_recall_falls_back_to_fulltext_when_embedding_unavailable(db, fake_llm):
     capture = await create_capture_and_finish(db, fake_llm, text="quokka sighting at the zoo")
 

@@ -34,7 +34,6 @@ def _provider_with_transport(handler) -> OllamaProvider:
     return provider
 
 
-@pytest.mark.asyncio
 async def test_non_json_response_body_raises_malformed_output_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="<html>not json</html>")
@@ -44,7 +43,6 @@ async def test_non_json_response_body_raises_malformed_output_error():
         await provider.generate("hello")
 
 
-@pytest.mark.asyncio
 async def test_non_200_status_raises_unavailable_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="internal error")
@@ -54,7 +52,6 @@ async def test_non_200_status_raises_unavailable_error():
         await provider.generate("hello")
 
 
-@pytest.mark.asyncio
 async def test_connection_failure_raises_unavailable_error():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -64,7 +61,6 @@ async def test_connection_failure_raises_unavailable_error():
         await provider.generate("hello")
 
 
-@pytest.mark.asyncio
 async def test_well_formed_response_still_works():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"message": {"role": "assistant", "content": "hello back"}})
@@ -73,7 +69,6 @@ async def test_well_formed_response_still_works():
     assert await provider.generate("hello") == "hello back"
 
 
-@pytest.mark.asyncio
 async def test_generate_calls_chat_endpoint_with_system_and_user_messages():
     """Regression: /api/generate's flat system+prompt fields were measured
     to truncate array-typed structured output for gemma4 (a 3-item array
@@ -99,7 +94,6 @@ async def test_generate_calls_chat_endpoint_with_system_and_user_messages():
     ]
 
 
-@pytest.mark.asyncio
 async def test_generate_attaches_images_to_the_user_message():
     captured = {}
 

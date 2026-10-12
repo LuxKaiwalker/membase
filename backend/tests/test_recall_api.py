@@ -1,4 +1,3 @@
-import pytest
 
 from app.api.recall import recall
 from app.models import RecallSession
@@ -15,7 +14,6 @@ from tests.helpers import create_capture_and_finish
 # ordinary arguments when not going through a real request).
 
 
-@pytest.mark.asyncio
 async def test_recall_endpoint_answers_via_a_real_session(db, fake_llm):
     await create_capture_and_finish(db, fake_llm, text="My gym locker combination is 42.", uploads=[])
 
@@ -31,7 +29,6 @@ async def test_recall_endpoint_answers_via_a_real_session(db, fake_llm):
     assert sessions[0].status == "success"
 
 
-@pytest.mark.asyncio
 async def test_recall_endpoint_abstains_on_empty_store(db, fake_llm):
     response = await recall(RecallRequest(query="anything at all"), db=db, llm=fake_llm)
 

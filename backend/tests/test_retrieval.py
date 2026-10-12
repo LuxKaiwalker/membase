@@ -1,11 +1,9 @@
-import pytest
 
 from app.ingestion.pipeline import create_capture
 from app.retrieval.pipeline import hybrid_search, sibling_context
 from tests.helpers import create_capture_and_finish
 
 
-@pytest.mark.asyncio
 async def test_exact_query_finds_unit(db, fake_llm):
     cap = await create_capture_and_finish(db, fake_llm, text="The quick brown fox jumps over the lazy dog")
     await create_capture_and_finish(db, fake_llm, text="Grocery list: milk, eggs, bread")
@@ -16,7 +14,6 @@ async def test_exact_query_finds_unit(db, fake_llm):
     assert scored[0].unit.capture_id == cap.id
 
 
-@pytest.mark.asyncio
 async def test_irrelevant_units_do_not_dominate(db, fake_llm):
     # FakeLLMProvider's embeddings are content-independent hashes, so the
     # vector channel contributes only noise here -- this specifically
@@ -33,14 +30,12 @@ async def test_irrelevant_units_do_not_dominate(db, fake_llm):
     assert ids[0] == cap.id
 
 
-@pytest.mark.asyncio
 async def test_no_match_returns_empty(db, fake_llm):
     await create_capture(db, fake_llm, text="Something about gardening", uploads=[])
     scored = await hybrid_search(db, fake_llm, "xyzzy nonexistent plugh quux")
     assert scored == []
 
 
-@pytest.mark.asyncio
 async def test_sibling_context_expands_within_same_capture(db):
     from tests.fakes import FakeLLMProvider
 

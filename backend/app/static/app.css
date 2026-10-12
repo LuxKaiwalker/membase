@@ -250,6 +250,11 @@ button:hover { opacity: 0.9; }
   justify-content: center;
   background: var(--bg);
 }
+/* Two-class selector, so this reliably beats .login-overlay's own
+   `display: flex` regardless of source order -- `.hidden` alone
+   (same specificity as `.login-overlay` alone) previously lost that
+   tie, so the overlay never actually hid for a logged-in user. */
+.login-overlay.hidden { display: none; }
 .login-form {
   width: 100%;
   max-width: 320px;
