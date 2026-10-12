@@ -33,11 +33,31 @@
         <p class="muted settings-hint">
           When off, you can skip a follow-up question without answering it.
         </p>
+        <hr class="settings-divider" />
+        <div class="settings-row settings-row-heading">Devices signed in</div>
+        <ul id="session-list" class="session-list"></ul>
+        <button id="logout-button" class="settings-logout" type="button">Log out this device</button>
       </div>
     </div>
   </header>
   <main>
     {% block content %}{% endblock %}
   </main>
+  <div id="login-overlay" class="login-overlay hidden">
+    <form id="login-form" class="login-form">
+      <h1>membase</h1>
+      <p class="muted">Enter the password to continue.</p>
+      <label>
+        Password
+        <input type="password" id="login-password" autocomplete="current-password" required />
+      </label>
+      <label>
+        This device (optional)
+        <input type="text" id="login-device-label" autocomplete="off" placeholder="e.g. work laptop" />
+      </label>
+      <button type="submit">Log in</button>
+      <p id="login-error" class="error hidden"></p>
+    </form>
+  </div>
 </body>
 </html>

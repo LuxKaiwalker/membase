@@ -86,30 +86,61 @@ adding one of the options in "Auth system ideas" below first.
   Ollama itself only serves one request at a time). Still binds
   `127.0.0.1` only -- see below for why that's deliberate, not a gap.
 
-## The blocking issue: no authentication
+## Authentication: implemented
 
-There is no `Authorization` header check, no session, no password,
-anywhere in this codebase (`grep` for `Authorization|HTTPBearer|
-APIKeyHeader|OAuth|SessionMiddleware` across `app/` returns nothing).
-Every route -- read your memories, delete a capture, attach a file,
-trigger an LLM call -- is wide open to anyone who can reach the port.
+This used to be the blocking issue -- there was no `Authorization`
+header check, no session, no password, anywhere in this codebase.
+That's now fixed: every route under `/api/captures`, `/api/memory-units`,
+and `/api/recall` requires a valid `Authorization: Bearer <token>`
+header (see `app/auth.py`'s `require_auth` dependency, wired on at
+`app.include_router(..., dependencies=[Depends(require_auth)])` in
+`app/main.py`). See docs/DECISIONS.md "Password login with per-device
+tokens" for the design and why it was chosen over the plain options
+below.
 
-This is fine, by design, for `127.0.0.1`-only local use (the only
-thing that can reach it is something already running as you, on your
-own machine). It stops being fine the moment anything -- a reverse
-proxy, a port-forward, a cloud VM's public IP -- makes that port
-reachable from the internet. At that point, with zero auth, you'd be
-running an app that lets any anonymous visitor read your entire stored
-memory, delete it, or run up your LLM compute, for free, with no sign-in
-screen at all.
+In short: there's one shared password, read from a plaintext file
+(`MEMBASE_AUTH_PASSWORD_FILE`, default `.data/auth_password`) fresh on
+every login attempt rather than from an env var captured once at
+startup -- so rotating it is just editing that file (e.g. over SSH)
+with no restart. A missing/empty file fails every login closed. But
+`POST /api/auth/login` issues a fresh, independently-revocable bearer
+token *per device* rather than handing back that shared secret itself.
+That's what makes this ready for a future mobile app or a second
+browser/device: each one logs in once with the same password and gets
+its own token, manageable (listed, individually revocable) from the
+settings menu without having to change the password everywhere else.
+Tokens are stored server-side only as a SHA-256 hash; the raw value is
+shown to the client exactly once, at login.
 
-**This audit did not add an auth system.** Which mechanism fits depends
-on how you want to actually use this day to day (type a password every
-time? use a VPN client? both?) -- that's a real product decision, not
-an "obviously correct" engineering default the way the fixes above
-were. See the next section for concrete options and a recommendation.
+`/login` is also rate-limited server-side (`app/rate_limit.py`): a
+global cap of 5 requests/second across all callers (a flood guard),
+plus a per-source-IP lockout after 10 failed attempts in 15 minutes (a
+brute-force guard, cleared immediately by one successful login). See
+docs/DECISIONS.md "File-based password, with server-side rate limiting
+on /login".
 
-## Auth system ideas
+HTML page routes (`/`, `/recall`, `/captures`) are intentionally NOT
+gated server-side -- they still return a static shell with no real
+data in it. The actual gate is client-side: `app/static/app.js`'s
+`initAuth()` shows a full-page login overlay whenever no valid token is
+stored, and every data-fetching call goes through the authenticated API
+routes above, so an unauthenticated visitor never sees real content,
+just an empty page and a password prompt.
+
+This still assumes the app is bound `127.0.0.1`-only with a reverse
+proxy doing TLS termination in front (see the checklist below) --
+bearer tokens over plain HTTP are exactly as interceptable as a Basic
+Auth header would be. **Password-login does not replace TLS; it
+replaces having no authentication at all.**
+
+## Auth system ideas (alternatives considered)
+
+The options below were evaluated before picking the token-based login
+above. Kept here for reference -- e.g. Option A (Tailscale) is still a
+good complementary layer (network-level isolation *underneath*
+app-level auth, not instead of it), and Option C's cookie/CSRF
+trade-offs are why this project used a header-based bearer token
+instead.
 
 All of these assume the FastAPI app keeps binding `127.0.0.1` only
 (via `scripts/run-prod.sh`) and something else -- a reverse proxy or a
@@ -197,25 +228,22 @@ of relying on the browser's native Basic Auth prompt or a cookie.
   page -- fine for a single trusted user, less fine if this UI ever
   embeds third-party content).
 
-### What this audit recommends
+### What was actually implemented
 
-**Option A (Tailscale) if you're the only person who'll ever use this
-and don't mind installing a client.** It requires no code changes at
-all and is strictly more secure than anything app-level, since there's
-no password to guess, phish, or leak in a log line.
+Neither B nor D exactly: a hybrid of "one password, any browser" (B's
+appeal) with D's bearer-token mechanics, extended to issue one token
+*per device* instead of one static token for everyone. This was the
+right fit once multi-device/mobile access became an explicit
+requirement -- Option B's native browser prompt has no concept of
+"log this one device out," and Option D as originally scoped assumed a
+single static secret. See docs/DECISIONS.md "Password login with
+per-device tokens" for the full reasoning.
 
-**Option B (HTTP Basic Auth) if you specifically want "visit a plain
-HTTPS URL from any browser, type a password once."** It's the smallest
-code change that closes the actual gap this audit found, and this
-project's whole engineering philosophy this phase has been "the
-smallest change that's actually correct" -- Basic Auth over HTTPS,
-with a reverse proxy doing TLS termination in front of
-`scripts/run-prod.sh`, is that for the auth gap specifically.
-
-Not recommended for this project's stated scope: anything involving a
-user table, OAuth/SSO, or multi-factor -- all solve problems this app
-doesn't have (there is, by design, exactly one user), at a complexity
-cost this phase's whole streamlining effort was specifically about
+Still not recommended for this project's stated scope: anything
+involving a user table, OAuth/SSO, or multi-factor -- all solve
+problems this app doesn't have (there is, by design, exactly one
+user, just possibly several of their own devices), at a complexity
+cost this project's whole streamlining effort was specifically about
 avoiding.
 
 ## Deployment checklist
@@ -225,8 +253,15 @@ avoiding.
 2. Put a reverse proxy in front for TLS -- Caddy is the least-effort
    option (automatic HTTPS via Let's Encrypt with a ~5-line Caddyfile);
    nginx + certbot works too if you already run nginx for other things.
-3. Pick and implement one of the auth options above *before* the
-   reverse proxy is reachable from the public internet, not after.
+3. Put a real password in the file `MEMBASE_AUTH_PASSWORD_FILE` points
+   at (`chmod 600`, owned by whichever user runs the app) *before* the
+   reverse proxy is reachable from the public internet -- the dev-only
+   default content `nix develop`'s shellHook seeds under `.data/` must
+   not be what ends up running in production. Changing it later is
+   just editing that file (e.g. over SSH) and takes effect on the next
+   login attempt, no restart needed. Log in once from each device you
+   want to use and keep its token; use the settings menu's session
+   list to revoke a lost device later.
 4. Confirm `app/main.py`'s `uvicorn.run(..., host="127.0.0.1", ...)`
    fallback and `scripts/run-prod.sh` both still say `127.0.0.1` --
    this should never change to `0.0.0.0` regardless of which auth

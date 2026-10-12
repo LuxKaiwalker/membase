@@ -59,9 +59,23 @@
           export PGDATABASE=membase
           export DATABASE_URL="postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST_DIR&port=$PGPORT"
           export OLLAMA_HOST="http://127.0.0.1:11434"
+          # Password login reads its one shared password from a file
+          # (see app/auth.py verify_password, docs/DECISIONS.md
+          # "Password login with per-device tokens") rather than an
+          # env var, so it can be changed over SSH without a restart.
+          # Only respected if the shell didn't already export a path
+          # (so a real deployment's own env still wins); if the file
+          # doesn't exist yet, seed it with a dev-only default so
+          # `nix develop` works out of the box -- that default is NOT
+          # meant to reach a real deployment, see docs/DEPLOYMENT.md.
+          export MEMBASE_AUTH_PASSWORD_FILE="''${MEMBASE_AUTH_PASSWORD_FILE:-$MEMBASE_ROOT/.data/auth_password}"
           export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
           export UPLOADS_DIR="$MEMBASE_ROOT/.data/uploads"
-          mkdir -p "$PGHOST_DIR" "$UPLOADS_DIR"
+          mkdir -p "$PGHOST_DIR" "$UPLOADS_DIR" "$(dirname "$MEMBASE_AUTH_PASSWORD_FILE")"
+          if [ ! -f "$MEMBASE_AUTH_PASSWORD_FILE" ]; then
+            echo "dev-only-password" > "$MEMBASE_AUTH_PASSWORD_FILE"
+            chmod 600 "$MEMBASE_AUTH_PASSWORD_FILE"
+          fi
           echo "membase dev shell ready."
           echo "  scripts/dev-db.sh start   # init + start project-local postgres on port $PGPORT"
           echo "  scripts/model-doctor.sh   # check Ollama + pull/verify configured models"

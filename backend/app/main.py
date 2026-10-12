@@ -1,11 +1,13 @@
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api import auth as auth_api
 from app.api import captures, recall, units
+from app.auth import require_auth
 from app.llm.base import LLMError
 from app.web import routes as web_routes
 
@@ -14,9 +16,20 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="membase")
 
-app.include_router(captures.router)
-app.include_router(units.router)
-app.include_router(recall.router)
+# auth.router's own /login is deliberately unauthenticated (that's the
+# one endpoint whose whole job is to grant a token); every other API
+# router that touches real memory data requires a valid bearer token.
+# See docs/DECISIONS.md "Password login with per-device tokens".
+app.include_router(auth_api.router)
+app.include_router(captures.router, dependencies=[Depends(require_auth)])
+app.include_router(units.router, dependencies=[Depends(require_auth)])
+app.include_router(recall.router, dependencies=[Depends(require_auth)])
+# HTML page shells stay unauthenticated at the route level -- they serve
+# no memory data themselves, just the page scaffold. app.js enforces the
+# actual gate client-side (checks for a stored token, shows a login
+# overlay otherwise) and every data call it makes goes through the
+# authenticated routers above, so an unauthenticated visitor sees an
+# empty shell and a login prompt, never real content.
 app.include_router(web_routes.router)
 
 _static_dir = Path(__file__).resolve().parent / "static"

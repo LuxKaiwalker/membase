@@ -8,6 +8,20 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
     database_url: str
+    # Path to a plaintext file containing the one shared login password
+    # (nothing else in the file -- just the password, trailing
+    # whitespace stripped). Read fresh on every /login attempt (see
+    # app/auth.py verify_password) rather than once at startup, so
+    # editing the file -- e.g. over SSH -- takes effect immediately,
+    # with no restart/redeploy. See docs/DECISIONS.md "Password login
+    # with per-device tokens". Deliberately has no default *password*
+    # value: a missing or unreadable file makes every login attempt
+    # fail closed (see verify_password), the same fail-closed intent
+    # the old `membase_auth_password` env var had. `nix develop`'s
+    # shellHook creates a dev-only default file under .data/ so local
+    # development works out of the box; that file is NOT meant to back
+    # a real deployment -- see docs/DEPLOYMENT.md.
+    membase_auth_password_file: Path = Path(".data/auth_password")
     ollama_host: str = "http://127.0.0.1:11434"
     # gemma4:12b -- natively multimodal (text/image/audio, no separate
     # vision encoder to wire up), used for *every* generation/structured-

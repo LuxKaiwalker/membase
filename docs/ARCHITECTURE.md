@@ -791,3 +791,19 @@ Unchanged from the original MVP: real file type sniffed from bytes before
 anything is written to disk; all writable state (Postgres data, uploaded
 files) lives under `.data/`, gitignored, never in the Nix store; the web
 server binds `127.0.0.1` only.
+
+## Authentication
+
+See docs/DECISIONS.md "Password login with per-device tokens" and
+"File-based password, with server-side rate limiting on /login" for
+the full design. Summary: one shared password, read fresh on every
+login attempt from a file (`Settings.membase_auth_password_file`,
+editable in place -- e.g. over SSH -- with no restart), but `POST
+/api/auth/login` issues a separately-revocable bearer token per device
+(`AuthToken` row, `app/models.py`, only `token_hash` ever persisted).
+`/login` itself is rate-limited (`app/rate_limit.py`): a 5 req/s global
+flood guard, and a 10-failed-attempts/15-min per-IP brute-force guard,
+both in-memory. `require_auth` (`app/auth.py`) is wired on at
+router-inclusion time in `app/main.py` for `captures`/`units`/`recall`;
+HTML page routes stay unauthenticated shells, gated client-side by
+`app/static/app.js`'s login overlay.

@@ -1576,3 +1576,145 @@ otherwise idle (`-np 1`, no concurrent load).
   structured-output path, consistent with schema-constrained JSON
   generation costing more than free-text generation for a comparable
   amount of actual content.
+
+---
+
+## Password login with per-device tokens
+
+**Decision:** The deployment-readiness audit (see docs/DEPLOYMENT.md)
+found this app had no authentication at all, which is fine for
+`127.0.0.1`-only local use but not once anything makes the port
+reachable from the internet. Given a choice between a plain HTTP Basic
+Auth prompt and extending to multiple devices (a future mobile app,
+a second browser) for the same single user, this project implemented a
+hybrid: there is still exactly one password
+(`Settings.membase_auth_password`, required, no default in
+production -- `flake.nix`'s shellHook sets a `dev-only-password`
+fallback for local development only), but `POST /api/auth/login`
+exchanges it for a freshly-generated, per-device bearer token rather
+than handing back one static shared secret. Each device that logs in
+gets its own `AuthToken` row (`app/models.py`) -- independently
+revocable later without having to change the password for every other
+device.
+
+Mechanics (`app/auth.py`, `app/api/auth.py`):
+- `AuthToken` stores only `token_hash` (SHA-256 of the raw token) --
+  the raw value is returned to the client exactly once, at login, and
+  never persisted, logged, or shown again.
+- `require_auth`, a FastAPI dependency, reads `Authorization: Bearer
+  <token>`, hashes it, looks up a matching non-revoked row, bumps
+  `last_used_at`, and raises 401 on any failure (missing header, no
+  match, revoked) -- the same 401 and the same generic message for
+  every failure mode, so a caller can't distinguish "wrong token" from
+  "revoked token" from "no token at all."
+- Applied at router-inclusion time in `app/main.py`
+  (`app.include_router(captures.router, dependencies=[Depends(require_auth)])`,
+  same for `units.router`/`recall.router`) rather than per-route, so
+  every current and future route on those three routers is covered
+  automatically. `auth.router` itself stays off this list -- `/login`
+  is the one endpoint whose entire job is to hand out a token before
+  the caller has one; `/logout`, `/sessions`, and `DELETE
+  /sessions/{id}` still require a valid token via `Depends(require_auth)`
+  on each of those route functions individually (they're on the same
+  router as the unauthenticated `/login`, so router-level
+  `dependencies=` would have caught `/login` too).
+- HTML page routes (`app/web/routes.py`) are NOT gated server-side --
+  they return the same static shell regardless of auth state, since
+  they contain no real data. The actual gate is client-side:
+  `app/static/app.js`'s `initAuth()` shows a full-page login overlay
+  whenever `localStorage` has no token, and `fetchWithTimeout()`
+  attaches `Authorization: Bearer <token>` to every request and pops
+  the overlay back up on any 401 response (covers both "never logged
+  in" and "this token just got revoked, possibly from another device's
+  session list").
+
+**Reason:** The user explicitly preferred "type a password from any
+browser" over a VPN-based approach, but also stated an intent to
+expand to mobile apps and multi-device access for the same single-user
+account. Plain HTTP Basic Auth (one static credential pair, browser-
+native prompt) satisfies the first preference alone but has no way to
+tell devices apart or revoke just one of them -- the only "log out" is
+clearing browser-cached credentials, which doesn't generalize to "kick
+my old phone off" once a password is shared across every client. A
+single static bearer token has the same problem in a different shape.
+Per-device tokens solve both at once: one password to type anywhere,
+but a device-level, revocable identity once logged in -- which is also
+exactly the shape a future native mobile client needs (log in once,
+store its own token, keep working even if a browser session elsewhere
+gets revoked).
+
+**Not done (acceptable gaps for this app's stated scope):** no token
+expiry (a device's token is valid until explicitly revoked, not until
+some TTL elapses -- acceptable for a single trusted user's own
+devices, revisit if that assumption ever changes); no "this is my
+current device" marker in the settings session list (revoking the
+session this browser is actually using is handled gracefully -- the
+next authenticated call 401s and the login overlay reappears -- but
+the list itself doesn't visually flag which row that is).
+
+---
+
+## File-based password, with server-side rate limiting on /login
+
+**Decision:** Two follow-up changes to the password-login design
+above, both requested after the initial implementation was live-
+verified:
+
+1. The one shared password moved from an env var
+   (`Settings.membase_auth_password`) to a file read fresh on every
+   login attempt (`Settings.membase_auth_password_file`, default
+   `.data/auth_password`; see `app/auth.py` `verify_password()`). An
+   env var is only set once, at process start -- changing it means
+   editing whatever sets the environment and restarting the process.
+   A file can be edited in place (e.g. over SSH: `vim
+   .data/auth_password`) and takes effect on the very next login
+   attempt, no restart. `get_settings()` is still `@lru_cache`'d, but
+   that only caches the *path*; the file's contents are read fresh
+   every time. A missing/unreadable file, or one that's empty, makes
+   every login attempt fail closed rather than falling back to some
+   default or treating an empty password as "no password required."
+   `nix develop`'s shellHook seeds a dev-only default file under
+   `.data/` (gitignored) so local dev keeps working out of the box;
+   that file is not meant to back a real deployment.
+2. `POST /api/auth/login` previously had no rate limiting at all --
+   flagged as an accepted gap above, mitigated only by
+   `scripts/run-prod.sh` binding `127.0.0.1`-only behind a reverse
+   proxy. Two independent, in-memory limiters were added
+   (`app/rate_limit.py`), checked in this order so a caller can't use
+   response timing to distinguish "locked out" from "wrong password":
+   - **Global flood guard:** at most 5 requests to `/login` per
+     second, in total, across every caller combined (keyed by nothing
+     -- it's one shared counter). Catches a burst/flood regardless of
+     source; not meant to be a serious brute-force deterrent on its
+     own.
+   - **Per-IP brute-force guard:** at most 10 *failed* attempts per
+     15 minutes, per source IP (`request.client.host`), then locked
+     out (`429`, with a `Retry-After` header) until the oldest failure
+     in that window ages out. A successful login immediately clears
+     that IP's failure count. Only failures count here (unlike the
+     global guard, which counts every request) -- a legitimate device
+     logging in repeatedly should never trip this.
+   Both are in-memory, per-process state -- no Redis, no DB table.
+   Safe because `scripts/run-prod.sh` always runs this app with
+   exactly one worker (it already has other process-local singletons
+   that assume this); a restart just resets everyone's counters, which
+   is a loosening, not a security hole.
+
+**Reason:** User-requested, after reviewing the original
+no-rate-limiting gap and the env-var password source live. The file-
+based password directly serves the stated deployment shape --
+single account, edited by whoever can SSH into the box, no redeploy
+needed to rotate it. The two-tier rate limiter was an explicit design
+ask (first drafted at 5 failures/15 min with no global guard, then
+widened to 10 failures/15 min plus a separate 5 req/s global cap) --
+splitting "don't let anyone flood this endpoint" from "don't let one
+attacker brute-force the password" means the global cap can stay tight
+without making life harder for one legitimate device that fat-fingers
+the password a few times in a row.
+
+**Not done:** the per-IP counter has no persistence or distributed
+component -- a reverse proxy that doesn't forward the real client IP
+(or that fronts many users behind one NAT'd IP) would make the per-IP
+guard either useless or overly broad; out of scope for a single-user,
+`127.0.0.1`-bound deployment. No alerting/logging on repeated
+lockouts beyond the 429 response itself.

@@ -137,3 +137,26 @@ class RecallSessionOut(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class LoginRequest(BaseModel):
+    password: str
+    # e.g. "iPhone", "work laptop" -- purely a label shown back in the
+    # session list later, see AuthToken.device_label.
+    device_label: str = ""
+
+
+class SessionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    device_label: str
+    created_at: datetime
+    last_used_at: datetime | None
+
+
+class LoginResponse(BaseModel):
+    # Shown exactly once -- the client must store this itself (see
+    # docs/DECISIONS.md "Password login with per-device tokens").
+    token: str
+    session: SessionOut

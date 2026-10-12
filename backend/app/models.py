@@ -271,3 +271,28 @@ class RecallSession(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class AuthToken(Base):
+    """One issued per successful login (see docs/DECISIONS.md "Password
+    login with per-device tokens") -- there is exactly one password
+    (this app has exactly one user, by design), but each device that
+    logs in gets its OWN token, so a lost phone can be revoked without
+    changing the password everywhere else. Only `token_hash` is ever
+    stored -- the raw token is shown to the client once, at login, and
+    never persisted or logged anywhere.
+    """
+
+    __tablename__ = "auth_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    # User-supplied at login time ("iPhone", "work laptop", ...) purely
+    # so the settings UI can show something recognizable when listing/
+    # revoking sessions -- never used for any security decision.
+    device_label: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

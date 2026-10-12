@@ -85,6 +85,148 @@ const membase = (() => {
     }
   }
 
+  // Password login with per-device bearer tokens (see docs/DECISIONS.md
+  // "Password login with per-device tokens"). The raw token lives only
+  // in this browser's localStorage -- never cookies, never sent
+  // anywhere but this app's own Authorization header below.
+  const TOKEN_KEY = "membase.authToken";
+
+  function getToken() {
+    try {
+      return localStorage.getItem(TOKEN_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  function setToken(value) {
+    try {
+      localStorage.setItem(TOKEN_KEY, value);
+    } catch {
+      // Login still "worked" for this page load (the token variable is
+      // still in memory for this request cycle) but won't survive a
+      // reload -- not worth surfacing as an error.
+    }
+  }
+
+  function clearToken() {
+    try {
+      localStorage.removeItem(TOKEN_KEY);
+    } catch {
+      // Nothing to do -- if localStorage is unavailable, there was
+      // nothing persisted to clear either.
+    }
+  }
+
+  function showLoginOverlay() {
+    const overlay = document.getElementById("login-overlay");
+    if (overlay) show(overlay);
+  }
+
+  function hideLoginOverlay() {
+    const overlay = document.getElementById("login-overlay");
+    if (overlay) hide(overlay);
+  }
+
+  async function loadSessions() {
+    const list = document.getElementById("session-list");
+    if (!list) return;
+    let sessions;
+    try {
+      const resp = await fetchWithTimeout("/api/auth/sessions");
+      if (!resp.ok) return;
+      sessions = await resp.json();
+    } catch {
+      return;
+    }
+    list.innerHTML = "";
+    for (const s of sessions) {
+      const li = document.createElement("li");
+      li.className = "session-item";
+      const label = document.createElement("span");
+      label.className = "session-device";
+      label.textContent = s.device_label || "Unnamed device";
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "session-revoke";
+      revoke.textContent = "Revoke";
+      revoke.addEventListener("click", async () => {
+        try {
+          // If this revokes the session this very browser is using, the
+          // next authenticated call (loadSessions() below) comes back
+          // 401 and fetchWithTimeout's own handling pops the login
+          // overlay back up -- no separate "did I just log myself out"
+          // check needed.
+          await fetchWithTimeout(`/api/auth/sessions/${s.id}`, { method: "DELETE" });
+        } catch {
+          // Fall through to reload the list either way.
+        }
+        loadSessions();
+      });
+      li.appendChild(label);
+      li.appendChild(revoke);
+      list.appendChild(li);
+    }
+  }
+
+  function initAuth() {
+    const overlay = document.getElementById("login-overlay");
+    const form = document.getElementById("login-form");
+    const passwordInput = document.getElementById("login-password");
+    const deviceInput = document.getElementById("login-device-label");
+    const errorEl = document.getElementById("login-error");
+    const logoutButton = document.getElementById("logout-button");
+    if (!overlay || !form) return;
+
+    if (getToken()) {
+      hideLoginOverlay();
+      loadSessions();
+    } else {
+      showLoginOverlay();
+    }
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      hide(errorEl);
+      const submitButton = form.querySelector("button[type=submit]");
+      submitButton.disabled = true;
+      try {
+        const resp = await fetchWithTimeout("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: passwordInput.value, device_label: deviceInput.value }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.detail || "Login failed.");
+        }
+        setToken(data.token);
+        passwordInput.value = "";
+        hideLoginOverlay();
+        loadSessions();
+      } catch (err) {
+        errorEl.textContent = err.message || "Login failed.";
+        show(errorEl);
+      } finally {
+        submitButton.disabled = false;
+      }
+    });
+
+    if (logoutButton) {
+      logoutButton.addEventListener("click", async () => {
+        try {
+          await fetchWithTimeout("/api/auth/logout", { method: "POST" });
+        } catch {
+          // Clear the local token regardless -- the point of logging
+          // out is that THIS browser stops acting authenticated, even
+          // if telling the server about it failed (e.g. offline).
+        }
+        clearToken();
+        showLoginOverlay();
+      });
+    }
+  }
+
   // Present in base.html on every page, so this runs unconditionally --
   // no per-page init call needed.
   function initSettingsMenu() {
@@ -105,8 +247,12 @@ const membase = (() => {
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();
       const isHidden = menu.classList.contains("hidden");
-      if (isHidden) show(menu);
-      else hide(menu);
+      if (isHidden) {
+        show(menu);
+        loadSessions();
+      } else {
+        hide(menu);
+      }
       toggle.setAttribute("aria-expanded", String(isHidden));
     });
 
@@ -124,6 +270,7 @@ const membase = (() => {
     });
   }
 
+  initAuth();
   initSettingsMenu();
 
   // A hung request (e.g. a stuck DB transaction server-side) must never
@@ -139,11 +286,26 @@ const membase = (() => {
   // instead of an infinite wait.
   const REQUEST_TIMEOUT_MS = 150_000;
 
-  async function fetchWithTimeout(url, options) {
+  async function fetchWithTimeout(url, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const token = getToken();
+    const headers = { ...(options.headers || {}) };
+    // Every route except POST /api/auth/login requires this -- see
+    // app/auth.py require_auth. Attaching it unconditionally (login
+    // included) is harmless: login ignores the header entirely.
+    if (token) headers.Authorization = `Bearer ${token}`;
     try {
-      return await fetch(url, { ...options, signal: controller.signal });
+      const resp = await fetch(url, { ...options, headers, signal: controller.signal });
+      if (resp.status === 401) {
+        // The token this browser had is gone or was revoked (by this
+        // device's own logout, or from another device's session list).
+        // Drop it and ask for the password again -- whatever request
+        // just 401'd still surfaces its own error to its caller below.
+        clearToken();
+        showLoginOverlay();
+      }
+      return resp;
     } catch (err) {
       if (err.name === "AbortError") {
         throw new Error("Request timed out. The server may be stuck -- please try again in a moment.");
