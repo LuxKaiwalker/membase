@@ -1958,15 +1958,17 @@ every push to `main` touching the frontend's own inputs and publishes
 `dist/` via `actions/upload-pages-artifact` + `actions/deploy-pages` --
 nothing built is ever committed to `main`.
 
-**Reason:** The three templates render with an empty context at every
-call site (`app/web/routes.py`) -- verified by grep, not assumed: no
-`{{ }}` interpolation anywhere outside `{% block %}`/`{% extends %}`.
-That makes a one-time, build-time render exactly as correct as the
-backend's own live Jinja2Templates rendering would be, with no server
-and no second hand-maintained copy of the markup to drift out of sync
-with the templates the backend still ships (even though it no longer
-serves them to anyone in production -- they stay the single source of
-truth for the HTML structure).
+**Reason:** The templates rendered with an empty context at every call
+site, back when `app/web/routes.py` still existed and served them
+itself -- verified by grep at the time, not assumed: no `{{ }}`
+interpolation anywhere outside `{% block %}`/`{% extends %}`. That made
+a one-time, build-time render exactly as correct as the backend's own
+live Jinja2Templates rendering was, with no server. `app/web/routes.py`
+itself was removed shortly after (see "API-only backend: stop serving
+the frontend's own HTML/static files") once nothing depended on the
+backend serving these pages live any more -- the templates under
+`backend/app/templates/` remain, now purely as this build script's
+source material, the single place the HTML structure is defined.
 
 **Not done:** no visual/screenshot regression check between what the
 backend would render and what the static build produces -- acceptable
@@ -2001,11 +2003,13 @@ backend (`deploy/nginx-membase.conf`'s `auth_basic`/`auth_basic_user_file`),
 not by the application. The frontend still shows a custom login-style
 overlay (`app/static/app.js`'s `initAuth()`), but it no longer talks to any
 `/api/auth/*` endpoint -- there isn't one anymore. It just collects a
-backend URL + username + password once, stores them in `localStorage`, and
-attaches `Authorization: Basic <base64(user:pass)>` to every API request
-itself (not via the browser's native Basic Auth prompt/cache, which would
-mean a jarring OS-native dialog instead of this app's own overlay). nginx
-is the only thing that ever actually validates the credentials.
+username + password once, stores them in `localStorage`, and attaches
+`Authorization: Basic <base64(user:pass)>` to every API request itself
+(not via the browser's native Basic Auth prompt/cache, which would mean
+a jarring OS-native dialog instead of this app's own overlay). nginx is
+the only thing that ever actually validates the credentials. (The
+backend's own address stopped being collected here too, shortly after --
+see "Hardcode the backend URL instead of asking for it at login".)
 
 **Reason:** User-requested, after an explicit discussion of the tradeoff:
 proxy-level Basic Auth is the conventional baseline for a single-user
@@ -2132,3 +2136,54 @@ browser-DOM-timing and cross-origin-error-response behaviors that the
 existing `pytest` suite, which never runs a real browser or a real
 nginx, structurally can't exercise) -- caught by manually loading the
 deployed site in an actual browser instead.
+
+---
+
+## Hardcode the backend URL instead of asking for it at login
+
+**Decision:** `app/static/app.js` now has a fixed `BACKEND_URL` constant
+(`https://membase-api.vxliu.com`) instead of reading it from a field the
+login overlay collected and stored in `localStorage`. The overlay now
+only asks for username + password.
+
+**Reason:** User-requested, once the backend's hostname had actually
+settled (after two iterations to get past the GitHub Pages hostname
+conflict and the Universal SSL wildcard-depth limit -- see "Cloudflare
+Tunnel for CGNAT-safe public reachability"). This frontend is only ever
+published for this one backend; asking for its address at every login
+was friction with nothing to gain once that address stopped changing.
+Matches the "fixed at deploy time" option considered (and deliberately
+not chosen) back when the backend's reachability was still unsettled --
+revisit if that ever becomes true again.
+
+**Not done:** no build-time templating/env-var injection for this
+constant -- it's a literal string in the committed source, so pointing
+a fork of this frontend at a different backend means editing
+`app/static/app.js` directly, not just setting a build variable.
+Acceptable given there's exactly one deployment of this frontend.
+
+## API-only backend: stop serving the frontend's own HTML/static files
+
+**Decision:** Removed `app/web/routes.py` (the four page routes --
+`/`, `/recall`, `/captures`, `/docs`) and the `/static` `StaticFiles`
+mount from `app/main.py` entirely. The backend now serves `/api/*`
+only; everything else 404s.
+
+**Reason:** User-reported: visiting the backend's own domain
+(`membase-api.vxliu.com`) rendered the same HTML pages the frontend
+does, because nginx proxied every path -- not just `/api/*` -- straight
+to this app, which still had its own, now-entirely-redundant copy of
+the page routes left over from before the GitHub Pages split. An API
+domain rendering a website is confusing and not what "it should only
+be an API" means. `backend/app/templates/` and `backend/app/static/`
+still exist in the repo -- `scripts/build_frontend.py` reads them
+directly off disk as source files for the GitHub Pages build (see
+"Publishing the frontend to GitHub Pages") -- but this running process
+never serves them over HTTP any more.
+
+**Not done:** nginx's own config wasn't narrowed to `location /api/`
+specifically -- it still proxies every path to the backend, which now
+just means those paths 404 instead of silently serving a website. Left
+as-is since a 404 is already the correct, unconfusing behavior for an
+API-only domain; narrowing the nginx location would be pure belt-and-
+suspenders with no behavior change.

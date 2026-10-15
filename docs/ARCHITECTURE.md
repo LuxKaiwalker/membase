@@ -799,8 +799,8 @@ This app has no authentication code of its own -- see docs/DECISIONS.md
 Basic Auth enforced entirely by the nginx reverse proxy in front of the
 backend (`deploy/nginx-membase.conf`); this app trusts whatever request
 already reached it. The frontend's login overlay (`app/static/app.js`'s
-`initAuth()`) collects a backend URL + username/password once, stores
-them in `localStorage`, and attaches `Authorization: Basic
+`initAuth()`) collects a username/password once, stores them in
+`localStorage`, and attaches `Authorization: Basic
 <base64(user:pass)>` to every API request itself -- there's no
 `/api/auth/*` route, session, or token on the backend to manage. CORS
 is also nginx's job, not this app's (see docs/DECISIONS.md "Move CORS

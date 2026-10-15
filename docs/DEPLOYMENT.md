@@ -103,13 +103,15 @@ its own on login attempts -- nginx owns all of that now (see "nginx +
 Cloudflare Tunnel" below).
 
 The frontend's login overlay (`app/static/app.js`'s `initAuth()`)
-still exists, but its job changed: it collects a backend URL plus a
-username/password once, stores them in this browser's `localStorage`,
-and attaches `Authorization: Basic <base64(user:pass)>` to every API
-request itself. There's no `/login` endpoint to call first -- the
-credentials are only ever actually checked by nginx, on the very next
-real API request. A 401 clears the stored credentials and re-shows the
-overlay.
+still exists, but its job changed: it collects a username/password
+once, stores them in this browser's `localStorage`, and attaches
+`Authorization: Basic <base64(user:pass)>` to every API request
+itself. The backend's address (`BACKEND_URL` in `app.js`) is fixed at
+build time, not asked for at login -- this frontend is only ever
+published for this one backend. There's no `/login` endpoint to call
+first -- the credentials are only ever actually checked by nginx, on
+the very next real API request. A 401 clears the stored credentials
+and re-shows the overlay.
 
 ## nginx + Cloudflare Tunnel
 
@@ -225,30 +227,35 @@ above; the two can't be the same hostname, see docs/DECISIONS.md
 "Cloudflare Tunnel for CGNAT-safe public reachability" for how that
 conflict got resolved).
 
-The three page templates render with an empty context (`app/web/routes.py`
-passes `{}` to every `TemplateResponse` call) -- confirmed, not assumed:
-there's no `{{ }}` variable interpolation in any of them outside
-`{% block %}`/`{% extends %}`. That makes them safe to pre-render exactly
-once, with no server, via `scripts/build_frontend.py` (plain Jinja2, not
-FastAPI's request-bound `Jinja2Templates`), rather than needing a second
-hand-maintained copy of the HTML.
+The four page templates (`create`, `recall`, `captures`, `docs`) render
+with an empty context -- no `{{ }}` variable interpolation in any of
+them outside `{% block %}`/`{% extends %}` (verified by grep, not
+assumed, back when the backend still served them itself). That made
+them safe to pre-render exactly once, with no server, via
+`scripts/build_frontend.py` (plain Jinja2, not FastAPI's request-bound
+`Jinja2Templates`), rather than needing a second hand-maintained copy
+of the HTML. The backend itself no longer serves these templates or
+`/static` at all -- see docs/DECISIONS.md "API-only backend: stop
+serving the frontend's own HTML/static files"; `backend/app/templates/`
+and `backend/app/static/` now exist purely as source files this build
+script reads directly off disk, never over HTTP.
 
-**One-time setup**: repo Settings → Pages → Source → "GitHub Actions"
-(currently "Deploy from a branch", which is why visiting the Pages URL
-shows the README rendered by GitHub's default Jekyll theme instead of
-the actual frontend -- there's no `index.html` in the published branch
-for it to prefer).
+Repo Settings → Pages → Source is set to "GitHub Actions" (not "Deploy
+from a branch", which would otherwise just render the README via
+GitHub's default Jekyll theme -- no `index.html` in the published
+branch for it to prefer).
 
-**After that**, `.github/workflows/pages.yml` handles the rest on every
-push to `main` that touches the frontend's own inputs (the templates,
+`.github/workflows/pages.yml` handles the rest on every push to `main`
+that touches the frontend's own inputs (the templates,
 `backend/app/static/`, or the build script itself): runs
 `scripts/build_frontend.py` into `dist/` (`index.html` for `/`,
 `recall/index.html` for `/recall/`, `captures/index.html` for
-`/captures/`, `static/app.js`/`app.css` copied verbatim, a `.nojekyll`
-marker so GitHub's Jekyll processor leaves the plain HTML alone, and the
-repo-root `CNAME` copied in), then publishes `dist/` via
-`actions/upload-pages-artifact` + `actions/deploy-pages`. Nothing built
-is ever committed to `main` -- the artifact is produced fresh per deploy.
+`/captures/`, `docs/index.html` for `/docs/`, `static/app.js`/`app.css`
+copied verbatim, a `.nojekyll` marker so GitHub's Jekyll processor
+leaves the plain HTML alone, and the repo-root `CNAME` copied in), then
+publishes `dist/` via `actions/upload-pages-artifact` +
+`actions/deploy-pages`. Nothing built is ever committed to `main` --
+the artifact is produced fresh per deploy.
 
 CORS is handled by nginx (`deploy/nginx-membase.conf`), not a backend
 env var -- see docs/DECISIONS.md "Move CORS to nginx: an app-level

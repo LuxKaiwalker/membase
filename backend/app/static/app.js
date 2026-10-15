@@ -95,32 +95,16 @@ const membase = (() => {
   // Authentication is handled by the nginx reverse proxy in front of
   // this app (HTTP Basic Auth), not by this app itself -- see
   // docs/DECISIONS.md "Retire app-level auth for nginx Basic Auth".
-  // This file's job is just: collect the backend's base URL plus a
-  // username/password once, store them in this browser, and attach
-  // them as a Basic Auth header on every API request -- there is no
-  // server-side session, token, or per-device identity to manage
-  // anymore (one shared credential pair, like any other HTTP Basic
-  // Auth deployment). The backend URL is stored separately from the
-  // credentials and survives logout, since it rarely changes and
-  // re-typing it every time is pure friction.
-  const BACKEND_URL_KEY = "membase.backendUrl";
+  // This file's job is just: collect a username/password once, store
+  // them in this browser, and attach them as a Basic Auth header on
+  // every API request -- there is no server-side session, token, or
+  // per-device identity to manage anymore (one shared credential pair,
+  // like any other HTTP Basic Auth deployment). The backend's address
+  // is fixed at build time (below), not asked for at login -- this
+  // frontend is only ever published for this one backend, so prompting
+  // for its URL every time was pure friction with nothing to gain.
+  const BACKEND_URL = "https://membase-api.vxliu.com";
   const CREDENTIALS_KEY = "membase.basicAuth";
-
-  function getBackendUrl() {
-    try {
-      return (localStorage.getItem(BACKEND_URL_KEY) || "").replace(/\/+$/, "");
-    } catch {
-      return "";
-    }
-  }
-
-  function setBackendUrl(value) {
-    try {
-      localStorage.setItem(BACKEND_URL_KEY, value.replace(/\/+$/, ""));
-    } catch {
-      // Not persisted across a reload -- not worth surfacing as an error.
-    }
-  }
 
   function getCredentials() {
     try {
@@ -149,15 +133,7 @@ const membase = (() => {
 
   function showLoginOverlay() {
     const overlay = document.getElementById("login-overlay");
-    if (!overlay) return;
-    // Pre-fill whatever backend URL is already stored -- only the
-    // credentials need re-entering (they're what's missing/wrong),
-    // and the URL rarely changes. Centralized here, not duplicated at
-    // each call site, so every path that shows the overlay (initial
-    // load, explicit logout, an automatic 401 retry) behaves the same.
-    const backendUrlInput = document.getElementById("login-backend-url");
-    if (backendUrlInput) backendUrlInput.value = getBackendUrl();
-    show(overlay);
+    if (overlay) show(overlay);
   }
 
   function hideLoginOverlay() {
@@ -168,14 +144,13 @@ const membase = (() => {
   function initAuth() {
     const overlay = document.getElementById("login-overlay");
     const form = document.getElementById("login-form");
-    const backendUrlInput = document.getElementById("login-backend-url");
     const usernameInput = document.getElementById("login-username");
     const passwordInput = document.getElementById("login-password");
     const errorEl = document.getElementById("login-error");
     const logoutButton = document.getElementById("logout-button");
-    if (!overlay || !form || !backendUrlInput || !usernameInput || !passwordInput || !errorEl || !logoutButton) return;
+    if (!overlay || !form || !usernameInput || !passwordInput || !errorEl || !logoutButton) return;
 
-    if (getBackendUrl() && getCredentials()) {
+    if (getCredentials()) {
       hideLoginOverlay();
     } else {
       showLoginOverlay();
@@ -184,12 +159,11 @@ const membase = (() => {
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       hide(errorEl);
-      if (!backendUrlInput.value || !usernameInput.value || !passwordInput.value) {
-        errorEl.textContent = "Backend URL, username, and password are all required.";
+      if (!usernameInput.value || !passwordInput.value) {
+        errorEl.textContent = "Username and password are both required.";
         show(errorEl);
         return;
       }
-      setBackendUrl(backendUrlInput.value);
       setCredentials(usernameInput.value, passwordInput.value);
       passwordInput.value = "";
       // Reload rather than just hiding the overlay -- there's no
@@ -279,11 +253,11 @@ const membase = (() => {
     // app's custom overlay instead of a jarring browser dialog.
     if (credentials) headers.Authorization = `Basic ${credentials}`;
     // Every API path is relative ("/api/...") in the markup/call
-    // sites; prefixed here with the configured backend origin so this
-    // works whether the page is served by the backend itself
-    // (same-origin, backend URL "") or published separately (GitHub
-    // Pages, cross-origin).
-    const url = path.startsWith("/") ? `${getBackendUrl()}${path}` : path;
+    // sites; prefixed here with the fixed backend origin (this
+    // frontend is only ever published for this one backend) since
+    // they're cross-origin -- GitHub Pages serves this page, not
+    // the backend itself.
+    const url = path.startsWith("/") ? `${BACKEND_URL}${path}` : path;
     try {
       const resp = await fetch(url, { ...options, headers, signal: controller.signal });
       if (resp.status === 401) {
