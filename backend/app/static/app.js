@@ -149,7 +149,15 @@ const membase = (() => {
 
   function showLoginOverlay() {
     const overlay = document.getElementById("login-overlay");
-    if (overlay) show(overlay);
+    if (!overlay) return;
+    // Pre-fill whatever backend URL is already stored -- only the
+    // credentials need re-entering (they're what's missing/wrong),
+    // and the URL rarely changes. Centralized here, not duplicated at
+    // each call site, so every path that shows the overlay (initial
+    // load, explicit logout, an automatic 401 retry) behaves the same.
+    const backendUrlInput = document.getElementById("login-backend-url");
+    if (backendUrlInput) backendUrlInput.value = getBackendUrl();
+    show(overlay);
   }
 
   function hideLoginOverlay() {
@@ -170,7 +178,6 @@ const membase = (() => {
     if (getBackendUrl() && getCredentials()) {
       hideLoginOverlay();
     } else {
-      backendUrlInput.value = getBackendUrl();
       showLoginOverlay();
     }
 
@@ -198,7 +205,6 @@ const membase = (() => {
       // anymore, just a shared credential pair nginx checks on every
       // request. "Logging out" is purely this browser forgetting it.
       clearCredentials();
-      backendUrlInput.value = getBackendUrl();
       showLoginOverlay();
     });
   }
