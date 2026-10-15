@@ -163,6 +163,46 @@ front" advice from earlier revisions of this doc -- nginx here never
 holds a TLS certificate at all; Cloudflare's edge is what the browser
 actually negotiates TLS with.
 
+### Layering Cloudflare's edge features on top of nginx
+
+nginx stays in place as the one local chokepoint -- deliberately not
+replaced by Cloudflare Access/edge-only equivalents, even though
+Cloudflare can do several of the same things (security headers, rate
+limiting) at the edge. Reason: the backend machine is also on a
+Tailscale tailnet; an edge-only approach would only protect requests
+that actually go through the Cloudflare Tunnel hostname, leaving a
+direct Tailscale hit to the machine (bypassing `membase.vxliu.com`
+entirely) with no auth at all, since the app itself has none anymore.
+nginx sits in front of the app regardless of which path a request
+takes to reach the machine, so it stays authoritative for Basic Auth.
+
+What *is* worth adding at Cloudflare's dashboard, as an **additional**,
+redundant layer in front of nginx's own copy -- not instead of it,
+since none of this applies to the Tailscale-direct path nginx still
+covers:
+
+1. **SSL/TLS → Edge Certificates → "Always Use HTTPS" + HSTS.**
+   Cloudflare's own HSTS toggle (with its built-in lockout safeguards)
+   is the more correct place to manage this than nginx's `add_header
+   Strict-Transport-Security`, since it's set directly on the response
+   the browser actually negotiated TLS with.
+2. **Rules → Transform Rules → Modify Response Header**, for
+   `membase.vxliu.com`: `X-Content-Type-Options: nosniff`,
+   `X-Frame-Options: DENY`, `Referrer-Policy:
+   strict-origin-when-cross-origin` -- mirrors `deploy/nginx-membase.conf`'s
+   headers, applied before the response ever re-enters the tunnel.
+3. **Security → WAF → Rate limiting rules**, for `membase.vxliu.com`:
+   a looser outer bound (e.g. 50 req/min per IP) than nginx's own
+   `limit_req` (10 req/s) -- catches gross abuse before it ever
+   consumes tunnel bandwidth, while nginx's tighter limit still does
+   the fine-grained enforcement for anything that gets through.
+4. **Security → Bots → Bot Fight Mode** (free tier) -- pure upside,
+   nothing equivalent exists in nginx at all.
+
+Exact free-tier availability/limits for Transform Rules and rate
+limiting have changed over time on Cloudflare's end; check your own
+dashboard rather than trusting a specific quota here.
+
 ## Auth system ideas (alternatives considered)
 
 The options below were evaluated before picking the token-based login

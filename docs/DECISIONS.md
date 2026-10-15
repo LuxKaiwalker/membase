@@ -1920,6 +1920,24 @@ record pointing the hostname at the tunnel). Config: `deploy/cloudflared-config.
 its one tunnel connection drops -- acceptable for a single-user app; revisit
 if uptime ever becomes a real requirement.
 
+**Layering, not replacing, nginx with Cloudflare's edge features:**
+Cloudflare can do several of nginx's jobs at the edge too (security
+headers, HSTS, rate limiting), raising the question of whether nginx
+is redundant now. Decision: keep nginx as the one local chokepoint,
+add the Cloudflare-side equivalents as an *additional* layer in front
+of it, not a replacement -- see docs/DEPLOYMENT.md "Layering
+Cloudflare's edge features on top of nginx" for the concrete dashboard
+steps. Reason: the backend machine is also reachable over Tailscale;
+an edge-only approach (Cloudflare Access instead of nginx's Basic
+Auth, edge-only headers/rate-limiting with no local copy) would only
+protect requests that go through the public `membase.vxliu.com`
+hostname, leaving a direct Tailscale hit to the machine completely
+unauthenticated, since the app itself has no auth code of its own.
+nginx sits in front of the app regardless of which network path a
+request takes to reach the machine, so it stays authoritative; the
+Cloudflare-edge copies are redundant on purpose, catching abuse before
+it ever consumes tunnel bandwidth, not instead of nginx's own.
+
 ### Retire app-level auth for nginx Basic Auth
 
 **Decision:** The password-login + per-device bearer-token system
