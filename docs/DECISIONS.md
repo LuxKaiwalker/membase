@@ -1889,8 +1889,8 @@ still bound `127.0.0.1`-only), and the frontend is published to GitHub
 Pages as static files, a different origin. This section covers the pieces
 that changed to make that split work: how the backend becomes reachable at
 all despite CGNAT, and the auth/reverse-proxy architecture in front of it.
-(The actual static-file extraction/publish workflow for the frontend is
-covered separately -- see the next entry below once that work lands.)
+See "Publishing the frontend to GitHub Pages" below for the actual
+static-file extraction/publish workflow.
 
 ### Cloudflare Tunnel for CGNAT-safe public reachability
 
@@ -1901,24 +1901,61 @@ open a hole in, regardless of any router configuration. The machine is
 already on a Tailscale tailnet, but Tailscale Funnel (the feature that
 would expose a tailnet service to the public internet without port
 forwarding) only serves on a Tailscale-assigned `*.ts.net` hostname, not an
-arbitrary custom domain -- and a real custom domain (`membase.vxliu.com`,
-already owned) was a hard requirement.
+arbitrary custom domain -- and a real custom domain (`vxliu.com`, already
+owned) was a hard requirement.
 
 **Mechanics:** `cloudflared`, a daemon running on the backend machine,
 makes an *outbound* connection to Cloudflare's edge network -- no inbound
 port needed on this machine at all, so CGNAT is irrelevant. Cloudflare's
-edge terminates TLS for `membase.vxliu.com` (using their own cert,
+edge terminates TLS for `api.membase.vxliu.com` (using their own cert,
 auto-issued and auto-renewed -- no certbot/ACME management on this end)
 and forwards traffic through that outbound tunnel to whatever
 `cloudflared`'s ingress config points it at locally -- here, nginx on
 `127.0.0.1:8080`, not directly to the FastAPI backend (see below for why).
-Prerequisite: `membase.vxliu.com`'s authoritative DNS must be hosted on
-Cloudflare (`cloudflared tunnel route dns` provisions the actual DNS
-record pointing the hostname at the tunnel). Config: `deploy/cloudflared-config.yml`.
+Prerequisite: `vxliu.com`'s authoritative DNS must be hosted on Cloudflare
+(`cloudflared tunnel route dns` provisions the actual DNS record pointing
+the hostname at the tunnel). Config: `deploy/cloudflared-config.yml`.
+
+**The hostname is `api.membase.vxliu.com`, not the bare
+`membase.vxliu.com`** -- discovered as a real conflict mid-implementation:
+`membase.vxliu.com` was already claimed as GitHub Pages' custom domain for
+the frontend (a `CNAME` file at the repo root, added via GitHub's own UI
+before this was noticed), and a single hostname's DNS can't point at both
+GitHub Pages' infrastructure and a Cloudflare Tunnel at the same time. The
+`api.` subdomain for the backend resolves this with no DNS-zone changes
+needed beyond the one new record `cloudflared tunnel route dns` creates --
+both hostnames are under the same `vxliu.com` zone regardless.
 
 **Not done:** no failover/redundancy if the single `cloudflared` process or
 its one tunnel connection drops -- acceptable for a single-user app; revisit
 if uptime ever becomes a real requirement.
+
+### Publishing the frontend to GitHub Pages
+
+**Decision:** `scripts/build_frontend.py` pre-renders the three Jinja
+page templates (`backend/app/templates/{create,recall,captures}.html`)
+with plain Jinja2 and an empty context into static `dist/index.html`,
+`dist/recall/index.html`, `dist/captures/index.html`, copies
+`backend/app/static/` verbatim, and adds a `.nojekyll` marker plus the
+repo-root `CNAME`. `.github/workflows/pages.yml` runs that script on
+every push to `main` touching the frontend's own inputs and publishes
+`dist/` via `actions/upload-pages-artifact` + `actions/deploy-pages` --
+nothing built is ever committed to `main`.
+
+**Reason:** The three templates render with an empty context at every
+call site (`app/web/routes.py`) -- verified by grep, not assumed: no
+`{{ }}` interpolation anywhere outside `{% block %}`/`{% extends %}`.
+That makes a one-time, build-time render exactly as correct as the
+backend's own live Jinja2Templates rendering would be, with no server
+and no second hand-maintained copy of the markup to drift out of sync
+with the templates the backend still ships (even though it no longer
+serves them to anyone in production -- they stay the single source of
+truth for the HTML structure).
+
+**Not done:** no visual/screenshot regression check between what the
+backend would render and what the static build produces -- acceptable
+given the render is deterministic and the templates have zero dynamic
+context to begin with.
 
 **Layering, not replacing, nginx with Cloudflare's edge features:**
 Cloudflare can do several of nginx's jobs at the edge too (security
@@ -1930,7 +1967,7 @@ Cloudflare's edge features on top of nginx" for the concrete dashboard
 steps. Reason: the backend machine is also reachable over Tailscale;
 an edge-only approach (Cloudflare Access instead of nginx's Basic
 Auth, edge-only headers/rate-limiting with no local copy) would only
-protect requests that go through the public `membase.vxliu.com`
+protect requests that go through the public `api.membase.vxliu.com`
 hostname, leaving a direct Tailscale hit to the machine completely
 unauthenticated, since the app itself has no auth code of its own.
 nginx sits in front of the app regardless of which network path a

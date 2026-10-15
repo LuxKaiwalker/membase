@@ -141,20 +141,26 @@ arbitrary custom domain).
    (prompts for the password interactively; `openssl passwd -apr1` is
    used instead of requiring the separate `apache2-utils`/`httpd`
    package just for its `htpasswd` binary).
-3. **Cloudflare Tunnel**: requires `membase.vxliu.com`'s DNS to be
-   hosted on Cloudflare first (point the domain's nameservers at
-   Cloudflare, or add it as a site there). Then:
+3. **Cloudflare Tunnel**: uses `api.membase.vxliu.com`, **not** the
+   bare `membase.vxliu.com` -- that hostname is already GitHub Pages'
+   custom domain for the frontend (see "Publishing the frontend to
+   GitHub Pages" below and docs/DECISIONS.md "Cloudflare Tunnel for
+   CGNAT-safe public reachability"), and one hostname can't point at
+   both. Requires `vxliu.com`'s DNS to be hosted on Cloudflare first
+   (point the domain's nameservers at Cloudflare, or add it as a site
+   there) -- this covers `api.membase.vxliu.com` too, as a subdomain of
+   the same zone. Then:
    ```
    cloudflared tunnel login
    cloudflared tunnel create membase
-   cloudflared tunnel route dns membase membase.vxliu.com
+   cloudflared tunnel route dns membase api.membase.vxliu.com
    ```
    Copy `deploy/cloudflared-config.yml` to wherever `cloudflared`
    expects it, filling in the tunnel ID and credentials-file path
    `tunnel create` printed. Run it (`cloudflared tunnel run membase`,
    or via the NixOS `services.cloudflared` module / a systemd unit for
    anything longer-running than a manual test).
-4. Confirm end to end: `curl -u yourusername https://membase.vxliu.com/api/captures`
+4. Confirm end to end: `curl -u yourusername https://api.membase.vxliu.com/api/captures`
    should prompt for the password and then return `[]` (or your real
    captures) -- not a connection error, not an unauthenticated 200.
 
@@ -171,7 +177,7 @@ Cloudflare can do several of the same things (security headers, rate
 limiting) at the edge. Reason: the backend machine is also on a
 Tailscale tailnet; an edge-only approach would only protect requests
 that actually go through the Cloudflare Tunnel hostname, leaving a
-direct Tailscale hit to the machine (bypassing `membase.vxliu.com`
+direct Tailscale hit to the machine (bypassing `api.membase.vxliu.com`
 entirely) with no auth at all, since the app itself has none anymore.
 nginx sits in front of the app regardless of which path a request
 takes to reach the machine, so it stays authoritative for Basic Auth.
@@ -187,11 +193,11 @@ covers:
    Strict-Transport-Security`, since it's set directly on the response
    the browser actually negotiated TLS with.
 2. **Rules → Transform Rules → Modify Response Header**, for
-   `membase.vxliu.com`: `X-Content-Type-Options: nosniff`,
+   `api.membase.vxliu.com`: `X-Content-Type-Options: nosniff`,
    `X-Frame-Options: DENY`, `Referrer-Policy:
    strict-origin-when-cross-origin` -- mirrors `deploy/nginx-membase.conf`'s
    headers, applied before the response ever re-enters the tunnel.
-3. **Security → WAF → Rate limiting rules**, for `membase.vxliu.com`:
+3. **Security → WAF → Rate limiting rules**, for `api.membase.vxliu.com`:
    a looser outer bound (e.g. 50 req/min per IP) than nginx's own
    `limit_req` (10 req/s) -- catches gross abuse before it ever
    consumes tunnel bandwidth, while nginx's tighter limit still does
@@ -202,6 +208,46 @@ covers:
 Exact free-tier availability/limits for Transform Rules and rate
 limiting have changed over time on Cloudflare's end; check your own
 dashboard rather than trusting a specific quota here.
+
+## Publishing the frontend to GitHub Pages
+
+The frontend (`backend/app/templates/*.html` + `backend/app/static/`)
+is published separately from the backend, to GitHub Pages under the
+custom domain `membase.vxliu.com` -- **not** `api.membase.vxliu.com`,
+which is the backend's own hostname (see "nginx + Cloudflare Tunnel"
+above; the two can't be the same hostname, see docs/DECISIONS.md
+"Cloudflare Tunnel for CGNAT-safe public reachability" for how that
+conflict got resolved).
+
+The three page templates render with an empty context (`app/web/routes.py`
+passes `{}` to every `TemplateResponse` call) -- confirmed, not assumed:
+there's no `{{ }}` variable interpolation in any of them outside
+`{% block %}`/`{% extends %}`. That makes them safe to pre-render exactly
+once, with no server, via `scripts/build_frontend.py` (plain Jinja2, not
+FastAPI's request-bound `Jinja2Templates`), rather than needing a second
+hand-maintained copy of the HTML.
+
+**One-time setup**: repo Settings → Pages → Source → "GitHub Actions"
+(currently "Deploy from a branch", which is why visiting the Pages URL
+shows the README rendered by GitHub's default Jekyll theme instead of
+the actual frontend -- there's no `index.html` in the published branch
+for it to prefer).
+
+**After that**, `.github/workflows/pages.yml` handles the rest on every
+push to `main` that touches the frontend's own inputs (the templates,
+`backend/app/static/`, or the build script itself): runs
+`scripts/build_frontend.py` into `dist/` (`index.html` for `/`,
+`recall/index.html` for `/recall/`, `captures/index.html` for
+`/captures/`, `static/app.js`/`app.css` copied verbatim, a `.nojekyll`
+marker so GitHub's Jekyll processor leaves the plain HTML alone, and the
+repo-root `CNAME` copied in), then publishes `dist/` via
+`actions/upload-pages-artifact` + `actions/deploy-pages`. Nothing built
+is ever committed to `main` -- the artifact is produced fresh per deploy.
+
+Set the backend's `FRONTEND_ORIGIN` to `https://membase.vxliu.com`
+(see `.env.example`) once this is live, or every cross-origin API call
+from the published frontend gets blocked by the browser's own CORS
+enforcement before it even reaches the app.
 
 ## Auth system ideas (alternatives considered)
 
@@ -327,8 +373,8 @@ was specifically about avoiding.
 2. Set up nginx + Cloudflare Tunnel per "nginx + Cloudflare Tunnel"
    above -- generate the htpasswd file with a real password before
    the tunnel is live, not the placeholder you tested with.
-3. Set `FRONTEND_ORIGIN` to the actual published GitHub Pages origin
-   (e.g. `https://luxkaiwalker.github.io`) in the backend's production
+3. Set `FRONTEND_ORIGIN` to `https://membase.vxliu.com` (the published
+   GitHub Pages custom domain) in the backend's production
    environment -- the dev default (`http://127.0.0.1:8000`) won't
    match once the frontend is served from a different origin, and a
    mismatch here means every cross-origin API call gets blocked by the

@@ -1,0 +1,59 @@
+name: Publish frontend to GitHub Pages
+
+# Builds scripts/build_frontend.py's static output and publishes it via
+# GitHub's own Pages deployment action -- see docs/DEPLOYMENT.md
+# "Publishing the frontend to GitHub Pages". Requires the repo's Settings
+# -> Pages -> Source to be set to "GitHub Actions" (one-time, manual --
+# this workflow can't flip that setting itself).
+#
+# Triggers only on changes to the actual frontend inputs, not every push
+# to main -- a backend-only change (e.g. an ingestion pipeline fix) has
+# no effect on what gets published here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/app/templates/**"
+      - "backend/app/static/**"
+      - "scripts/build_frontend.py"
+      - "CNAME"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Just jinja2 -- this build has no other dependency, and
+      # intentionally doesn't go through flake.nix's dev shell (that's
+      # for running the actual backend, not for this one-shot static
+      # render).
+      - run: pip install jinja2
+      - run: python3 scripts/build_frontend.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

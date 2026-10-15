@@ -14,7 +14,7 @@ tunnel: <TUNNEL-ID-FROM-TUNNEL-CREATE>
 credentials-file: /root/.cloudflared/<TUNNEL-ID-FROM-TUNNEL-CREATE>.json
 
 ingress:
-  - hostname: membase.vxliu.com
+  - hostname: api.membase.vxliu.com
     service: http://127.0.0.1:8080
   # Required catch-all -- cloudflared refuses to start without one.
   - service: http_status:404
