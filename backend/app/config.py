@@ -8,16 +8,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
     database_url: str
-    # The one origin allowed to make cross-origin requests to this API
-    # (see app/main.py's CORSMiddleware) -- the published GitHub Pages
-    # frontend's origin in production. No wildcard: authentication is
-    # no longer this app's job (see docs/DECISIONS.md "Retire app-level
-    # auth for nginx Basic Auth"), so CORS is the one remaining layer
-    # deciding which *websites* may call this API from a browser at
-    # all, as opposed to who may call it directly (e.g. curl, which
-    # CORS never restricts -- it's a browser-enforced policy, not a
-    # server-side access control).
-    frontend_origin: str = "http://127.0.0.1:8000"
     ollama_host: str = "http://127.0.0.1:11434"
     # gemma4:12b -- natively multimodal (text/image/audio, no separate
     # vision encoder to wire up), used for *every* generation/structured-

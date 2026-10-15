@@ -802,9 +802,9 @@ already reached it. The frontend's login overlay (`app/static/app.js`'s
 `initAuth()`) collects a backend URL + username/password once, stores
 them in `localStorage`, and attaches `Authorization: Basic
 <base64(user:pass)>` to every API request itself -- there's no
-`/api/auth/*` route, session, or token on the backend to manage. The
-app's own contribution to this boundary is CORS only (`app/main.py`'s
-`CORSMiddleware`, allow-listing `Settings.frontend_origin`), needed
-because the frontend is published separately (GitHub Pages) from
-wherever the backend is reached. See docs/DEPLOYMENT.md "nginx +
-Cloudflare Tunnel" for the full request path from browser to backend.
+`/api/auth/*` route, session, or token on the backend to manage. CORS
+is also nginx's job, not this app's (see docs/DECISIONS.md "Move CORS
+to nginx: an app-level CORSMiddleware can't cover a proxy-level
+rejection") -- this app carries no CORS code at all. See
+docs/DEPLOYMENT.md "nginx + Cloudflare Tunnel" for the full request
+path from browser to backend.

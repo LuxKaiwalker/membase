@@ -2060,3 +2060,75 @@ as a "failed login attempt" the way the retired app-level limiter was
 (nginx has no visibility into response semantics without more complex
 config); the htpasswd file's credentials are managed entirely manually
 (generate with `openssl passwd -apr1`, no rotation tooling).
+
+---
+
+## Two live bugs found deploying the real frontend (DOM ordering, CORS on proxy-level rejections)
+
+Both only surfaced once the actual deployed frontend was exercised in a
+real browser for the first time -- everything up to this point had only
+been checked via `curl`/`node --check` (explicitly noted as a known gap
+in earlier entries), which can't catch either of these.
+
+### `#login-overlay` positioned after the script that needs it
+
+**The bug:** `app/templates/base.html` had `<div id="login-overlay">`
+positioned *after* `<main>{% block content %}{% endblock %}</main>`.
+Every page's content block includes `<script src="/static/app.js">`
+as a classic (non-deferred) script, which executes synchronously the
+moment the HTML parser reaches it -- before the parser has read
+`#login-overlay`, further down, into the DOM at all. `initAuth()` runs
+unconditionally at script load time and does
+`document.getElementById("login-overlay")` first; finding `null` (by
+design, matching every other element lookup in that file, each of
+which bails out gracefully rather than throwing on a missing element),
+it returned immediately. No error, no overlay, no event listeners ever
+attached -- indistinguishable from "there's no authentication at all"
+from the outside, which is exactly how it was reported.
+
+**Fix:** moved `#login-overlay` to appear directly after `</header>`,
+before `<main>` -- zero JS changes, the overlay's own `position: fixed`
+styling means its DOM position never affected how it looks, only
+whether `initAuth()` could find it in time.
+
+### Move CORS to nginx: an app-level `CORSMiddleware` can't cover a proxy-level rejection
+
+**The bug:** CORS lived in the FastAPI app's `CORSMiddleware`
+(`app/main.py`), allow-listing `Settings.frontend_origin`. That only
+covers responses the app itself produces. nginx's own `auth_basic` can
+reject a request (401) *before it ever reaches the app* -- and a
+401 nginx generates entirely on its own carries no CORS headers at
+all, since nothing added them. A browser blocks such a response from
+ever being read by the page's JS (a CORS failure, not a readable 401),
+so `fetchWithTimeout`'s `resp.status === 401` branch -- the one that
+clears stored credentials and re-shows the login overlay -- never ran;
+the failure surfaced as an opaque, generic error instead ("failed to
+save"). The same gap applies to the rate limiter's 429.
+
+**Fix:** moved CORS entirely into nginx (`deploy/nginx-membase.conf`):
+`Access-Control-Allow-*` headers added with `always` at the `location /`
+level, so they're present on every response that location can produce
+-- auth_basic's 401, the rate limiter's 429, and proxied responses from
+the app alike, not just the success path. The preflight `OPTIONS`
+request is now answered by nginx directly (`return 204`, after the CORS
+headers are already set) instead of being forwarded to the app with
+Basic Auth conditionally disabled for it -- simpler, and one fewer
+thing that depends on the app behaving correctly for an unauthenticated
+request type. `Settings.frontend_origin` and the app's `CORSMiddleware`
+were removed entirely; nginx is now the single source of truth for
+CORS, with no risk of the two layers emitting conflicting or duplicate
+`Access-Control-Allow-Origin` values (browsers reject a response with
+more than one).
+
+**Reason this wasn't caught earlier:** every prior CORS check (including
+in this same deployment session) tested the *success* path -- a
+preflight from the right origin, a request with correct credentials.
+Nothing exercised what a cross-origin client sees on a rejection nginx
+generates itself, which is precisely the case that matters most for the
+frontend's intended retry-on-401 UX.
+
+**Not done:** no automated test reproduces either bug (both are
+browser-DOM-timing and cross-origin-error-response behaviors that the
+existing `pytest` suite, which never runs a real browser or a real
+nginx, structurally can't exercise) -- caught by manually loading the
+deployed site in an actual browser instead.

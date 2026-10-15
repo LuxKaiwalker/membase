@@ -250,10 +250,11 @@ repo-root `CNAME` copied in), then publishes `dist/` via
 `actions/upload-pages-artifact` + `actions/deploy-pages`. Nothing built
 is ever committed to `main` -- the artifact is produced fresh per deploy.
 
-Set the backend's `FRONTEND_ORIGIN` to `https://membase.vxliu.com`
-(see `.env.example`) once this is live, or every cross-origin API call
-from the published frontend gets blocked by the browser's own CORS
-enforcement before it even reaches the app.
+CORS is handled by nginx (`deploy/nginx-membase.conf`), not a backend
+env var -- see docs/DECISIONS.md "Move CORS to nginx: an app-level
+CORSMiddleware can't cover a proxy-level rejection". Nothing to set on
+the backend for this; the allowed origin is the hardcoded
+`https://membase.vxliu.com` in that nginx config file.
 
 ## Auth system ideas (alternatives considered)
 
@@ -379,28 +380,20 @@ was specifically about avoiding.
 2. Set up nginx + Cloudflare Tunnel per "nginx + Cloudflare Tunnel"
    above -- generate the htpasswd file with a real password before
    the tunnel is live, not the placeholder you tested with.
-3. Set `FRONTEND_ORIGIN` to `https://membase.vxliu.com` (the published
-   GitHub Pages custom domain) in the backend's production
-   environment -- the dev default (`http://127.0.0.1:8000`) won't
-   match once the frontend is served from a different origin, and a
-   mismatch here means every cross-origin API call gets blocked by the
-   browser's own CORS enforcement (the request never even reaches this
-   app's logic -- check the browser console, not server logs, if this
-   is wrong).
-4. Confirm `app/main.py`'s `uvicorn.run(..., host="127.0.0.1", ...)`
+3. Confirm `app/main.py`'s `uvicorn.run(..., host="127.0.0.1", ...)`
    fallback and `scripts/run-prod.sh` both still say `127.0.0.1` --
    this should never change to `0.0.0.0`; nginx (itself only listening
    on `127.0.0.1:8080`, reached only via `cloudflared`'s local
    connection) is the only thing in this chain with any path from the
    public internet, and even it has no direct public-facing socket.
-5. Set `membase_max_upload_mb` / `membase_max_text_chars` to whatever
+4. Set `membase_max_upload_mb` / `membase_max_text_chars` to whatever
    you're actually comfortable with publicly-reachable-even-if-
    authenticated input costing in storage/LLM compute -- the defaults
    (50MB / 50,000 chars) are reasonable starting points, not
    load-tested ceilings. `deploy/nginx-membase.conf`'s
    `client_max_body_size` should stay in sync with
    `membase_max_upload_mb` if you change the latter.
-6. Make sure the machine's firewall doesn't already expose port 5544
+5. Make sure the machine's firewall doesn't already expose port 5544
    (Postgres), 11434 (Ollama), or 8000/8080 (the app/nginx) directly --
    none of them need to be, or should be, reachable from outside this
    machine; `cloudflared` is the only process that talks to the outside

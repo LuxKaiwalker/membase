@@ -2,12 +2,10 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import captures, recall, units
-from app.config import get_settings
 from app.llm import get_llm_provider
 from app.llm.base import LLMError
 from app.web import routes as web_routes
@@ -17,27 +15,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="membase")
 
-# Authentication is NOT handled in this app -- see docs/DECISIONS.md
-# "Retire app-level auth for nginx Basic Auth". A reverse proxy
-# (nginx) sitting in front of this process is expected to gate every
-# request with HTTP Basic Auth before it ever reaches here; this app
-# trusts whatever already reached it. Never bind this app directly to
-# a public interface without that proxy in front -- see
-# docs/DEPLOYMENT.md.
-#
-# CORS is still this app's job, not the proxy's: the frontend is
-# published separately (GitHub Pages), a different origin from
-# wherever this backend is reached, so cross-origin fetch() calls need
-# an explicit allow-list. Only the configured origin is allowed; no
-# wildcard, and no credentials mode (Basic Auth credentials are sent
-# as an explicit header by the frontend's own JS, not as a browser-
-# managed cookie, so `allow_credentials` is correctly left False).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[get_settings().frontend_origin],
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
+# Neither authentication nor CORS is handled in this app -- both are
+# nginx's job, in front of this process. See docs/DECISIONS.md "Retire
+# app-level auth for nginx Basic Auth" and "Move CORS to nginx: an
+# app-level CORSMiddleware can't cover a proxy-level rejection" (CORS
+# moved here after nginx's own 401/429 responses -- generated without
+# ever reaching this app -- turned out to need CORS headers too, which
+# only the layer producing every response, not just the proxied ones,
+# can guarantee). This app trusts whatever request already reached it.
+# Never bind this app directly to a public interface without nginx in
+# front -- see docs/DEPLOYMENT.md.
 
 app.include_router(captures.router)
 app.include_router(units.router)

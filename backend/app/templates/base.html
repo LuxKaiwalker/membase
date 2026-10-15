@@ -38,9 +38,6 @@
       </div>
     </div>
   </header>
-  <main>
-    {% block content %}{% endblock %}
-  </main>
   <div id="login-overlay" class="login-overlay hidden">
     <form id="login-form" class="login-form">
       <h1>membase</h1>
@@ -61,5 +58,8 @@
       <p id="login-error" class="error hidden"></p>
     </form>
   </div>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
 </body>
 </html>

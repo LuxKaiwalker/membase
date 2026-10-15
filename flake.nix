@@ -59,11 +59,6 @@
           export PGDATABASE=membase
           export DATABASE_URL="postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST_DIR&port=$PGPORT"
           export OLLAMA_HOST="http://127.0.0.1:11434"
-          # CORS allow-list for the API (see app/main.py's
-          # CORSMiddleware, app/config.py's frontend_origin). Defaults
-          # to same-origin local dev; a real deployment overrides this
-          # to the published GitHub Pages origin -- see docs/DEPLOYMENT.md.
-          export FRONTEND_ORIGIN="''${FRONTEND_ORIGIN:-http://127.0.0.1:8000}"
           export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
           export UPLOADS_DIR="$MEMBASE_ROOT/.data/uploads"
           mkdir -p "$PGHOST_DIR" "$UPLOADS_DIR"
