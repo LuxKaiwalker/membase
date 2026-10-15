@@ -271,14 +271,15 @@ moves to `status="processing"` and background finalization (above) runs
 -- this is what makes a clarified term's aliases actually searchable
 afterward, not just present in a one-off answer.
 
-Answering is optional, enforced only as a client-side preference (the
-settings menu's "obligatory" toggle, `app/static/app.js`), never by the
-API: `ClarifyRequest.answer` is `str | None`, and a blank/omitted answer
-skips the question -- nothing is appended to `clarifications`, the unit
-just proceeds through `_advance_unit()` exactly as if the question had
-never been asked. The user may also explicitly cancel an awaiting unit
-(`POST .../discard`, status becomes `"discarded"`) rather than answer
-or skip it.
+Answering is optional, never enforced by the API: `ClarifyRequest.answer`
+is `str | None`, and a blank/omitted answer skips the question -- nothing
+is appended to `clarifications`, the unit just proceeds through
+`_advance_unit()` exactly as if the question had never been asked. The
+user may also explicitly cancel an awaiting unit (`POST .../discard`,
+status becomes `"discarded"`) rather than answer or skip it -- the
+Browse tab's "skip all remaining follow-up questions" button is this,
+applied in bulk to every unit still pending across the whole list (see
+docs/DECISIONS.md "Clarification moved to Browse").
 
 Clarification is bounded on two axes (`app/ingestion/pipeline.py`):
 `MAX_QUESTIONS_PER_ROUND = 3` candidate questions considered per check
@@ -392,8 +393,9 @@ deliberately infrequent manual action, not part of the normal flow.
 
 **Visualized only on the Browse page** (`structure-badge-*` in
 `app/static/app.css`, read at page-load time, no polling) -- the Store
-page shows "Saved" as soon as clarification is resolved and never waits
-on or displays structuring status at all.
+page shows "Saved" as soon as the save itself is durable and never waits
+on or displays clarification or structuring status at all (see
+docs/DECISIONS.md "Clarification moved to Browse").
 
 **Deferred:** structurer-driven re-segmentation (splitting an existing
 ready unit into more units if the deeper pass judges the original

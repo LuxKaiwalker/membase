@@ -531,6 +531,16 @@ the setting has no bearing on data correctness, so adding persistence
 and a new guard clause for it would be solving a problem that doesn't
 exist yet.
 
+**Superseded:** the "obligatory" toggle was removed once clarification
+moved entirely to the Browse tab (see "Clarification moved to Browse")
+-- there's no longer a live, in-flight question on the Store page for
+"obligatory" to gate at all. The underlying API behavior this decision
+describes (a blank answer is always accepted, `resolve_clarification()`
+never requires one) is unchanged; only the client-side toggle and its
+effect on `required`/"Discard this one" visibility are gone -- Browse's
+per-unit clarification form now always offers both answering and
+discarding, with no obligatory mode.
+
 ---
 
 **Decision:** Migrated the single generation model from
@@ -1516,6 +1526,16 @@ model's own (already bounded, already fast) response time, so a second
 schema variant would have added real complexity for a saving that
 isn't the one that actually matters here.
 
+**Superseded:** the settings-menu checkbox for this (and the "obligatory"
+one mentioned above) were later removed once the Store page stopped
+blocking on clarification at all (see "Clarification moved to Browse")
+-- the unbounded-human-wait this setting existed to let someone opt out
+of no longer happens regardless, so there was nothing left for the
+toggle to usefully control from the UI. The underlying API field
+(`disable_followup_questions` on `POST /api/captures`) and pipeline
+parameter (`allow_clarification`) are untouched -- still real,
+server-enforced capabilities, just not exposed in the web UI any more.
+
 ---
 
 ## Benchmark: fast pipeline vs. structurer wall-clock time
@@ -2187,3 +2207,53 @@ just means those paths 404 instead of silently serving a website. Left
 as-is since a 404 is already the correct, unconfusing behavior for an
 API-only domain; narrowing the nginx location would be pure belt-and-
 suspenders with no behavior change.
+
+---
+
+## Clarification moved to Browse
+
+**Decision:** The Store page no longer shows any clarification UI at
+all. `runCapture()` (`app/static/app.js`) goes straight from "Saving..."
+to a result card the moment `POST /api/captures` returns -- if any
+resulting unit has `pending_clarification` set, the result card just
+notes that and points to the Browse tab; it never blocks, never shows
+the question, never offers to answer or discard inline. Resolving a
+pending clarification (`POST /api/memory-units/{id}/clarify` or
+`.../discard`) now happens exclusively on the Browse tab, via the
+per-unit form added there (see "Full-codebase audit and fix pass" --
+this UI already existed before this decision; what changed is Store no
+longer has a competing copy of it). The Browse tab's capture list also
+now sorts captures with at least one pending unit first (a stable sort,
+so each group keeps the backend's own newest-first order), and gained
+a single "Skip all remaining follow-up questions" button that discards
+every currently-pending unit across the whole list in one action
+(sequential `POST .../discard` calls, one per unit, confirmed once
+up front -- not parallel, since these share the same backend as
+everything else and there's no reason to race them).
+
+**Reason:** User-requested, consolidating clarification into one place
+instead of two. The Store page's in-flight clarification flow and the
+Browse tab's later-resolution flow had become two independent
+implementations of the same thing (same endpoints, materially the same
+UI, different code) -- confusing to maintain, and splitting "where do I
+answer a follow-up question" across two pages depending on *when* you
+happen to do it. Browse is also simply the better fit: it's the page
+that already visualizes a unit's status and background-processing
+progress, so a pending clarification sitting there alongside is one
+more thing to check in the place that's already "checking on things",
+not an interruption on the page whose only job is writing something
+down quickly.
+
+**What this removes:** both settings-menu toggles ("obligatory
+questions", "disable follow-up questions") -- see the two superseded
+notes on their original decisions above for why each stopped making
+sense once nothing on Store blocks any more. `buildCaptureCard()`'s
+clarification markup, `runCapture()`'s `pendingQueue`/
+`askNextClarification()`/clarification-form-handling, and
+`isObligatory()`/`isFollowupDisabled()` and their `localStorage` keys
+are all gone from `app.js`.
+
+**Not done:** no visual distinction in the Browse list beyond sort
+order for *why* something is sorted first (no separate heading/divider
+between "pending" and "everything else") -- the sort alone was judged
+sufficient; revisit if the list ever gets long enough that it isn't.

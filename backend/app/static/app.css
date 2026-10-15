@@ -85,19 +85,6 @@ header {
   z-index: 10;
 }
 
-.settings-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.9rem;
-  color: var(--fg);
-  margin: 0;
-}
-
-.settings-hint {
-  margin: 0.5rem 0 0;
-}
-
 .brand { font-weight: 700; }
 
 nav a {
@@ -265,11 +252,6 @@ button:hover { opacity: 0.9; }
 }
 .login-form h1 { margin: 0 0 0.25rem; font-size: 1.3rem; }
 
-.settings-divider {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 0.75rem 0;
-}
 .settings-logout {
   margin-top: 0.5rem;
   width: 100%;

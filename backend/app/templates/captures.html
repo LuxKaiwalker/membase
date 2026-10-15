@@ -3,7 +3,12 @@
 {% block content %}
 <section class="panel">
   <h1>Browse your memories</h1>
-  <p class="muted">Every capture you've saved, newest first. Deleting one removes its units and attachments for good.</p>
+  <p class="muted">
+    Anything still awaiting a follow-up question is listed first;
+    everything else, newest first. Deleting a capture removes its units
+    and attachments for good.
+  </p>
+  <button id="skip-all-followups" type="button" class="hidden">Skip all remaining follow-up questions</button>
 
   <div id="status" class="status hidden"></div>
   <div id="capture-list"></div>

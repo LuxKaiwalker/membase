@@ -35,63 +35,6 @@ const membase = (() => {
     return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
-  // Whether follow-up (clarification) questions must be answered is a
-  // client-side-only preference -- the API always accepts a blank answer
-  // as "skip this question" (see docs/DECISIONS.md), there is no
-  // server-side enforcement to keep in sync with. Defaults to true so
-  // existing behavior (answer required) is unchanged for anyone who
-  // never opens the settings menu.
-  const OBLIGATORY_SETTING_KEY = "membase.obligatoryQuestions";
-
-  // localStorage can throw (not just be unavailable) in some browser
-  // privacy modes/configurations -- this is called unconditionally at
-  // page-load time via initSettingsMenu(), so an uncaught exception here
-  // would break this entire script's top-level execution, silently
-  // disabling every button on the page, not just the settings menu.
-  function isObligatory() {
-    try {
-      return localStorage.getItem(OBLIGATORY_SETTING_KEY) !== "0";
-    } catch {
-      return true;
-    }
-  }
-
-  function setObligatory(value) {
-    try {
-      localStorage.setItem(OBLIGATORY_SETTING_KEY, value ? "1" : "0");
-    } catch {
-      // Preference just won't persist across reloads -- not worth
-      // surfacing an error for.
-    }
-  }
-
-  // Unlike "obligatory" above, this one IS enforced server-side (see
-  // docs/DECISIONS.md "Disable follow-up questions") -- when on, the
-  // `disable_followup_questions` form field is sent with every
-  // POST /api/captures, and the backend never surfaces a clarification
-  // question for that capture at all, regardless of what the model (or
-  // an explicit-metadata conflict) would otherwise have asked. Defaults
-  // to false so existing behavior is unchanged for anyone who never
-  // opens the settings menu.
-  const DISABLE_FOLLOWUP_SETTING_KEY = "membase.disableFollowupQuestions";
-
-  function isFollowupDisabled() {
-    try {
-      return localStorage.getItem(DISABLE_FOLLOWUP_SETTING_KEY) === "1";
-    } catch {
-      return false;
-    }
-  }
-
-  function setFollowupDisabled(value) {
-    try {
-      localStorage.setItem(DISABLE_FOLLOWUP_SETTING_KEY, value ? "1" : "0");
-    } catch {
-      // Preference just won't persist across reloads -- not worth
-      // surfacing an error for.
-    }
-  }
-
   // Authentication is handled by the nginx reverse proxy in front of
   // this app (HTTP Basic Auth), not by this app itself -- see
   // docs/DECISIONS.md "Retire app-level auth for nginx Basic Auth".
@@ -188,17 +131,7 @@ const membase = (() => {
   function initSettingsMenu() {
     const toggle = document.getElementById("settings-toggle");
     const menu = document.getElementById("settings-menu");
-    const obligatoryCheckbox = document.getElementById("setting-obligatory-questions");
-    const disableFollowupCheckbox = document.getElementById("setting-disable-followup-questions");
-    if (!toggle || !menu || !obligatoryCheckbox || !disableFollowupCheckbox) return;
-
-    obligatoryCheckbox.checked = isObligatory();
-    disableFollowupCheckbox.checked = isFollowupDisabled();
-    // "Must you answer a question that will never be asked" doesn't
-    // make sense -- grey the obligatory setting out while follow-up
-    // questions are disabled entirely, rather than leave two settings
-    // visibly contradicting each other.
-    obligatoryCheckbox.disabled = disableFollowupCheckbox.checked;
+    if (!toggle || !menu) return;
 
     toggle.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -216,12 +149,6 @@ const membase = (() => {
         hide(menu);
         toggle.setAttribute("aria-expanded", "false");
       }
-    });
-
-    obligatoryCheckbox.addEventListener("change", () => setObligatory(obligatoryCheckbox.checked));
-    disableFollowupCheckbox.addEventListener("change", () => {
-      setFollowupDisabled(disableFollowupCheckbox.checked);
-      obligatoryCheckbox.disabled = disableFollowupCheckbox.checked;
     });
   }
 
@@ -356,23 +283,15 @@ const membase = (() => {
     card.className = "card capture-card";
     card.innerHTML = `
       <p class="capture-saving muted"><span class="spinner" aria-hidden="true"></span>Saving...</p>
-      <div class="capture-clarification hidden">
-        <h2>One question</h2>
-        <p class="muted">This memory isn't saved as searchable yet until this is answered.</p>
-        <p class="capture-clarification-question"></p>
-        <form class="capture-clarification-form">
-          <input class="capture-clarification-answer" type="text" placeholder="Your answer" />
-          <button type="submit" class="capture-clarification-submit">Submit answer</button>
-          <button type="button" class="capture-clarification-discard">Discard this one</button>
-        </form>
-        <p class="capture-clarification-stage muted hidden"></p>
-        <p class="capture-clarification-error status error hidden"></p>
-      </div>
       <div class="capture-result hidden">
         <h2 class="capture-result-heading">Saved.</h2>
         <p class="muted">Derived information (automatically extracted; your original text above is never changed by it):</p>
         <pre class="derived"></pre>
         <p class="muted capture-attachment-list"></p>
+        <p class="muted capture-pending-note hidden">
+          One of these needs a quick follow-up question answered before
+          it's searchable -- see the Browse tab.
+        </p>
         <p class="muted capture-safe-to-leave">
           Your words are already saved. Everything else -- indexing it
           for search, and the slower background enrichment pass -- keeps
@@ -385,154 +304,33 @@ const membase = (() => {
     return card;
   }
 
-  // Drives one capture, from submission through any clarification
-  // rounds to background processing, entirely through this card's own
-  // elements and local state -- nothing here is shared with any other
-  // card, so several captures can be mid-flight at once.
+  // Drives one capture from submission to the result card, entirely
+  // through this card's own elements -- nothing here is shared with any
+  // other card, so several captures can be mid-flight at once. No
+  // clarification handling here any more -- a unit that needs a
+  // follow-up question answered just stays awaiting_clarification;
+  // resolving it only ever happens on the Browse tab now (see
+  // docs/DECISIONS.md "Clarification moved to Browse"), never blocking
+  // this page.
   function runCapture(card, formData) {
     const savingEl = card.querySelector(".capture-saving");
-    const clarificationSection = card.querySelector(".capture-clarification");
-    const clarificationQuestion = card.querySelector(".capture-clarification-question");
-    const clarificationForm = card.querySelector(".capture-clarification-form");
-    const clarificationAnswer = card.querySelector(".capture-clarification-answer");
-    const clarificationSubmit = card.querySelector(".capture-clarification-submit");
-    const clarificationDiscard = card.querySelector(".capture-clarification-discard");
-    const clarificationStage = card.querySelector(".capture-clarification-stage");
-    const clarificationError = card.querySelector(".capture-clarification-error");
     const resultSection = card.querySelector(".capture-result");
     const resultHeading = card.querySelector(".capture-result-heading");
     const derivedEl = card.querySelector(".derived");
     const errorEl = card.querySelector(".capture-error");
     const attachmentListEl = card.querySelector(".capture-attachment-list");
+    const pendingNoteEl = card.querySelector(".capture-pending-note");
 
-    let allUnits = [];
-    // Capture may split into several units; each may independently have
-    // a pending clarification. Ask them one at a time rather than all at
-    // once (spec: don't turn this into an interrogation).
-    let pendingQueue = [];
-    let currentAttachments = [];
-
-    // Read-only: just what's already attached to this memory. Attaching
-    // files happens before saving (see initCreatePage()'s selected-files
-    // list) -- this card never offers to add more after the fact (see
-    // docs/DECISIONS.md "Multi-file posthoc attachment").
-    function renderAttachmentList() {
-      attachmentListEl.textContent = currentAttachments.length
-        ? `Attachments: ${currentAttachments.map((a) => a.original_filename).join(", ")}`
+    function renderAttachmentList(attachments) {
+      attachmentListEl.textContent = attachments.length
+        ? `Attachments: ${attachments.map((a) => a.original_filename).join(", ")}`
         : "";
     }
 
     function showError(message) {
       hide(savingEl);
-      hide(clarificationSection);
       showStatus(errorEl, message, true);
     }
-
-    // Shown as soon as every pending clarification question (if any) is
-    // settled -- does not wait for background embedding/structuring to
-    // finish, since authoritative content and the derived fields shown
-    // below are already durably saved and known synchronously by this
-    // point. Whether background processing later succeeds, fails, or is
-    // still running is a Browse-page concern now, not this page's (see
-    // docs/DECISIONS.md "membase structurer").
-    function showResult() {
-      const saved = allUnits.filter((u) => u.status !== "discarded");
-      resultHeading.textContent =
-        saved.length > 1 ? `Saved ${saved.length} memories.` : saved.length === 1 ? "Saved." : "Nothing saved.";
-      renderUnits(derivedEl, saved);
-      renderAttachmentList();
-      show(resultSection);
-    }
-
-    function askNextClarification() {
-      setClarificationBusy(false);
-      if (pendingQueue.length === 0) {
-        showResult();
-        return;
-      }
-      clarificationQuestion.textContent = pendingQueue[0].question;
-      // Soft guard only: the API always accepts a blank answer as "skip"
-      // (see docs/DECISIONS.md) -- this toggles the HTML `required`
-      // attribute and the discard button, nothing server-enforced.
-      // Re-read on every question, not just once, so a mid-flight
-      // settings change takes effect on the very next question.
-      const obligatory = isObligatory();
-      clarificationAnswer.required = obligatory;
-      // When questions are obligatory, "Discard this one" is the only
-      // escape hatch from answering; when they're optional, skipping
-      // (submitting blank) already covers that, so the button is
-      // redundant and hidden to keep the choice simple.
-      if (obligatory) hide(clarificationDiscard);
-      else show(clarificationDiscard);
-      show(clarificationSection);
-    }
-
-    function enqueueIfPending(unit) {
-      if (unit.pending_clarification) {
-        pendingQueue.push({ unitId: unit.id, question: unit.pending_clarification.question });
-      }
-    }
-
-    // Disables both buttons and shows a progress label while a clarify/
-    // discard request is in flight, so a click gets immediate feedback
-    // instead of looking unresponsive during real network/LLM latency --
-    // and can't be double-submitted while the first click is still
-    // pending. Restored on error so a transient failure (e.g. a dropped
-    // connection) can just be retried, not just reported as a dead end.
-    function setClarificationBusy(busy, label) {
-      clarificationSubmit.disabled = busy;
-      clarificationDiscard.disabled = busy;
-      clarificationAnswer.disabled = busy;
-      if (busy) {
-        clarificationSubmit.textContent = label;
-        hide(clarificationError);
-        showStatus(clarificationStage, label, false);
-      } else {
-        clarificationSubmit.textContent = "Submit answer";
-        hide(clarificationStage);
-      }
-    }
-
-    function showClarificationError(message) {
-      showStatus(clarificationError, message, true);
-    }
-
-    clarificationForm.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      const current = pendingQueue[0];
-      setClarificationBusy(true, "Submitting answer...");
-      try {
-        const updatedUnit = await postJSON(`/api/memory-units/${current.unitId}/clarify`, {
-          answer: clarificationAnswer.value,
-        });
-        clarificationAnswer.value = "";
-        allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
-        pendingQueue = pendingQueue.slice(1);
-        // Answering can surface a further question -- another round, or
-        // the next one already queued server-side for this unit.
-        enqueueIfPending(updatedUnit);
-        askNextClarification();
-      } catch (err) {
-        setClarificationBusy(false);
-        showClarificationError(err.message);
-      }
-    });
-
-    clarificationDiscard.addEventListener("click", async () => {
-      const current = pendingQueue[0];
-      setClarificationBusy(true, "Discarding...");
-      try {
-        const resp = await fetchWithTimeout(`/api/memory-units/${current.unitId}/discard`, { method: "POST" });
-        const updatedUnit = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(updatedUnit.detail || "Failed to discard");
-        allUnits = allUnits.map((u) => (u.id === updatedUnit.id ? updatedUnit : u));
-        pendingQueue = pendingQueue.slice(1);
-        askNextClarification();
-      } catch (err) {
-        setClarificationBusy(false);
-        showClarificationError(err.message);
-      }
-    });
 
     return async function start() {
       try {
@@ -541,11 +339,12 @@ const membase = (() => {
         if (!resp.ok) throw new Error(capture.detail || "Failed to save");
 
         hide(savingEl);
-        currentAttachments = capture.attachments;
-        allUnits = capture.units;
-        pendingQueue = [];
-        for (const unit of capture.units) enqueueIfPending(unit);
-        askNextClarification();
+        const units = capture.units;
+        resultHeading.textContent = units.length > 1 ? `Saved ${units.length} memories.` : "Saved.";
+        renderUnits(derivedEl, units);
+        renderAttachmentList(capture.attachments);
+        if (units.some((u) => u.pending_clarification)) show(pendingNoteEl);
+        show(resultSection);
       } catch (err) {
         showError(err.message);
       }
@@ -598,7 +397,6 @@ const membase = (() => {
       const formData = new FormData();
       formData.set("text", document.getElementById("text").value);
       for (const file of selectedFiles) formData.append("files", file);
-      formData.set("disable_followup_questions", isFollowupDisabled() ? "true" : "false");
       form.reset();
       selectedFiles = [];
       renderSelectedFiles();
@@ -675,7 +473,7 @@ const membase = (() => {
     });
   }
 
-  function renderCaptureList(listEl, captures) {
+  function renderCaptureList(listEl, captures, onClarificationResolved) {
     listEl.innerHTML = "";
     if (captures.length === 0) {
       listEl.innerHTML = '<p class="muted">Nothing saved yet.</p>';
@@ -749,14 +547,6 @@ const membase = (() => {
         const discardButton = block.querySelector(".capture-clarification-discard");
         const clarificationErrorEl = block.querySelector(".capture-clarification-error");
 
-        // Same "obligatory" preference the Store page's own clarification
-        // flow reads (see isObligatory()) -- one setting governs whether
-        // discarding is offered instead of answering, everywhere in the
-        // app, not just where a question was first asked.
-        const obligatory = isObligatory();
-        answerInput.required = obligatory;
-        if (obligatory) hide(discardButton);
-
         function setBusy(busy, label) {
           submitButton.disabled = busy;
           discardButton.disabled = busy;
@@ -787,6 +577,7 @@ const membase = (() => {
             setBusy(false);
           } else {
             block.remove();
+            if (onClarificationResolved) onClarificationResolved();
           }
         }
 
@@ -858,6 +649,48 @@ const membase = (() => {
   function initCapturesPage() {
     const statusEl = document.getElementById("status");
     const listEl = document.getElementById("capture-list");
+    const skipAllButton = document.getElementById("skip-all-followups");
+
+    function updateSkipAllVisibility() {
+      if (!skipAllButton) return;
+      if (listEl.querySelector(".capture-clarification")) show(skipAllButton);
+      else hide(skipAllButton);
+    }
+
+    if (skipAllButton) {
+      skipAllButton.addEventListener("click", async () => {
+        const blocks = [...listEl.querySelectorAll(".capture-clarification")];
+        if (blocks.length === 0) return;
+        if (!confirm(`Discard all ${blocks.length} memory unit(s) still awaiting a follow-up question? This can't be undone.`)) return;
+        skipAllButton.disabled = true;
+        // Fire sequentially, not in parallel -- these hit the same
+        // rate-limited backend as everything else, and there's no need
+        // to race several discard calls against each other.
+        for (const block of blocks) {
+          const unitId = block.dataset.unitId;
+          try {
+            const resp = await fetchWithTimeout(`/api/memory-units/${unitId}/discard`, { method: "POST" });
+            const updatedUnit = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+              const badge = listEl.querySelector(`.status-badge[data-unit-id="${CSS.escape(unitId)}"]`);
+              if (badge) {
+                badge.textContent = updatedUnit.status;
+                badge.className = `status-badge status-badge-${updatedUnit.status}`;
+              }
+              block.remove();
+            }
+            // A single failure (network hiccup, already-resolved unit)
+            // just leaves that one block in place, still answerable or
+            // discardable individually -- doesn't abort the rest of the
+            // batch.
+          } catch {
+            // Same as above: move on to the next one.
+          }
+        }
+        skipAllButton.disabled = false;
+        updateSkipAllVisibility();
+      });
+    }
 
     (async () => {
       const startedAt = performance.now();
@@ -867,7 +700,16 @@ const membase = (() => {
         const captures = await resp.json().catch(() => ([]));
         if (!resp.ok) throw new Error(captures.detail || "Failed to load captures");
         hide(statusEl);
-        renderCaptureList(listEl, captures);
+        // Captures with a unit still awaiting a follow-up question sort
+        // first -- a stable sort, so within each group (pending / not)
+        // the backend's own newest-first order is preserved.
+        const sorted = [...captures].sort((a, b) => {
+          const aPending = a.units.some((u) => u.pending_clarification) ? 1 : 0;
+          const bPending = b.units.some((u) => u.pending_clarification) ? 1 : 0;
+          return bPending - aPending;
+        });
+        renderCaptureList(listEl, sorted, updateSkipAllVisibility);
+        updateSkipAllVisibility();
       } catch (err) {
         showStatus(statusEl, describeError(err, performance.now() - startedAt), true);
       }
