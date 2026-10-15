@@ -794,16 +794,17 @@ server binds `127.0.0.1` only.
 
 ## Authentication
 
-See docs/DECISIONS.md "Password login with per-device tokens" and
-"File-based password, with server-side rate limiting on /login" for
-the full design. Summary: one shared password, read fresh on every
-login attempt from a file (`Settings.membase_auth_password_file`,
-editable in place -- e.g. over SSH -- with no restart), but `POST
-/api/auth/login` issues a separately-revocable bearer token per device
-(`AuthToken` row, `app/models.py`, only `token_hash` ever persisted).
-`/login` itself is rate-limited (`app/rate_limit.py`): a 5 req/s global
-flood guard, and a 10-failed-attempts/15-min per-IP brute-force guard,
-both in-memory. `require_auth` (`app/auth.py`) is wired on at
-router-inclusion time in `app/main.py` for `captures`/`units`/`recall`;
-HTML page routes stay unauthenticated shells, gated client-side by
-`app/static/app.js`'s login overlay.
+This app has no authentication code of its own -- see docs/DECISIONS.md
+"Retire app-level auth for nginx Basic Auth". Access control is HTTP
+Basic Auth enforced entirely by the nginx reverse proxy in front of the
+backend (`deploy/nginx-membase.conf`); this app trusts whatever request
+already reached it. The frontend's login overlay (`app/static/app.js`'s
+`initAuth()`) collects a backend URL + username/password once, stores
+them in `localStorage`, and attaches `Authorization: Basic
+<base64(user:pass)>` to every API request itself -- there's no
+`/api/auth/*` route, session, or token on the backend to manage. The
+app's own contribution to this boundary is CORS only (`app/main.py`'s
+`CORSMiddleware`, allow-listing `Settings.frontend_origin`), needed
+because the frontend is published separately (GitHub Pages) from
+wherever the backend is reached. See docs/DEPLOYMENT.md "nginx +
+Cloudflare Tunnel" for the full request path from browser to backend.

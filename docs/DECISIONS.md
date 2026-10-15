@@ -1877,3 +1877,115 @@ substitution looked like the more obvious fix but does not apply to
   `analysis.py` already defines instead of deriving from it. Both are
   real but cosmetic; revisit opportunistically next time either file
   is touched for an unrelated reason.
+
+---
+
+## Split deployment: backend local behind nginx + Cloudflare Tunnel, frontend on GitHub Pages
+
+**Decision:** The deployment shape changed from "one process serving both
+the API and the HTML/JS/CSS on one origin" to two independently deployed
+pieces: the backend keeps running locally (as before -- `scripts/run-prod.sh`,
+still bound `127.0.0.1`-only), and the frontend is published to GitHub
+Pages as static files, a different origin. This section covers the pieces
+that changed to make that split work: how the backend becomes reachable at
+all despite CGNAT, and the auth/reverse-proxy architecture in front of it.
+(The actual static-file extraction/publish workflow for the frontend is
+covered separately -- see the next entry below once that work lands.)
+
+### Cloudflare Tunnel for CGNAT-safe public reachability
+
+**Reason:** The machine running the backend is behind CGNAT (Carrier-Grade
+NAT) -- it has no unique public IP of its own, so conventional router
+port-forwarding cannot work: there is no "public IP" under local control to
+open a hole in, regardless of any router configuration. The machine is
+already on a Tailscale tailnet, but Tailscale Funnel (the feature that
+would expose a tailnet service to the public internet without port
+forwarding) only serves on a Tailscale-assigned `*.ts.net` hostname, not an
+arbitrary custom domain -- and a real custom domain (`membase.vxliu.com`,
+already owned) was a hard requirement.
+
+**Mechanics:** `cloudflared`, a daemon running on the backend machine,
+makes an *outbound* connection to Cloudflare's edge network -- no inbound
+port needed on this machine at all, so CGNAT is irrelevant. Cloudflare's
+edge terminates TLS for `membase.vxliu.com` (using their own cert,
+auto-issued and auto-renewed -- no certbot/ACME management on this end)
+and forwards traffic through that outbound tunnel to whatever
+`cloudflared`'s ingress config points it at locally -- here, nginx on
+`127.0.0.1:8080`, not directly to the FastAPI backend (see below for why).
+Prerequisite: `membase.vxliu.com`'s authoritative DNS must be hosted on
+Cloudflare (`cloudflared tunnel route dns` provisions the actual DNS
+record pointing the hostname at the tunnel). Config: `deploy/cloudflared-config.yml`.
+
+**Not done:** no failover/redundancy if the single `cloudflared` process or
+its one tunnel connection drops -- acceptable for a single-user app; revisit
+if uptime ever becomes a real requirement.
+
+### Retire app-level auth for nginx Basic Auth
+
+**Decision:** The password-login + per-device bearer-token system
+(`app/auth.py`, `app/api/auth.py`, `app/rate_limit.py`, the `AuthToken`
+table, the login overlay's token/session-list UI) was removed entirely.
+Authentication is now HTTP Basic Auth, enforced by nginx in front of the
+backend (`deploy/nginx-membase.conf`'s `auth_basic`/`auth_basic_user_file`),
+not by the application. The frontend still shows a custom login-style
+overlay (`app/static/app.js`'s `initAuth()`), but it no longer talks to any
+`/api/auth/*` endpoint -- there isn't one anymore. It just collects a
+backend URL + username + password once, stores them in `localStorage`, and
+attaches `Authorization: Basic <base64(user:pass)>` to every API request
+itself (not via the browser's native Basic Auth prompt/cache, which would
+mean a jarring OS-native dialog instead of this app's own overlay). nginx
+is the only thing that ever actually validates the credentials.
+
+**Reason:** User-requested, after an explicit discussion of the tradeoff:
+proxy-level Basic Auth is the conventional baseline for a single-user
+self-hosted app (most such apps never build their own session/token layer
+at all), and the custom app-level system -- built specifically for
+per-device revocation ahead of an anticipated mobile client -- was judged
+not worth keeping once a reverse proxy was being introduced for other
+reasons (TLS termination via Cloudflare, security headers, rate limiting).
+Consolidating "is this request allowed at all" into one place (nginx) is
+simpler than splitting it across two layers.
+
+**Trade-off, accepted knowingly:** there is now exactly one shared
+credential pair, with no per-device identity and no way to revoke access
+for one specific device without changing the password for every device at
+once. The old system's whole reason for existing -- "kick my phone off
+without re-typing the password everywhere else" -- is gone. Acceptable
+given this app's stated single-user scope; revisit (likely by reintroducing
+an app-level or proxy-level per-device mechanism, e.g. Cloudflare Access
+with per-device service tokens) if multi-device revocation becomes a real
+need again.
+
+**What moved where, concretely:**
+- **nginx** (`deploy/nginx-membase.conf`): HTTP Basic Auth, security
+  response headers (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy`, `Strict-Transport-Security`), a general per-IP rate
+  limit across every route (`limit_req`, replacing the retired app-level
+  `/login`-specific limiter), and the request body-size cap
+  (`client_max_body_size`, matching `membase_max_upload_mb`). Real client
+  IP recovered from `CF-Connecting-IP` (set by `cloudflared`, trusted here
+  because that connection is always local, never attacker-reachable
+  directly).
+- **The FastAPI app** (`app/main.py`): CORS only (`CORSMiddleware`,
+  allow-listing `app/config.py`'s `frontend_origin` -- the published
+  GitHub Pages origin). Deliberately NOT moved to nginx: CORS is naturally
+  expressed as middleware already built into the framework, and keeping it
+  here means it stays in sync with whatever config says the frontend's
+  origin is, without a second place to update. `allow_credentials` is
+  correctly `False` -- the frontend's own JS attaches the Basic Auth header
+  explicitly; nothing here relies on browser-managed cookie credentials.
+- **nginx's `auth_basic` and CORS preflight**: a plain `if ($request_method
+  = OPTIONS) { set $membase_auth "off"; }` disables Basic Auth just for
+  preflight requests, which never carry credentials by design -- without
+  this, every preflight would 401 before the real, credentialed request
+  behind it ever got a chance, breaking all cross-origin calls from the
+  GitHub Pages frontend. Standard, documented nginx idiom for this exact
+  conflict (`auth_basic` accepts a variable; the literal value `"off"`
+  disables it).
+
+**Not done:** no per-device anything (see trade-off above); nginx's rate
+limit is IP-based and request-count-based only, not aware of what counts
+as a "failed login attempt" the way the retired app-level limiter was
+(nginx has no visibility into response semantics without more complex
+config); the htpasswd file's credentials are managed entirely manually
+(generate with `openssl passwd -apr1`, no rotation tooling).

@@ -34,9 +34,7 @@
           When off, you can skip a follow-up question without answering it.
         </p>
         <hr class="settings-divider" />
-        <div class="settings-row settings-row-heading">Devices signed in</div>
-        <ul id="session-list" class="session-list"></ul>
-        <button id="logout-button" class="settings-logout" type="button">Log out this device</button>
+        <button id="logout-button" class="settings-logout" type="button">Forget backend credentials</button>
       </div>
     </div>
   </header>
@@ -46,16 +44,20 @@
   <div id="login-overlay" class="login-overlay hidden">
     <form id="login-form" class="login-form">
       <h1>membase</h1>
-      <p class="muted">Enter the password to continue.</p>
+      <p class="muted">Connect to your backend.</p>
+      <label>
+        Backend URL
+        <input type="url" id="login-backend-url" autocomplete="off" placeholder="https://membase.example.com" required />
+      </label>
+      <label>
+        Username
+        <input type="text" id="login-username" autocomplete="username" required />
+      </label>
       <label>
         Password
         <input type="password" id="login-password" autocomplete="current-password" required />
       </label>
-      <label>
-        This device (optional)
-        <input type="text" id="login-device-label" autocomplete="off" placeholder="e.g. work laptop" />
-      </label>
-      <button type="submit">Log in</button>
+      <button type="submit">Connect</button>
       <p id="login-error" class="error hidden"></p>
     </form>
   </div>

@@ -3,12 +3,16 @@
 Scope: can this app be safely run somewhere other than a developer's
 own `nix develop` shell on localhost? Specifically the scenario the
 audit was commissioned for: **single user by design, but the HTTP
-endpoint itself reachable from the public internet.**
+endpoint itself reachable from the public internet.** The deployment
+shape itself is now split: backend local (behind nginx + Cloudflare
+Tunnel, see "nginx + Cloudflare Tunnel" below), frontend published
+separately to GitHub Pages.
 
-Short answer: **everything is fixed except one thing, and that one
-thing is a hard blocker.** There is currently no authentication
-anywhere in this app. Do not put this on the public internet without
-adding one of the options in "Auth system ideas" below first.
+Short answer: **everything needed is in place.** Authentication is
+HTTP Basic Auth enforced by nginx in front of the backend -- see
+"Authentication: nginx Basic Auth" below; this app has no auth code of
+its own anymore. Don't skip the nginx setup; without it, nothing in
+this app gates access to your stored memories.
 
 ## What's already safe (verified, not assumed)
 
@@ -86,52 +90,78 @@ adding one of the options in "Auth system ideas" below first.
   Ollama itself only serves one request at a time). Still binds
   `127.0.0.1` only -- see below for why that's deliberate, not a gap.
 
-## Authentication: implemented
+## Authentication: nginx Basic Auth (app-level auth retired)
 
-This used to be the blocking issue -- there was no `Authorization`
-header check, no session, no password, anywhere in this codebase.
-That's now fixed: every route under `/api/captures`, `/api/memory-units`,
-and `/api/recall` requires a valid `Authorization: Bearer <token>`
-header (see `app/auth.py`'s `require_auth` dependency, wired on at
-`app.include_router(..., dependencies=[Depends(require_auth)])` in
-`app/main.py`). See docs/DECISIONS.md "Password login with per-device
-tokens" for the design and why it was chosen over the plain options
-below.
+This app used to implement its own password-login + per-device
+bearer-token system. That was **retired** in favor of HTTP Basic Auth
+enforced by the nginx reverse proxy in front of the backend -- see
+docs/DECISIONS.md "Retire app-level auth for nginx Basic Auth" for the
+full reasoning and the trade-off accepted (one shared credential pair,
+no per-device revocation anymore). The app itself no longer has any
+`/api/auth/*` routes, any session/token table, or any rate limiting of
+its own on login attempts -- nginx owns all of that now (see "nginx +
+Cloudflare Tunnel" below).
 
-In short: there's one shared password, read from a plaintext file
-(`MEMBASE_AUTH_PASSWORD_FILE`, default `.data/auth_password`) fresh on
-every login attempt rather than from an env var captured once at
-startup -- so rotating it is just editing that file (e.g. over SSH)
-with no restart. A missing/empty file fails every login closed. But
-`POST /api/auth/login` issues a fresh, independently-revocable bearer
-token *per device* rather than handing back that shared secret itself.
-That's what makes this ready for a future mobile app or a second
-browser/device: each one logs in once with the same password and gets
-its own token, manageable (listed, individually revocable) from the
-settings menu without having to change the password everywhere else.
-Tokens are stored server-side only as a SHA-256 hash; the raw value is
-shown to the client exactly once, at login.
+The frontend's login overlay (`app/static/app.js`'s `initAuth()`)
+still exists, but its job changed: it collects a backend URL plus a
+username/password once, stores them in this browser's `localStorage`,
+and attaches `Authorization: Basic <base64(user:pass)>` to every API
+request itself. There's no `/login` endpoint to call first -- the
+credentials are only ever actually checked by nginx, on the very next
+real API request. A 401 clears the stored credentials and re-shows the
+overlay.
 
-`/login` is also rate-limited server-side (`app/rate_limit.py`): a
-global cap of 5 requests/second across all callers (a flood guard),
-plus a per-source-IP lockout after 10 failed attempts in 15 minutes (a
-brute-force guard, cleared immediately by one successful login). See
-docs/DECISIONS.md "File-based password, with server-side rate limiting
-on /login".
+## nginx + Cloudflare Tunnel
 
-HTML page routes (`/`, `/recall`, `/captures`) are intentionally NOT
-gated server-side -- they still return a static shell with no real
-data in it. The actual gate is client-side: `app/static/app.js`'s
-`initAuth()` shows a full-page login overlay whenever no valid token is
-stored, and every data-fetching call goes through the authenticated API
-routes above, so an unauthenticated visitor never sees real content,
-just an empty page and a password prompt.
+The backend stays local (bound `127.0.0.1` only, as always), reached
+publicly through: **Cloudflare edge (TLS to the browser) → encrypted
+tunnel → `cloudflared` on this machine → nginx (`127.0.0.1:8080`) →
+FastAPI backend (`127.0.0.1:8000`)**. Cloudflare Tunnel specifically
+(rather than a conventional reverse-proxy-with-port-forwarding setup)
+because this machine is behind CGNAT -- there is no public IP under
+local control to forward a port on at all. See docs/DECISIONS.md
+"Cloudflare Tunnel for CGNAT-safe public reachability" for why
+Tailscale Funnel doesn't substitute here (it doesn't support an
+arbitrary custom domain).
 
-This still assumes the app is bound `127.0.0.1`-only with a reverse
-proxy doing TLS termination in front (see the checklist below) --
-bearer tokens over plain HTTP are exactly as interceptable as a Basic
-Auth header would be. **Password-login does not replace TLS; it
-replaces having no authentication at all.**
+**Setup:**
+
+1. **nginx**: copy `deploy/nginx-membase.conf` in (as a traditional
+   `/etc/nginx/sites-enabled/` file, or adapted into a NixOS
+   `services.nginx.virtualHosts` block's `extraConfig` -- the file
+   itself is portable either way). It listens on `127.0.0.1:8080` only
+   -- TLS is already terminated by Cloudflare's edge before
+   `cloudflared` ever forwards a request here, so nginx never needs
+   its own certificate.
+2. **Basic Auth credentials**: generate the htpasswd file nginx's
+   config points at:
+   ```
+   printf 'yourusername:%s\n' "$(openssl passwd -apr1)" | sudo tee /etc/nginx/membase.htpasswd
+   ```
+   (prompts for the password interactively; `openssl passwd -apr1` is
+   used instead of requiring the separate `apache2-utils`/`httpd`
+   package just for its `htpasswd` binary).
+3. **Cloudflare Tunnel**: requires `membase.vxliu.com`'s DNS to be
+   hosted on Cloudflare first (point the domain's nameservers at
+   Cloudflare, or add it as a site there). Then:
+   ```
+   cloudflared tunnel login
+   cloudflared tunnel create membase
+   cloudflared tunnel route dns membase membase.vxliu.com
+   ```
+   Copy `deploy/cloudflared-config.yml` to wherever `cloudflared`
+   expects it, filling in the tunnel ID and credentials-file path
+   `tunnel create` printed. Run it (`cloudflared tunnel run membase`,
+   or via the NixOS `services.cloudflared` module / a systemd unit for
+   anything longer-running than a manual test).
+4. Confirm end to end: `curl -u yourusername https://membase.vxliu.com/api/captures`
+   should prompt for the password and then return `[]` (or your real
+   captures) -- not a connection error, not an unauthenticated 200.
+
+This fully replaces the old "put *a* TLS-terminating reverse proxy in
+front" advice from earlier revisions of this doc -- nginx here never
+holds a TLS certificate at all; Cloudflare's edge is what the browser
+actually negotiates TLS with.
 
 ## Auth system ideas (alternatives considered)
 
@@ -230,68 +260,63 @@ of relying on the browser's native Basic Auth prompt or a cookie.
 
 ### What was actually implemented
 
-Neither B nor D exactly: a hybrid of "one password, any browser" (B's
-appeal) with D's bearer-token mechanics, extended to issue one token
-*per device* instead of one static token for everyone. This was the
-right fit once multi-device/mobile access became an explicit
-requirement -- Option B's native browser prompt has no concept of
-"log this one device out," and Option D as originally scoped assumed a
-single static secret. See docs/DECISIONS.md "Password login with
-per-device tokens" for the full reasoning.
+None of the above, in the end -- see docs/DECISIONS.md "Retire
+app-level auth for nginx Basic Auth". Option B's exact mechanics
+(HTTP Basic Auth, one shared credential pair) ended up being what's
+actually used, just enforced by nginx (see "nginx + Cloudflare
+Tunnel" above) rather than written into this app. The per-device
+token system described in earlier revisions of this doc was built,
+then deliberately retired once a reverse proxy was being introduced
+for other reasons anyway (TLS, headers, rate limiting) -- consolidating
+"is this request allowed at all" into one place was judged simpler
+than splitting it across two layers, at the cost of losing per-device
+revocation (now back to Option B's own trade-off: one shared password,
+no concept of "log this one device out" short of changing it for
+everyone).
 
 Still not recommended for this project's stated scope: anything
 involving a user table, OAuth/SSO, or multi-factor -- all solve
 problems this app doesn't have (there is, by design, exactly one
-user, just possibly several of their own devices), at a complexity
-cost this project's whole streamlining effort was specifically about
-avoiding.
+user), at a complexity cost this project's whole streamlining effort
+was specifically about avoiding.
 
 ## Deployment checklist
 
 1. Run `scripts/run-prod.sh` (not `run-dev.sh`) for anything other than
    active local development.
-2. Put a reverse proxy in front for TLS -- Caddy is the least-effort
-   option (automatic HTTPS via Let's Encrypt with a ~5-line Caddyfile);
-   nginx + certbot works too if you already run nginx for other things.
-3. Put a real password in the file `MEMBASE_AUTH_PASSWORD_FILE` points
-   at (`chmod 600`, owned by whichever user runs the app) *before* the
-   reverse proxy is reachable from the public internet -- the dev-only
-   default content `nix develop`'s shellHook seeds under `.data/` must
-   not be what ends up running in production. Changing it later is
-   just editing that file (e.g. over SSH) and takes effect on the next
-   login attempt, no restart needed. Log in once from each device you
-   want to use and keep its token; use the settings menu's session
-   list to revoke a lost device later.
+2. Set up nginx + Cloudflare Tunnel per "nginx + Cloudflare Tunnel"
+   above -- generate the htpasswd file with a real password before
+   the tunnel is live, not the placeholder you tested with.
+3. Set `FRONTEND_ORIGIN` to the actual published GitHub Pages origin
+   (e.g. `https://luxkaiwalker.github.io`) in the backend's production
+   environment -- the dev default (`http://127.0.0.1:8000`) won't
+   match once the frontend is served from a different origin, and a
+   mismatch here means every cross-origin API call gets blocked by the
+   browser's own CORS enforcement (the request never even reaches this
+   app's logic -- check the browser console, not server logs, if this
+   is wrong).
 4. Confirm `app/main.py`'s `uvicorn.run(..., host="127.0.0.1", ...)`
    fallback and `scripts/run-prod.sh` both still say `127.0.0.1` --
-   this should never change to `0.0.0.0` regardless of which auth
-   option you pick; let the reverse proxy be the only thing with a
-   public-facing socket.
+   this should never change to `0.0.0.0`; nginx (itself only listening
+   on `127.0.0.1:8080`, reached only via `cloudflared`'s local
+   connection) is the only thing in this chain with any path from the
+   public internet, and even it has no direct public-facing socket.
 5. Set `membase_max_upload_mb` / `membase_max_text_chars` to whatever
    you're actually comfortable with publicly-reachable-even-if-
    authenticated input costing in storage/LLM compute -- the defaults
    (50MB / 50,000 chars) are reasonable starting points, not
-   load-tested ceilings.
+   load-tested ceilings. `deploy/nginx-membase.conf`'s
+   `client_max_body_size` should stay in sync with
+   `membase_max_upload_mb` if you change the latter.
 6. Make sure the machine's firewall doesn't already expose port 5544
-   (Postgres) or 11434 (Ollama) directly -- both are already bound in a
-   way that shouldn't be reachable remotely (see "What's already safe"
-   above), but a host-level firewall rule is free defense-in-depth on
-   top of that, not instead of it.
+   (Postgres), 11434 (Ollama), or 8000/8080 (the app/nginx) directly --
+   none of them need to be, or should be, reachable from outside this
+   machine; `cloudflared` is the only process that talks to the outside
+   world, and it does so via an outbound connection, not a listening
+   socket.
 
 ## Known non-blocking gaps (not fixed this pass, not auth-related)
 
-- **No rate limiting beyond the new length caps.** An authenticated-but-
-  malicious (or just buggy) client could still call any endpoint in a
-  tight loop. Once an auth option from above is in place, this matters
-  much less (the blast radius is "someone with your one password"
-  rather than "anyone on the internet"); a reverse-proxy-level rate
-  limit (Caddy/nginx both support this natively) is the lowest-effort
-  place to add it if it turns out to matter in practice.
-- **No security response headers** (`X-Content-Type-Options`,
-  `X-Frame-Options`, a `Content-Security-Policy`). Lower priority given
-  this app has no cross-origin surface and consistent output-escaping
-  already (see "What's already safe"), but cheap defense-in-depth a
-  reverse proxy can also add without touching app code.
 - **No health-check endpoint** (`GET /healthz` or similar) for a reverse
   proxy or process supervisor to poll. Trivial to add if/when one is
   actually wired up to supervise this process.

@@ -92,33 +92,55 @@ const membase = (() => {
     }
   }
 
-  // Password login with per-device bearer tokens (see docs/DECISIONS.md
-  // "Password login with per-device tokens"). The raw token lives only
-  // in this browser's localStorage -- never cookies, never sent
-  // anywhere but this app's own Authorization header below.
-  const TOKEN_KEY = "membase.authToken";
+  // Authentication is handled by the nginx reverse proxy in front of
+  // this app (HTTP Basic Auth), not by this app itself -- see
+  // docs/DECISIONS.md "Retire app-level auth for nginx Basic Auth".
+  // This file's job is just: collect the backend's base URL plus a
+  // username/password once, store them in this browser, and attach
+  // them as a Basic Auth header on every API request -- there is no
+  // server-side session, token, or per-device identity to manage
+  // anymore (one shared credential pair, like any other HTTP Basic
+  // Auth deployment). The backend URL is stored separately from the
+  // credentials and survives logout, since it rarely changes and
+  // re-typing it every time is pure friction.
+  const BACKEND_URL_KEY = "membase.backendUrl";
+  const CREDENTIALS_KEY = "membase.basicAuth";
 
-  function getToken() {
+  function getBackendUrl() {
     try {
-      return localStorage.getItem(TOKEN_KEY);
+      return (localStorage.getItem(BACKEND_URL_KEY) || "").replace(/\/+$/, "");
+    } catch {
+      return "";
+    }
+  }
+
+  function setBackendUrl(value) {
+    try {
+      localStorage.setItem(BACKEND_URL_KEY, value.replace(/\/+$/, ""));
+    } catch {
+      // Not persisted across a reload -- not worth surfacing as an error.
+    }
+  }
+
+  function getCredentials() {
+    try {
+      return localStorage.getItem(CREDENTIALS_KEY);
     } catch {
       return null;
     }
   }
 
-  function setToken(value) {
+  function setCredentials(username, password) {
     try {
-      localStorage.setItem(TOKEN_KEY, value);
+      localStorage.setItem(CREDENTIALS_KEY, btoa(`${username}:${password}`));
     } catch {
-      // Login still "worked" for this page load (the token variable is
-      // still in memory for this request cycle) but won't survive a
-      // reload -- not worth surfacing as an error.
+      // Not persisted across a reload -- not worth surfacing as an error.
     }
   }
 
-  function clearToken() {
+  function clearCredentials() {
     try {
-      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(CREDENTIALS_KEY);
     } catch {
       // Nothing to do -- if localStorage is unavailable, there was
       // nothing persisted to clear either.
@@ -135,108 +157,48 @@ const membase = (() => {
     if (overlay) hide(overlay);
   }
 
-  async function loadSessions() {
-    const list = document.getElementById("session-list");
-    if (!list) return;
-    let sessions;
-    try {
-      const resp = await fetchWithTimeout("/api/auth/sessions");
-      if (!resp.ok) return;
-      sessions = await resp.json();
-    } catch {
-      return;
-    }
-    list.innerHTML = "";
-    for (const s of sessions) {
-      const li = document.createElement("li");
-      li.className = "session-item";
-      const label = document.createElement("span");
-      label.className = "session-device";
-      label.textContent = s.device_label || "Unnamed device";
-      const revoke = document.createElement("button");
-      revoke.type = "button";
-      revoke.className = "session-revoke";
-      revoke.textContent = "Revoke";
-      revoke.addEventListener("click", async () => {
-        try {
-          // If this revokes the session this very browser is using, the
-          // next authenticated call (loadSessions() below) comes back
-          // 401 and fetchWithTimeout's own handling pops the login
-          // overlay back up -- no separate "did I just log myself out"
-          // check needed.
-          await fetchWithTimeout(`/api/auth/sessions/${s.id}`, { method: "DELETE" });
-        } catch {
-          // Fall through to reload the list either way.
-        }
-        loadSessions();
-      });
-      li.appendChild(label);
-      li.appendChild(revoke);
-      list.appendChild(li);
-    }
-  }
-
   function initAuth() {
     const overlay = document.getElementById("login-overlay");
     const form = document.getElementById("login-form");
+    const backendUrlInput = document.getElementById("login-backend-url");
+    const usernameInput = document.getElementById("login-username");
     const passwordInput = document.getElementById("login-password");
-    const deviceInput = document.getElementById("login-device-label");
     const errorEl = document.getElementById("login-error");
     const logoutButton = document.getElementById("logout-button");
-    // All six are static siblings always rendered together in
-    // base.html -- checked together, consistently with how every
-    // other element access in this file degrades gracefully instead
-    // of throwing, rather than guarding only two of the six and
-    // dereferencing the rest unconditionally below.
-    if (!overlay || !form || !passwordInput || !deviceInput || !errorEl || !logoutButton) return;
+    if (!overlay || !form || !backendUrlInput || !usernameInput || !passwordInput || !errorEl || !logoutButton) return;
 
-    if (getToken()) {
+    if (getBackendUrl() && getCredentials()) {
       hideLoginOverlay();
-      loadSessions();
     } else {
+      backendUrlInput.value = getBackendUrl();
       showLoginOverlay();
     }
 
-    form.addEventListener("submit", async (ev) => {
+    form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       hide(errorEl);
-      const submitButton = form.querySelector("button[type=submit]");
-      submitButton.disabled = true;
-      try {
-        const resp = await fetchWithTimeout("/api/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: passwordInput.value, device_label: deviceInput.value }),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          throw new Error(data.detail || "Login failed.");
-        }
-        setToken(data.token);
-        passwordInput.value = "";
-        // Reload rather than just hiding the overlay -- whatever page
-        // load already ran before login (create/recall/captures) may
-        // have 401'd and rendered an error with no token to retry
-        // with; a reload re-runs that page's init with the token now
-        // in place instead of leaving stale error text on screen.
-        window.location.reload();
-      } catch (err) {
-        errorEl.textContent = err.message || "Login failed.";
+      if (!backendUrlInput.value || !usernameInput.value || !passwordInput.value) {
+        errorEl.textContent = "Backend URL, username, and password are all required.";
         show(errorEl);
-      } finally {
-        submitButton.disabled = false;
+        return;
       }
+      setBackendUrl(backendUrlInput.value);
+      setCredentials(usernameInput.value, passwordInput.value);
+      passwordInput.value = "";
+      // Reload rather than just hiding the overlay -- there's no
+      // separate "verify these credentials" call to make (nginx
+      // checks them on the very next real API request); a reload
+      // re-runs the page's own init, which surfaces a 401 the normal
+      // way (fetchWithTimeout's handler below) if they were wrong.
+      window.location.reload();
     });
 
-    logoutButton.addEventListener("click", async () => {
-      try {
-        await fetchWithTimeout("/api/auth/logout", { method: "POST" });
-      } catch {
-        // Clear the local token regardless -- the point of logging
-        // out is that THIS browser stops acting authenticated, even
-        // if telling the server about it failed (e.g. offline).
-      }
-      clearToken();
+    logoutButton.addEventListener("click", () => {
+      // Nothing server-side to revoke -- there's no per-device session
+      // anymore, just a shared credential pair nginx checks on every
+      // request. "Logging out" is purely this browser forgetting it.
+      clearCredentials();
+      backendUrlInput.value = getBackendUrl();
       showLoginOverlay();
     });
   }
@@ -263,7 +225,6 @@ const membase = (() => {
       const isHidden = menu.classList.contains("hidden");
       if (isHidden) {
         show(menu);
-        loadSessions();
       } else {
         hide(menu);
       }
@@ -300,23 +261,30 @@ const membase = (() => {
   // instead of an infinite wait.
   const REQUEST_TIMEOUT_MS = 150_000;
 
-  async function fetchWithTimeout(url, options = {}) {
+  async function fetchWithTimeout(path, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    const token = getToken();
     const headers = { ...(options.headers || {}) };
-    // Every route except POST /api/auth/login requires this -- see
-    // app/auth.py require_auth. Attaching it unconditionally (login
-    // included) is harmless: login ignores the header entirely.
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const credentials = getCredentials();
+    // nginx (not this app) checks this -- see docs/DECISIONS.md
+    // "Retire app-level auth for nginx Basic Auth". Attached
+    // explicitly by this JS rather than relying on the browser's own
+    // native Basic Auth prompt/cache, so the login UI stays this
+    // app's custom overlay instead of a jarring browser dialog.
+    if (credentials) headers.Authorization = `Basic ${credentials}`;
+    // Every API path is relative ("/api/...") in the markup/call
+    // sites; prefixed here with the configured backend origin so this
+    // works whether the page is served by the backend itself
+    // (same-origin, backend URL "") or published separately (GitHub
+    // Pages, cross-origin).
+    const url = path.startsWith("/") ? `${getBackendUrl()}${path}` : path;
     try {
       const resp = await fetch(url, { ...options, headers, signal: controller.signal });
       if (resp.status === 401) {
-        // The token this browser had is gone or was revoked (by this
-        // device's own logout, or from another device's session list).
-        // Drop it and ask for the password again -- whatever request
-        // just 401'd still surfaces its own error to its caller below.
-        clearToken();
+        // Wrong or missing credentials -- drop them and ask again.
+        // Whatever request just 401'd still surfaces its own error to
+        // its caller below.
+        clearCredentials();
         showLoginOverlay();
       }
       return resp;

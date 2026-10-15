@@ -8,20 +8,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", extra="ignore")
 
     database_url: str
-    # Path to a plaintext file containing the one shared login password
-    # (nothing else in the file -- just the password, trailing
-    # whitespace stripped). Read fresh on every /login attempt (see
-    # app/auth.py verify_password) rather than once at startup, so
-    # editing the file -- e.g. over SSH -- takes effect immediately,
-    # with no restart/redeploy. See docs/DECISIONS.md "Password login
-    # with per-device tokens". Deliberately has no default *password*
-    # value: a missing or unreadable file makes every login attempt
-    # fail closed (see verify_password), the same fail-closed intent
-    # the old `membase_auth_password` env var had. `nix develop`'s
-    # shellHook creates a dev-only default file under .data/ so local
-    # development works out of the box; that file is NOT meant to back
-    # a real deployment -- see docs/DEPLOYMENT.md.
-    membase_auth_password_file: Path = Path(".data/auth_password")
+    # The one origin allowed to make cross-origin requests to this API
+    # (see app/main.py's CORSMiddleware) -- the published GitHub Pages
+    # frontend's origin in production. No wildcard: authentication is
+    # no longer this app's job (see docs/DECISIONS.md "Retire app-level
+    # auth for nginx Basic Auth"), so CORS is the one remaining layer
+    # deciding which *websites* may call this API from a browser at
+    # all, as opposed to who may call it directly (e.g. curl, which
+    # CORS never restricts -- it's a browser-enforced policy, not a
+    # server-side access control).
+    frontend_origin: str = "http://127.0.0.1:8000"
     ollama_host: str = "http://127.0.0.1:11434"
     # gemma4:12b -- natively multimodal (text/image/audio, no separate
     # vision encoder to wire up), used for *every* generation/structured-
