@@ -141,26 +141,32 @@ arbitrary custom domain).
    (prompts for the password interactively; `openssl passwd -apr1` is
    used instead of requiring the separate `apache2-utils`/`httpd`
    package just for its `htpasswd` binary).
-3. **Cloudflare Tunnel**: uses `api.membase.vxliu.com`, **not** the
+3. **Cloudflare Tunnel**: uses `membase-api.vxliu.com`, **not** the
    bare `membase.vxliu.com` -- that hostname is already GitHub Pages'
    custom domain for the frontend (see "Publishing the frontend to
    GitHub Pages" below and docs/DECISIONS.md "Cloudflare Tunnel for
    CGNAT-safe public reachability"), and one hostname can't point at
-   both. Requires `vxliu.com`'s DNS to be hosted on Cloudflare first
+   both. Also deliberately *not* `api.membase.vxliu.com` -- that's two
+   subdomain levels below the zone apex, which Cloudflare's free
+   Universal SSL cert doesn't cover (only `vxliu.com` and `*.vxliu.com`,
+   one level); a hostname that deep gets a TLS handshake failure, not a
+   clean error, so this is easy to get wrong and only notice once you
+   actually test the connection. Requires `vxliu.com`'s DNS to be hosted
+   on Cloudflare first
    (point the domain's nameservers at Cloudflare, or add it as a site
-   there) -- this covers `api.membase.vxliu.com` too, as a subdomain of
+   there) -- this covers `membase-api.vxliu.com` too, as a subdomain of
    the same zone. Then:
    ```
    cloudflared tunnel login
    cloudflared tunnel create membase
-   cloudflared tunnel route dns membase api.membase.vxliu.com
+   cloudflared tunnel route dns membase membase-api.vxliu.com
    ```
    Copy `deploy/cloudflared-config.yml` to wherever `cloudflared`
    expects it, filling in the tunnel ID and credentials-file path
    `tunnel create` printed. Run it (`cloudflared tunnel run membase`,
    or via the NixOS `services.cloudflared` module / a systemd unit for
    anything longer-running than a manual test).
-4. Confirm end to end: `curl -u yourusername https://api.membase.vxliu.com/api/captures`
+4. Confirm end to end: `curl -u yourusername https://membase-api.vxliu.com/api/captures`
    should prompt for the password and then return `[]` (or your real
    captures) -- not a connection error, not an unauthenticated 200.
 
@@ -177,7 +183,7 @@ Cloudflare can do several of the same things (security headers, rate
 limiting) at the edge. Reason: the backend machine is also on a
 Tailscale tailnet; an edge-only approach would only protect requests
 that actually go through the Cloudflare Tunnel hostname, leaving a
-direct Tailscale hit to the machine (bypassing `api.membase.vxliu.com`
+direct Tailscale hit to the machine (bypassing `membase-api.vxliu.com`
 entirely) with no auth at all, since the app itself has none anymore.
 nginx sits in front of the app regardless of which path a request
 takes to reach the machine, so it stays authoritative for Basic Auth.
@@ -193,11 +199,11 @@ covers:
    Strict-Transport-Security`, since it's set directly on the response
    the browser actually negotiated TLS with.
 2. **Rules → Transform Rules → Modify Response Header**, for
-   `api.membase.vxliu.com`: `X-Content-Type-Options: nosniff`,
+   `membase-api.vxliu.com`: `X-Content-Type-Options: nosniff`,
    `X-Frame-Options: DENY`, `Referrer-Policy:
    strict-origin-when-cross-origin` -- mirrors `deploy/nginx-membase.conf`'s
    headers, applied before the response ever re-enters the tunnel.
-3. **Security → WAF → Rate limiting rules**, for `api.membase.vxliu.com`:
+3. **Security → WAF → Rate limiting rules**, for `membase-api.vxliu.com`:
    a looser outer bound (e.g. 50 req/min per IP) than nginx's own
    `limit_req` (10 req/s) -- catches gross abuse before it ever
    consumes tunnel bandwidth, while nginx's tighter limit still does
@@ -213,7 +219,7 @@ dashboard rather than trusting a specific quota here.
 
 The frontend (`backend/app/templates/*.html` + `backend/app/static/`)
 is published separately from the backend, to GitHub Pages under the
-custom domain `membase.vxliu.com` -- **not** `api.membase.vxliu.com`,
+custom domain `membase.vxliu.com` -- **not** `membase-api.vxliu.com`,
 which is the backend's own hostname (see "nginx + Cloudflare Tunnel"
 above; the two can't be the same hostname, see docs/DECISIONS.md
 "Cloudflare Tunnel for CGNAT-safe public reachability" for how that

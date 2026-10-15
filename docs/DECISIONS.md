@@ -1907,7 +1907,7 @@ owned) was a hard requirement.
 **Mechanics:** `cloudflared`, a daemon running on the backend machine,
 makes an *outbound* connection to Cloudflare's edge network -- no inbound
 port needed on this machine at all, so CGNAT is irrelevant. Cloudflare's
-edge terminates TLS for `api.membase.vxliu.com` (using their own cert,
+edge terminates TLS for `membase-api.vxliu.com` (using their own cert,
 auto-issued and auto-renewed -- no certbot/ACME management on this end)
 and forwards traffic through that outbound tunnel to whatever
 `cloudflared`'s ingress config points it at locally -- here, nginx on
@@ -1916,15 +1916,31 @@ Prerequisite: `vxliu.com`'s authoritative DNS must be hosted on Cloudflare
 (`cloudflared tunnel route dns` provisions the actual DNS record pointing
 the hostname at the tunnel). Config: `deploy/cloudflared-config.yml`.
 
-**The hostname is `api.membase.vxliu.com`, not the bare
-`membase.vxliu.com`** -- discovered as a real conflict mid-implementation:
-`membase.vxliu.com` was already claimed as GitHub Pages' custom domain for
-the frontend (a `CNAME` file at the repo root, added via GitHub's own UI
-before this was noticed), and a single hostname's DNS can't point at both
-GitHub Pages' infrastructure and a Cloudflare Tunnel at the same time. The
-`api.` subdomain for the backend resolves this with no DNS-zone changes
-needed beyond the one new record `cloudflared tunnel route dns` creates --
-both hostnames are under the same `vxliu.com` zone regardless.
+**The hostname is `membase-api.vxliu.com`, a sibling of `membase.vxliu.com`
+(both one level under the zone apex), not a child of it** -- went through
+two iterations before landing here, each caught by actually testing the
+live connection rather than assuming the config was right:
+
+1. First attempt used the bare `membase.vxliu.com` for the backend too --
+   discovered as a real conflict immediately: that hostname was already
+   claimed as GitHub Pages' custom domain for the frontend (a `CNAME` file
+   at the repo root, added via GitHub's own UI before this was noticed),
+   and a single hostname's DNS can't point at both GitHub Pages'
+   infrastructure and a Cloudflare Tunnel at the same time.
+2. Second attempt used `api.membase.vxliu.com` (the backend as a child of
+   the frontend's hostname) -- DNS resolved fine (`cloudflared tunnel route
+   dns` succeeded), but every connection failed with a TLS handshake error.
+   Confirmed by inspecting the actual certificate Cloudflare's edge serves
+   for the zone: free Universal SSL only covers `vxliu.com` and
+   `*.vxliu.com` -- one wildcard level, nothing deeper. `api.membase.vxliu.com`
+   is two labels below the apex (`api.` *and* `membase.`), so no cert on
+   Cloudflare's edge ever matched that SNI.
+3. `membase-api.vxliu.com` -- one label below the apex, a sibling of
+   `membase.vxliu.com` rather than a child -- is covered by the same
+   `*.vxliu.com` wildcard the frontend already uses, and resolves the
+   original GitHub Pages conflict identically to the `api.` attempt (still
+   a distinct hostname from the frontend's). No DNS-zone changes needed
+   beyond the one new record `cloudflared tunnel route dns` creates.
 
 **Not done:** no failover/redundancy if the single `cloudflared` process or
 its one tunnel connection drops -- acceptable for a single-user app; revisit
@@ -1967,7 +1983,7 @@ Cloudflare's edge features on top of nginx" for the concrete dashboard
 steps. Reason: the backend machine is also reachable over Tailscale;
 an edge-only approach (Cloudflare Access instead of nginx's Basic
 Auth, edge-only headers/rate-limiting with no local copy) would only
-protect requests that go through the public `api.membase.vxliu.com`
+protect requests that go through the public `membase-api.vxliu.com`
 hostname, leaving a direct Tailscale hit to the machine completely
 unauthenticated, since the app itself has no auth code of its own.
 nginx sits in front of the app regardless of which network path a

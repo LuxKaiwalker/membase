@@ -1,20 +1,23 @@
 # cloudflared ingress config -- see docs/DEPLOYMENT.md "nginx + Cloudflare
-# Tunnel" for the full setup walkthrough. Copy this to wherever cloudflared
-# expects its config (conventionally /etc/cloudflared/config.yml, or wherever
-# the NixOS services.cloudflared module's `configFile` option points), filling
-# in the two placeholders below with the values `cloudflared tunnel create`
-# printed.
+# Tunnel" for the full setup walkthrough.
+#
+# NOT the actual runtime config on the deployed NixOS machine -- the
+# services.cloudflared module there generates its own config internally
+# from configuration.nix's `tunnels.<id>.ingress` attrset and never reads
+# this file at all. Kept here as a portable reference for reproducing
+# this setup outside NixOS (copy to wherever cloudflared expects its
+# config, conventionally /etc/cloudflared/config.yml).
 #
 # Routes the public hostname to nginx (127.0.0.1:8080), NOT directly to the
 # FastAPI backend (127.0.0.1:8000) -- nginx is what does Basic Auth, security
 # headers, rate limiting, and the body-size cap; skipping it here would
 # bypass all of that.
 
-tunnel: <TUNNEL-ID-FROM-TUNNEL-CREATE>
-credentials-file: /root/.cloudflared/<TUNNEL-ID-FROM-TUNNEL-CREATE>.json
+tunnel: 815ad8c7-1554-416e-a2f2-15a9f27bd98e
+credentials-file: /root/.cloudflared/815ad8c7-1554-416e-a2f2-15a9f27bd98e.json
 
 ingress:
-  - hostname: api.membase.vxliu.com
+  - hostname: membase-api.vxliu.com
     service: http://127.0.0.1:8080
   # Required catch-all -- cloudflared refuses to start without one.
   - service: http_status:404
