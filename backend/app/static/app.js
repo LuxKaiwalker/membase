@@ -713,7 +713,10 @@ const membase = (() => {
       const when = new Date(capture.created_at).toLocaleString();
       const unitBadges = capture.units
         .map((u) => {
-          const statusBadge = `<span class="status-badge status-badge-${escapeHtml(u.status)}">${escapeHtml(u.status)}</span>`;
+          // data-unit-id so the clarification handler below can update
+          // this specific badge in place once a question is answered,
+          // without a full list reload.
+          const statusBadge = `<span class="status-badge status-badge-${escapeHtml(u.status)}" data-unit-id="${escapeHtml(u.id)}">${escapeHtml(u.status)}</span>`;
           // The structurer's own progress (see docs/DECISIONS.md "The
           // 'membase structurer'") -- deliberately only shown here, not
           // on the Store page, and only read at page-load time (no
@@ -729,15 +732,115 @@ const membase = (() => {
       const restructureButtons = failedStructureUnits
         .map((u) => `<button type="button" class="capture-restructure" data-unit-id="${escapeHtml(u.id)}">Retry structuring</button>`)
         .join(" ");
+      // A unit awaiting clarification is durably saved but not yet
+      // searchable (see docs/ARCHITECTURE.md "Status gate") -- it never
+      // gets structured either, since structuring only runs on units
+      // that have already reached "ready". Answering here is the same
+      // POST /api/memory-units/{id}/clarify the Store page's own
+      // in-flight card uses, just reachable later for anything left
+      // unanswered from a previous visit.
+      const pendingUnits = capture.units.filter((u) => u.pending_clarification);
+      const clarificationBlocks = pendingUnits
+        .map(
+          (u) => `
+        <div class="capture-clarification" data-unit-id="${escapeHtml(u.id)}">
+          <p class="muted">This memory isn't searchable yet until this is answered.</p>
+          <p class="capture-clarification-question">${escapeHtml(u.pending_clarification.question)}</p>
+          <form class="capture-clarification-form">
+            <input class="capture-clarification-answer" type="text" placeholder="Your answer" />
+            <button type="submit" class="capture-clarification-submit">Submit answer</button>
+            <button type="button" class="capture-clarification-discard">Discard this one</button>
+          </form>
+          <p class="capture-clarification-error status error hidden"></p>
+        </div>`
+        )
+        .join("");
       card.innerHTML = `
         <p class="muted">${escapeHtml(when)}</p>
         <p>${escapeHtml(capture.raw_text)}</p>
         <p>${unitBadges}</p>
+        ${clarificationBlocks}
         ${attachmentList}
         ${restructureButtons}
         <p class="capture-restructure-error status error hidden"></p>
         <button type="button" class="capture-delete">Delete</button>
       `;
+
+      for (const block of card.querySelectorAll(".capture-clarification")) {
+        const unitId = block.dataset.unitId;
+        const questionEl = block.querySelector(".capture-clarification-question");
+        const form = block.querySelector(".capture-clarification-form");
+        const answerInput = block.querySelector(".capture-clarification-answer");
+        const submitButton = block.querySelector(".capture-clarification-submit");
+        const discardButton = block.querySelector(".capture-clarification-discard");
+        const clarificationErrorEl = block.querySelector(".capture-clarification-error");
+
+        // Same "obligatory" preference the Store page's own clarification
+        // flow reads (see isObligatory()) -- one setting governs whether
+        // discarding is offered instead of answering, everywhere in the
+        // app, not just where a question was first asked.
+        const obligatory = isObligatory();
+        answerInput.required = obligatory;
+        if (obligatory) hide(discardButton);
+
+        function setBusy(busy, label) {
+          submitButton.disabled = busy;
+          discardButton.disabled = busy;
+          answerInput.disabled = busy;
+          submitButton.textContent = busy ? label : "Submit answer";
+          if (busy) hide(clarificationErrorEl);
+        }
+
+        // A unit can ask another round of questions after this one is
+        // answered (see docs/ARCHITECTURE.md) -- if so, this same block
+        // just shows the next question instead of disappearing; it only
+        // goes away once nothing is left pending for this unit.
+        function applyUpdatedUnit(updatedUnit) {
+          const unit = capture.units.find((u) => u.id === updatedUnit.id);
+          if (unit) {
+            unit.status = updatedUnit.status;
+            unit.pending_clarification = updatedUnit.pending_clarification;
+            unit.clarifications = updatedUnit.clarifications;
+          }
+          const badge = card.querySelector(`.status-badge[data-unit-id="${CSS.escape(updatedUnit.id)}"]`);
+          if (badge) {
+            badge.textContent = updatedUnit.status;
+            badge.className = `status-badge status-badge-${updatedUnit.status}`;
+          }
+          if (updatedUnit.pending_clarification) {
+            questionEl.textContent = updatedUnit.pending_clarification.question;
+            answerInput.value = "";
+            setBusy(false);
+          } else {
+            block.remove();
+          }
+        }
+
+        form.addEventListener("submit", async (ev) => {
+          ev.preventDefault();
+          setBusy(true, "Submitting...");
+          try {
+            const updatedUnit = await postJSON(`/api/memory-units/${unitId}/clarify`, { answer: answerInput.value });
+            applyUpdatedUnit(updatedUnit);
+          } catch (err) {
+            setBusy(false);
+            showStatus(clarificationErrorEl, err.message, true);
+          }
+        });
+
+        discardButton.addEventListener("click", async () => {
+          setBusy(true, "Discarding...");
+          try {
+            const resp = await fetchWithTimeout(`/api/memory-units/${unitId}/discard`, { method: "POST" });
+            const updatedUnit = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(updatedUnit.detail || "Failed to discard");
+            applyUpdatedUnit(updatedUnit);
+          } catch (err) {
+            setBusy(false);
+            showStatus(clarificationErrorEl, err.message, true);
+          }
+        });
+      }
 
       const restructureError = card.querySelector(".capture-restructure-error");
       for (const button of card.querySelectorAll(".capture-restructure")) {

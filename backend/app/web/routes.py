@@ -21,3 +21,8 @@ async def recall_page(request: Request):
 @router.get("/captures")
 async def captures_page(request: Request):
     return templates.TemplateResponse(request, "captures.html", {})
+
+
+@router.get("/docs")
+async def docs_page(request: Request):
+    return templates.TemplateResponse(request, "docs.html", {})

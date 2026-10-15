@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}membase — Docs{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>How storage works</h1>
+  <p>
+    Writing a memory never edits anything after the fact. What you type
+    is saved verbatim as a <strong>capture</strong> and never rewritten
+    — everything else (search index, extracted meaning, later
+    corrections) is layered on top of it, not in place of it.
+  </p>
+  <p>
+    A capture can become one or more <strong>memory units</strong> — one
+    independently retrievable piece of memory each. A single note about
+    two unrelated things becomes two units; one coherent story stays one.
+  </p>
+  <p>
+    Each unit carries a strict order of authority: what you typed
+    outranks what you later clarified, which outranks what was
+    automatically inferred, which outranks the fully-derived search
+    index built from all of it. Nothing downstream ever overwrites
+    something upstream of it.
+  </p>
+  <p>
+    A unit with a genuinely ambiguous term or date may hold one question
+    before it becomes searchable — answer it, skip it, or discard that
+    unit from the Browse tab. Answering never changes your original
+    words; it just adds to what the unit knows about itself.
+  </p>
+  <p>
+    Deleting a capture (Browse tab) is the only way a memory goes away —
+    there's no automatic expiry or relevance-based forgetting.
+  </p>
+  <p class="muted">
+    Full architecture, design decisions, and the evaluation history:
+    <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a>.
+  </p>
+</section>
+{% endblock %}

@@ -37,6 +37,7 @@ PAGES = {
     "create.html": "index.html",
     "recall.html": "recall/index.html",
     "captures.html": "captures/index.html",
+    "docs.html": "docs/index.html",
 }
 
 
