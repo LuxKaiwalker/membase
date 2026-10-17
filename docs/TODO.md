@@ -1,5 +1,35 @@
 # TODO / open questions
 
+## Resolved this phase (restore the multi-call pipeline, instant save, image structured data, attachment access)
+
+Full reasoning for every item below is in docs/DECISIONS.md under
+"Restore the multi-call ingestion pipeline" and docs/REPORT.md (the
+current report) -- this is just the index.
+
+- **The streamlining-phase ingestion collapse (below) is reversed.**
+  `create_capture()` is Phase-0-only (persist + return instantly, zero
+  LLM calls); a single background task, `process_capture_fully()`,
+  does the restored dedicated segmentation/clarify/enrichment calls
+  (`app/ingestion/{segmentation,clarify,enrichment}.py`), now free of
+  the synchronous-latency pressure that motivated collapsing them in
+  the first place.
+- **Image understanding gained a structured-data extraction pass**
+  (`_extract_image_structured_data()`) alongside the existing free-text
+  caption, promoted into `semantic.relations` by enrichment -- fixes a
+  photographed form/prescription/measurement's values getting
+  lost/garbled in prose. Still not empirically quality-tested against
+  a real photo -- see "Known technical gaps" below, same open item as
+  the caption prompt.
+- **Attachment view/download**, previously missing entirely: new
+  `GET /api/attachments/{id}/file`, wired into the Store page, Browse
+  tab, and Recall page.
+- **A real incident, caught and fixed in the same phase**: running
+  `pytest` against the shared dev Postgres database while a live
+  production backend on the same machine was pointed at that exact
+  database wiped every stored memory for real (no backups existed).
+  Fixed by giving production its own `membase_prod` database
+  (`scripts/run-prod.sh`) -- see CLAUDE.md footgun #10.
+
 ## Resolved this phase (the "membase structurer")
 
 - **A second, independent background pass now deepens an already-
@@ -300,7 +330,11 @@ Full reasoning for every item below is in docs/DECISIONS.md under
   (`tests/test_chunking.py`), but nothing in `app/api/` calls it -- a
   server restart that drops a `finish_attachment_chunking` background
   task currently has no user-facing recovery path, only a callable
-  Python function. Needs either a `POST /api/attachments/{id}/retry`
+  Python function. `app/api/attachments.py` now exists (added for
+  `GET /{id}/file`, see docs/DECISIONS.md "Restore the multi-call
+  ingestion pipeline") and would be the natural home for this route if
+  it's ever added -- not done as part of that work, still open here.
+  Needs either a `POST /api/attachments/{id}/retry`
   route or a startup reconciliation pass (scan for attachments past the
   size threshold with zero chunks), whichever turns out to need less new
   surface.
@@ -515,6 +549,13 @@ Full reasoning for every item below is in docs/DECISIONS.md under
   with a fake model, but caption *quality* against real images (does it
   reliably transcribe visible text? describe enough detail to be
   findable later?) hasn't been evaluated the way the text pipeline was.
+  **Now also applies to `_extract_image_structured_data()`** (see
+  docs/DECISIONS.md "Restore the multi-call ingestion pipeline" --
+  added to fix lost/garbled prescription-style numeric data): validated
+  by prompt/schema reasoning and the fake-model test suite, not yet
+  against a real photographed form/prescription/measurement. Trying it
+  with a real photo through the dev server is the concrete next step
+  for both this and the caption prompt above.
 - **A RecallSession round can be more expensive than the one-shot
   agent's**, since `automatic_search` re-searches the original query
   plus every accumulated positive cue from scratch each round (by
