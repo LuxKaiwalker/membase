@@ -1,5 +1,5 @@
 
-from app.ingestion.pipeline import create_capture, finish_unit_processing, retry_enrichment
+from app.ingestion.pipeline import create_capture, finish_unit_processing, process_capture_fully, retry_enrichment
 from app.models import MemoryUnit
 from tests.helpers import create_capture_and_finish
 
@@ -16,16 +16,15 @@ async def test_unexpected_enrichment_failure_marks_unit_failed_not_silently_read
 
     monkeypatch.setattr(pipeline_module, "build_retrieval_text", _boom)
 
-    capture = await create_capture(db, fake_llm, text="Authoritative content must survive a bug", uploads=[])
-    unit = capture.units[0]
-    # Full enrichment (where the bug lives) hasn't run yet -- it's
-    # scheduled as a background task, not run inline by create_capture()
-    # anymore (see docs/DECISIONS.md). Drive it explicitly, the test
-    # equivalent of "the background task runs".
-    assert unit.status == "processing"
-
-    await finish_unit_processing(unit.id, llm=fake_llm)
+    capture = await create_capture(db, text="Authoritative content must survive a bug", uploads=[])
+    # Segmentation + enrichment haven't run yet -- they're scheduled as
+    # one background task, not run inline by create_capture() anymore
+    # (see docs/DECISIONS.md). Drive it explicitly, the test equivalent
+    # of "the background task runs".
+    await process_capture_fully(capture.id, llm=fake_llm)
     db.expire_all()
+    db.refresh(capture)
+    unit = capture.units[0]
     assert unit.status == "failed"
     # The authoritative content committed in phase 1, before enrichment
     # ran, must still be intact.

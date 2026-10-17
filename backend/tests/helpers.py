@@ -1,30 +1,29 @@
-"""Shared test helpers for driving the now-backgrounded enrichment and
-attachment-chunking steps.
+"""Shared test helpers for driving the now-fully-backgrounded ingestion
+pipeline.
 
-Full enrichment and attachment chunk-indexing both run as scheduled
-FastAPI BackgroundTasks in production (see docs/DECISIONS.md) -- a unit
-reaches status="processing" the moment clarification is settled, and
-only reaches "ready" once that background task runs; an attachment's
-chunks only exist once its own background task runs. There's no
-BackgroundTasks machinery outside the HTTP layer, so these helpers run
-create_capture()/resolve_clarification() and then synchronously finish
-whatever processing they scheduled -- the test equivalent of "wait for
-the background tasks to complete".
+process_capture_fully() is the ONE function that does ALL of a
+capture's LLM-dependent work in production (image captioning + structured
+extraction, chunking, segmentation, clarification, enrichment,
+embedding, and the membase structurer's deeper pass) as a single
+background task (see app/ingestion/pipeline.py and docs/DECISIONS.md
+"Restore the multi-call ingestion pipeline"). There's no BackgroundTasks
+machinery outside the HTTP layer, so create_capture_and_finish() runs
+create_capture() (Phase 0 only) and then awaits process_capture_fully()
+directly -- the test equivalent of "wait for the background task to
+complete".
 
-Tests that only care about clarification-time state (an open question,
-the gate, discard) and never need a unit to actually reach "ready" or
-an attachment to actually have chunks can keep calling
-create_capture()/resolve_clarification() directly; no need to pull
-these in.
+Tests that only care about Phase-0 state (rejection, raw persistence,
+`capture.units == []` immediately after creation) can keep calling
+create_capture() directly; no need to pull this in.
 """
 
 from app.ingestion.pipeline import (
     create_capture,
     finish_attachment_chunking,
-    finish_image_captioning,
     finish_unit_processing,
-    is_uncaptioned_image,
+    process_capture_fully,
     resolve_clarification,
+    should_chunk,
 )
 
 
@@ -36,32 +35,41 @@ async def _finish_processing(db, llm, *units) -> None:
         db.expire_all()  # pick up what finish_unit_processing's own session committed
 
 
-async def _finish_captioning(db, llm, *attachments) -> None:
-    for attachment in attachments:
-        if is_uncaptioned_image(attachment):
-            await finish_image_captioning(attachment.id, llm=llm)
-    if attachments:
-        db.expire_all()  # pick up what finish_image_captioning's own session committed
+async def create_capture_and_finish(db, llm, *, text, uploads=None, explicit_metadata=None, allow_clarification=True):
+    """create_capture() (Phase 0: raw text + attachments, zero LLM
+    calls) + process_capture_fully() (everything else) + a non-image
+    attachment's independently-scheduled chunking (see
+    app/api/captures.py's create() -- process_capture_fully() only
+    chunks an IMAGE attachment internally, since that's the one case
+    whose chunking decision depends on state it just produced; a
+    non-image attachment's chunking is scheduled separately, right
+    alongside capture creation, in production too), synchronously -- the
+    direct replacement for the old pre-restore
+    `create_capture(db, llm, text=X, uploads=Y)` call pattern, which
+    used to do all of this inline.
+    """
+    capture = await create_capture(
+        db, text=text, uploads=uploads or [], explicit_metadata=explicit_metadata, allow_clarification=allow_clarification
+    )
+    await process_capture_fully(capture.id, llm=llm)
+    db.expire_all()
+    db.refresh(capture)
+    for attachment in capture.attachments:
+        if not attachment.content_type.startswith("image/") and should_chunk(attachment.extracted_text):
+            await finish_attachment_chunking(attachment.id, llm=llm)
+    db.expire_all()
+    db.refresh(capture)
+    return capture
 
 
-async def _finish_chunking(db, llm, *attachments) -> None:
-    for attachment in attachments:
-        await finish_attachment_chunking(attachment.id, llm=llm)
-    if attachments:
-        db.expire_all()  # pick up what finish_attachment_chunking's own session committed
-
-
-async def create_capture_and_finish(db, llm, *, text, uploads=None):
-    """create_capture() + synchronously finish every backgrounded step:
-    unit enrichment for every unit without a clarification question
-    pending, image captioning, and chunk-indexing -- in that order, since
-    whether a (now-captioned) attachment needs chunking at all depends on
-    its caption length (see docs/DECISIONS.md "Lazy attachment
-    chunking")."""
-    capture = await create_capture(db, llm, text=text, uploads=uploads or [])
-    await _finish_processing(db, llm, *capture.units)
-    await _finish_captioning(db, llm, *capture.attachments)
-    await _finish_chunking(db, llm, *capture.attachments)
+async def create_capture_and_finish_unstructured(db, llm, *, text, uploads=None):
+    """Like create_capture_and_finish(), but stops right after the fast
+    pipeline (embedding) -- before the membase structurer's automatic
+    chaining -- so a test can drive structuring itself, with a
+    separately controlled LLM response (see tests/test_structurer.py)."""
+    capture = await create_capture(db, text=text, uploads=uploads or [])
+    await process_capture_fully(capture.id, llm=llm, auto_structure=False)
+    db.expire_all()
     db.refresh(capture)
     return capture
 

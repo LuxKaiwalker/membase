@@ -18,7 +18,7 @@ async def test_saving_a_users_own_message_creates_a_normal_capture(db, fake_llm)
     session = await start_session(db, fake_llm, "something I can't quite recall")
 
     capture = await save_as_memory(
-        session.id, SaveAsMemoryRequest(text="something I can't quite recall"), background_tasks=_NoopTasks(), db=db, llm=fake_llm
+        session.id, SaveAsMemoryRequest(text="something I can't quite recall"), background_tasks=_NoopTasks(), db=db
     )
 
     assert isinstance(capture, Capture)
@@ -38,7 +38,7 @@ async def test_saving_a_cue_the_user_supplied_mid_session_creates_a_normal_captu
     db.refresh(session)
 
     capture = await save_as_memory(
-        session.id, SaveAsMemoryRequest(text="It was Markus, not Anna"), background_tasks=_NoopTasks(), db=db, llm=fake_llm
+        session.id, SaveAsMemoryRequest(text="It was Markus, not Anna"), background_tasks=_NoopTasks(), db=db
     )
 
     assert capture.raw_text == "It was Markus, not Anna"
@@ -49,7 +49,7 @@ async def test_arbitrary_text_not_said_in_the_session_is_rejected(db, fake_llm):
 
     with pytest.raises(HTTPException) as exc_info:
         await save_as_memory(
-            session.id, SaveAsMemoryRequest(text="this was never said in this session"), background_tasks=_NoopTasks(), db=db, llm=fake_llm
+            session.id, SaveAsMemoryRequest(text="this was never said in this session"), background_tasks=_NoopTasks(), db=db
         )
     assert exc_info.value.status_code == 400
 

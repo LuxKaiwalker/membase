@@ -10,24 +10,28 @@ from app.llm.base import (
 )
 from app.models import EMBEDDING_DIM
 
-# Shared default for every semantic field analyze_capture/reanalyze_unit
-# can produce -- _parse_semantics()/_as_*() in app/ingestion/analysis.py
-# already tolerate missing keys gracefully, but spelling out the full
-# shape here keeps fake responses self-documenting.
+# Shared default for every semantic field enrich_unit() can produce --
+# _as_*()/empty_semantics() in app/ingestion/analysis.py already
+# tolerate missing keys gracefully, but spelling out the full shape here
+# keeps fake responses self-documenting. No clarification fields here
+# any more -- clarify.generate_question() is a separate call now with
+# its own response queue (see `clarification_response` below).
 _EMPTY_SEMANTIC_FIELDS = {
     "meaning": "", "aliases": [], "people": [], "organizations": [], "locations": [],
     "topics": [], "definitions": [], "relations": [], "event_date": "",
-    "clarification_question": "", "clarification_field": "",
 }
+_DEFAULT_CLARIFICATION = {"clarification_question": "", "clarification_field": ""}
+_DEFAULT_IMAGE_STRUCTURED = {"has_structured_data": False, "fields": []}
 _DEFAULT_EVALUATE = {"sufficient": True, "reformulated_queries": []}
 _DEFAULT_ANSWER = {"answer": "stub answer", "grounded": True}
 _DEFAULT_CUES = {"cues": []}
 
-# analyze_capture's prompt always ends "Text:\n{raw_text}\n\nAnalyze
-# this." (see app/ingestion/analysis.py) -- extracting it lets the fake
-# echo the real text back as the default single unit's verbatim
-# "content" without a test needing to repeat it in segmentation_response.
-_CAPTURE_TEXT_RE = re.compile(r"Text:\n(.*)\n\nAnalyze this\.", re.DOTALL)
+# segment_capture()'s prompt always ends "Text:\n{raw_text}\n\nSplit
+# this into memory units." (see app/ingestion/segmentation.py) --
+# extracting it lets the fake echo the real text back as the default
+# single unit's verbatim "content" without a test needing to repeat it
+# in segmentation_response.
+_CAPTURE_TEXT_RE = re.compile(r"Text:\n(.*)\n\nSplit this into memory units\.", re.DOTALL)
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
@@ -66,35 +70,78 @@ class _ResponseQueue:
             return self._items.pop(0)
         return self._items[0]
 
+    def peek(self) -> Any:
+        """Returns the current item WITHOUT consuming it -- used for
+        enrich_unit()'s 3 sub-calls, which must all see the same
+        per-unit response (see `advance()` below)."""
+        if self._items is None:
+            return self._default
+        return self._items[0] if self._items else self._default
+
+    def advance(self) -> None:
+        """Consumes the current item -- called once, after the LAST of
+        enrich_unit()'s 3 sub-calls, so one queued item corresponds to
+        one enrich_unit() invocation, not one sub-call."""
+        if self._items and len(self._items) > 1:
+            self._items.pop(0)
+
+
+def _derive_clarification_response(enrichment_response: Any) -> Any:
+    """Backward-compatible convenience: many test fixtures bundle
+    clarification_question/clarification_field into the same single
+    `enrichment_response` dict a one-call-does-everything fixture used
+    to configure. If the caller didn't explicitly pass
+    `clarification_response`, and `enrichment_response` is a plain dict
+    (not a per-unit list -- where this derivation can't unambiguously
+    line a clarify call up with the right unit) carrying either key,
+    derive a constant clarification_response from it so those fixtures
+    keep working unmodified under the restored multi-call dispatch."""
+    if isinstance(enrichment_response, dict) and (
+        "clarification_question" in enrichment_response or "clarification_field" in enrichment_response
+    ):
+        return {
+            "clarification_question": enrichment_response.get("clarification_question", ""),
+            "clarification_field": enrichment_response.get("clarification_field", ""),
+        }
+    return None
+
 
 class FakeLLMProvider(LLMProvider):
     """Fast, deterministic stand-in for LLMProvider used by unit tests.
 
     `fail` simulates backend failure modes: None | "unavailable" | "timeout"
     | "malformed" (applies to every call). Dispatched by a distinguishing
-    key in the schema's properties:
-      - "units"       -> analyze_capture() (segmentation + per-unit
-                         analysis in one call, see
-                         app/ingestion/analysis.py). If
-                         `segmentation_response` is configured, returned
-                         as-is (for multi-unit tests); otherwise a single
-                         unit is built automatically, echoing the real
-                         text being analyzed as its verbatim "content"
-                         and drawing semantic/clarification fields from
-                         `enrichment_response`.
-      - "sufficient"  -> agent's evaluate-sufficiency step
-      - "grounded"    -> final answer generation
-      - "cues"        -> recall-session cue extraction
-      - (none of the above) -> reanalyze_unit() (a single unit's
-                         post-clarification re-analysis -- same semantic
-                         shape as above minus "content"/"units"), drawn
-                         from the same `enrichment_response` queue.
+    key in the schema's properties -- the restored multi-call pipeline
+    (see app/ingestion/{segmentation,clarify,enrichment}.py) makes
+    several separate `generate_structured` calls per unit instead of one
+    combined call, each with its own narrow schema:
+      - "units"                 -> segment_capture() (content-only, no
+                                    semantic fields any more). If
+                                    `segmentation_response` is configured,
+                                    returned as-is (for multi-unit tests);
+                                    otherwise a single unit is built
+                                    automatically, echoing the real text
+                                    being segmented as its verbatim
+                                    "content".
+      - "clarification_question" -> clarify.generate_question(), drawn
+                                    from `clarification_response`
+                                    (default: no question).
+      - "meaning" (no "people")  -> enrichment's narrative sub-call
+      - "people"                 -> enrichment's entities sub-call
+      - "aliases"                -> enrichment's retrieval-aids sub-call
+        These three share ONE `enrichment_response` queue item per unit
+        (peeked by narrative/entities, consumed by retrieval-aids, the
+        last of the three) -- a list's Nth item is the Nth UNIT's
+        response, not the Nth sub-call's.
+      - "has_structured_data"    -> the image structured-data-extraction
+                                    call, drawn from
+                                    `image_structured_response`.
+      - "sufficient"             -> agent's evaluate-sufficiency step
+      - "grounded"                -> final answer generation
+      - "cues"                   -> recall-session cue extraction
 
     Each `*_response` may be a single dict (returned every time) or a
-    list (consumed in order, one per actual call -- unlike the old
-    three-sub-call enrich(), analyze_capture()/reanalyze_unit() are each
-    exactly one call now, so a list's Nth item is simply the Nth call's
-    response, no multiplier to account for).
+    list (consumed in order).
     """
 
     def __init__(
@@ -103,6 +150,8 @@ class FakeLLMProvider(LLMProvider):
         fail: str | None = None,
         segmentation_response: Any = None,
         enrichment_response: Any = None,
+        clarification_response: Any = None,
+        image_structured_response: Any = None,
         evaluate_response: Any = None,
         answer_response: Any = None,
         cue_response: Any = None,
@@ -112,6 +161,10 @@ class FakeLLMProvider(LLMProvider):
         self.fail = fail
         self._segmentation = _ResponseQueue(segmentation_response, None)
         self._enrichment = _ResponseQueue(enrichment_response, dict(_EMPTY_SEMANTIC_FIELDS))
+        if clarification_response is None:
+            clarification_response = _derive_clarification_response(enrichment_response)
+        self._clarification = _ResponseQueue(clarification_response, dict(_DEFAULT_CLARIFICATION))
+        self._image_structured = _ResponseQueue(image_structured_response, dict(_DEFAULT_IMAGE_STRUCTURED))
         self._evaluate = _ResponseQueue(evaluate_response, _DEFAULT_EVALUATE)
         self._answer = _ResponseQueue(answer_response, _DEFAULT_ANSWER)
         self._cues = _ResponseQueue(cue_response, dict(_DEFAULT_CUES))
@@ -168,14 +221,50 @@ class FakeLLMProvider(LLMProvider):
             raise LLMMalformedOutputError("fake: model did not return valid JSON")
 
         props = schema.get("properties", {})
+        if "related_indices" in props:
+            # app/ingestion/structurer.py's deep second pass: one
+            # combined call (still unsplit -- it's a quality-only pass
+            # with no clarification decision riding on it), so this
+            # just returns the configured dict as-is (same semantics as
+            # the old unified-call "reanalyze" catch-all).
+            self.calls.append("structure")
+            return dict(self._enrichment.next())
+        if "has_structured_data" in props:
+            self.calls.append("image_structured")
+            return self._image_structured.next()
         if "units" in props:
-            self.calls.append("analyze_capture")
+            self.calls.append("segment")
             configured = self._segmentation.next()
             if configured is not None:
                 return configured
             match = _CAPTURE_TEXT_RE.search(prompt)
             content = match.group(1) if match else prompt
-            return {"units": [{"content": content, **self._enrichment.next()}]}
+            return {"units": [{"content": content}]}
+        if "clarification_question" in props:
+            self.calls.append("clarify")
+            return self._clarification.next()
+        if "people" in props:
+            self.calls.append("entities")
+            item = self._enrichment.peek()
+            return {
+                "people": item.get("people", []),
+                "organizations": item.get("organizations", []),
+                "locations": item.get("locations", []),
+            }
+        if "aliases" in props:
+            self.calls.append("retrieval_aids")
+            item = self._enrichment.peek()
+            self._enrichment.advance()
+            return {
+                "aliases": item.get("aliases", []),
+                "topics": item.get("topics", []),
+                "definitions": item.get("definitions", []),
+                "relations": item.get("relations", []),
+            }
+        if "meaning" in props:
+            self.calls.append("narrative")
+            item = self._enrichment.peek()
+            return {"meaning": item.get("meaning", ""), "event_date": item.get("event_date", "")}
         if "sufficient" in props:
             self.calls.append("evaluate")
             return self._evaluate.next()
@@ -185,8 +274,7 @@ class FakeLLMProvider(LLMProvider):
         if "cues" in props:
             self.calls.append("cues")
             return self._cues.next()
-        self.calls.append("reanalyze")
-        return dict(self._enrichment.next())
+        raise AssertionError(f"FakeLLMProvider: no dispatch rule matched schema properties {list(props)}")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         self.embed_calls.append(list(texts))

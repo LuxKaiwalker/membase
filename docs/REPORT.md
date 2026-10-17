@@ -1,275 +1,183 @@
-# Engineering report: streamlining phase
+# Engineering report: restore the multi-call pipeline, instant save, image structured data, attachment access
 
-This supersedes the previous report. Scope: the previous two phases
-built out and then hardened the augmented-memory architecture
-(MemoryUnit segmentation, clarification gating, iterative RecallSession).
-This phase's mandate was different in kind -- not a new feature, but an
-explicit instruction that "the project is too bloaty": reduce LLM call
-count, remove duplicate retrieval pathways, collapse prematurely
-specialized processing stages, and reduce latency, **while preserving
-every architectural idea that makes this an augmented-memory system
-rather than a conventional notes/RAG app**. The spec named five
-abstractions everything else had to justify its existence against:
-Capture, MemoryUnit, Semantic representation, RecallSession, LLM/
-Database. All five survive this phase unchanged in kind; what changed
-is how many calls and how much code it takes to run them.
+This supersedes the previous report (the "streamlining phase," summarized
+below where it's still relevant). Scope: four related changes, driven by
+one premise the streamlining phase's own trade-off no longer holds under
+-- interactive recall now lives entirely in Browse/Remember, so saving a
+memory no longer needs to return a synchronously-analyzed result at all.
 
-Verified against the real local model throughout -- the 30-case eval
-corpus, a live multipart `POST /api/captures` round-trip including an
-explicit-metadata conflict and its clarification answer, and the full
-fast pytest suite (139 tests, all passing, against fakes).
+1. **Restore the multi-call ingestion pipeline**, now fully backgrounded,
+   so the quality the streamlining phase traded away can come back at
+   zero perceived latency cost.
+2. **Make saving instant**: `POST /api/captures` returns the moment raw
+   text + attachments are durably persisted, before any LLM call.
+3. **Fix lost structured data in images** (the concrete bug that
+   motivated this work: a photographed glasses prescription's numeric
+   values were getting summarized into prose, or lost, instead of
+   becoming queryable facts).
+4. **Attachment view/download**, previously missing entirely -- a
+   retrieved memory with a photo attached had no way to actually see
+   the photo anywhere in the UI.
+
+Verified against the real local model throughout: the full fast pytest
+suite (161 tests, all passing, against fakes) and the real-`gemma4:12b`
+integration suite (5 tests, all passing -- one needed a prompt fix,
+documented in section 4).
 
 ## 1. Current architecture
 
-Unchanged in *shape* from docs/ARCHITECTURE.md's description before this
-phase: a `Capture` decomposes into one or more `MemoryUnit`s; each unit
-carries authoritative content (verbatim, never rewritten), an append-only
+Unchanged in *shape* from docs/ARCHITECTURE.md's description: a
+`Capture` decomposes into one or more `MemoryUnit`s; each unit carries
+authoritative content (verbatim, never rewritten), an append-only
 clarification history, a derived semantic representation, and a status
 gate (`draft -> awaiting_clarification -> processing -> ready`, or
-`failed`/`discarded`). Recall is `RecallSession`-based: a query starts a
-persisted session, an automatic search-and-answer round runs first, and
-a difficult query escalates to asking the user a discriminating question
-rather than guessing. See docs/ARCHITECTURE.md (updated this phase) for
-the full diagrams.
+`failed`/`discarded`). What changed is *where* the LLM-dependent work
+happens, not what it produces: all of it (image understanding,
+segmentation, clarification, enrichment, embedding, structuring) now
+runs in one background task, `process_capture_fully()`, scheduled the
+instant `POST /api/captures` persists the raw text. `create_capture()`
+itself no longer calls the LLM at all.
 
-What's different is *how few calls it takes to run that shape*:
+## 2. Reversed: the streamlining-phase ingestion collapse
 
-- **Ingestion** is one unified LLM call (`analyze_capture()`) per
-  capture instead of five across segmentation, clarification-need
-  detection, and three-way enrichment. A clarification round is one
-  further call (`reanalyze_unit()`), not a pre-generated queue.
-- **Recall** has exactly one retrieval+decision algorithm, not two:
-  the previously-separate one-shot `run_agent()` path and the
-  multi-turn `RecallSession` path now both route through
-  `start_session()`'s first automatic round. `run_agent()` survives
-  only as an internal primitive for the eval harness and benchmarks.
-- **A deterministic shortcut** skips the sufficiency-reasoning LLM call
-  entirely when the top search result is unambiguously dominant.
-- **Two new capabilities were added without new call-shaped
-  complexity**: explicit structured metadata (bypasses inference, no
-  LLM call) and lightweight contradiction detection (reuses the
-  existing search call, pure-Python comparison).
+The previous phase collapsed segmentation + clarification-need +
+enrichment into one call per capture (`analyze_capture()`) specifically
+to cut *synchronous-request* latency, trading some retrieval quality
+for it (documented there: 28/30 vs 30/30 on the eval set, one
+regression explicitly attributed to losing a dedicated clarification
+call's focused attention). That trade's entire premise -- a capture's
+full analysis has to finish before the HTTP response can return --
+stopped being true once saving became fully backgrounded. The restored
+`app/ingestion/segmentation.py`/`clarify.py`/`enrichment.py` (reconstructed
+from pre-collapse git history, adapted to the current `Semantics` shape
+and multi-image/prior-context support that didn't exist back then) cost
+more LLM calls per capture, but none of them are on any critical path a
+human is waiting on any more.
 
-## 2. Removed complexity
-
-Deleted outright: `app/ingestion/clarify.py`, `enrichment.py`,
-`segmentation.py`, and their dedicated test files -- replaced by the
-single `app/ingestion/analysis.py`. Removed from the schema:
-`MemoryUnit.clarification_queue` (there is no longer a batch of
-pre-generated future questions to store). Removed from config:
-`membase_max_images_captioned_per_capture` (the per-request image-batch
-cap it bounded no longer applies now that each image is captioned by its
-own independent background task, not a synchronous batch). Removed from
-`agent.py`: the implicit assumption that one-shot and multi-turn recall
-could reasonably diverge in answer quality for the same stored memories
--- they can't any more, by construction.
-
-Reduced, not removed: `MAX_AGENT_ITERATIONS` 3->2,
-`MAX_REFORMULATIONS_PER_ROUND` 2->1, the DB idle-in-transaction timeout
-450s->180s (now that a transaction holds at most one LLM call instead of
-up to five). The long-held `with_for_update` row lock was replaced with a
-processing-lease/token pattern -- not removed, since the underlying race
-it protects against is real, but reduced to two fast local transactions
-instead of a lock held for an LLM call's duration.
-
-**What was deliberately NOT removed, despite "too bloaty":** the
-verbatim-excerpt safety check, the two-phase-commit durability pattern,
-the status gate excluding unanswered units from search, provenance
-(clarifications never overwritten), grounding enforcement, and the
-processing-lease/background-task machinery itself (collapsed to fewer
-calls *inside* it, not replaced with a synchronous call, per the spec's
-explicit instruction to keep FastAPI BackgroundTasks and the state
-machine). Removing any of these would have been removing an
-architectural idea, not bloat.
+`resolve_clarification()` and `correct_unit()` were rewired to the same
+clarify/enrich composition. One correctness gap in the collapsed design
+was fixed along the way, not just inherited: `resolve_clarification()`
+now *always* eventually calls `enrich_unit()` once no further question
+will be surfaced, closing a path where a unit's only candidate question
+got suppressed (round budget exhausted, or the field was already marked
+declined/unknown) and the unit could previously reach `"ready"` with
+semantics that were never actually enriched.
 
 ## 3. Performance
 
-LLM call counts are exact (by inspection, not measurement -- a call
-count doesn't need a timer to know):
+LLM call counts, by inspection:
 
-| Flow | Before this phase | After |
+| Flow | Streamlining phase | Now |
 |---|---|---|
-| Ordinary memory, no clarification | 4 generation calls + 1 embed | **1 generation call + 1 embed** |
-| Memory needing 1 clarification round | 4 + 1 (initial) + 1 (question re-check) + re-embed | 1 (initial) + 1 (`reanalyze_unit`) + 1 embed |
-| Simple one-shot recall, high-confidence match | 1 embed (unit search) + 1 embed (chunk search, duplicate) + 1 sufficiency-eval call + 1 answer call | **1 embed (shared) + 1 answer call** -- sufficiency-eval skipped entirely |
-| Recall needing 1 reformulation | up to 2 reformulations searched, each re-embedding twice | up to 1 reformulation, embedding deduped |
-| Contradiction check | did not exist | +1 reused `hybrid_search()` call per newly-finalized unit with a relation (no new LLM call) |
+| Ordinary memory, no clarification | 1 generation call + 1 embed (synchronous) | up to 5 generation calls + 1 embed (segment, clarify, 3x enrich) -- **all backgrounded, zero synchronous calls** |
+| Memory needing 1 clarification round | 1 (initial) + 1 (`reanalyze_unit`) + 1 embed | 1 segment + 1 clarify (round 1) + 1 clarify (round 2, settles) + 3 enrich + 1 embed -- **still entirely backgrounded** |
+| Image attachment | captioned in a separate, later-scheduled background task, blind to the capture's first analysis pass | captioned (+ a new structured-extraction call) in the SAME background task, BEFORE segmentation/clarification/enrichment ever run, so they see its content |
+| `POST /api/captures` response latency | bounded by the synchronous analysis call (up to `llm_timeout_seconds`, 90s) | bounded by a DB commit only -- no LLM call in the request path at all |
 
-Not measured: wall-clock latency under identical load conditions
-before vs. after. Reverting the full call collapse to produce a clean
-"before" timing baseline would have cost more of this phase's time
-budget than the number was worth, given the call-count reduction is the
-more direct, less noisy signal, and Ollama (`-np 1`, serialized
-requests) makes any latency number collected on this machine highly
-sensitive to what else was running at the time -- confirmed firsthand
-when a manual verification request queued for over a minute behind the
-eval harness's own concurrent Ollama calls during this phase's own
-testing. If a wall-clock number is specifically needed later,
-docs/TODO.md has the exact before/after procedure.
+The trade is the opposite of the streamlining phase's: more total LLM
+calls, in exchange for zero of them being on the critical path. Not
+measured: whether the background task's own total wall-clock time grew
+enough to matter for anything (nothing is waiting on it, so this was
+judged not worth instrumenting yet -- see docs/TODO.md if it ever is).
 
 ## 4. Retrieval quality
 
-The 30-case eval corpus (`eval/cases.yaml`), run against the real
-`gemma4:12b` + `nomic-embed-text` models via `scripts/run-eval.sh`:
-**28/30 passed (93%)**, full transcript in docs/DECISIONS.md. Two
-failures, both plausibly connected to this phase's specific trade-offs
-(detailed analysis and the recommended follow-up experiment in
-docs/DECISIONS.md and docs/TODO.md):
+Re-running the real-model integration suite surfaced one live
+regression from restoring a *dedicated* clarification call: asked in
+isolation (no enrichment competing for its attention), `gemma4:12b`
+asked an unnecessary clarification question about a memory's missing
+optional detail (a recommended paper's title/author) -- directly
+violating its own prompt's explicit instruction that "a missing field
+is not, by itself, grounds for a question." This gated the unit out of
+search entirely, which is exactly the failure mode
+`test_indirect_multiconcept_relationship_query` exists to catch. Fixed
+by adding a concrete negative example matching this exact case to
+`clarify.py`'s system prompt; re-run confirmed fixed, deterministically
+(structured-output calls run at `temperature=0.0`, so this was a
+reliable prompt-adherence gap, not sampling noise). All 5 real-model
+integration tests pass after the fix.
 
-- `clarification_alias_second_term`: the unified `analyze_capture` call
-  didn't flag an invented term ("Flimvex") as needing clarification,
-  where a prior phase's dedicated, single-purpose question-generation
-  call apparently did.
-- `user_specific_terminology`: an indirect alias query ("What did I call
-  the project?" -> "Nightingale") abstained instead of answering,
-  plausibly from the reduced reformulation budget running out before
-  finding the bridging phrasing.
+This is the same category of risk the streamlining phase itself
+flagged going the other direction ("a dedicated call, with no other
+task competing for its attention, [may ask more]") -- confirmed real
+here, and addressed by prompt wording rather than by abandoning the
+dedicated-call design, since the alternative (collapsing calls back
+together) is exactly the trade-off this whole effort exists to undo.
 
-Neither was reverted: 93% on a 30-case hand-written corpus is within a
-plausible sampling-noise band for a non-deterministic model even with
-zero code change, and the spec explicitly traded some quality margin for
-the call-count reduction on purpose. They're recorded as the concrete
-starting point for a real before/after comparison if this turns out to
-matter in practice, not swept under the rug.
+## 5. Image structured-data extraction
 
-Ambiguity detection was tightened, not loosened: `is_ambiguous()` now
-also requires the runner-up candidate to independently clear an absolute
-relevance floor (`0.45`), so two weak matches that happen to be close to
-*each other* near the noise floor no longer trigger a pointless
-clarifying question -- a genuine quality improvement alongside the
-latency-motivated changes.
+`_describe_image()`'s free-text caption is unchanged and still the
+image's general-purpose searchable description. New alongside it:
+`_extract_image_structured_data()`, a schema-constrained call
+(`has_structured_data: bool`, `fields: [{label, value}]`) prompted to
+transcribe any form/table/prescription/measurement data exactly as
+shown, appended to the caption as a `"Structured data:\n..."` block.
+`enrichment.py`'s retrieval-aids sub-prompt gained one instruction:
+promote each such labeled pair into its own `relations` entry rather
+than summarizing the block in prose -- this is the line that makes a
+photographed prescription's numbers land as queryable
+`semantic.relations` instead of staying inert text a free-text caption
+might also have garbled. Two images in one capture are labeled
+`"Image 1:"`/`"Image 2:"` in the combined attachment text so one
+photo's values and another's can be merged into one unit's `relations`
+by a single enrichment call.
 
-## 5. Contradiction handling
+## 6. Attachment view/download
 
-Implemented this phase, storage-side and retrieval-side, both reusing
-existing primitives rather than adding new ones. Storage-side: after a
-unit embeds, its relation triples are compared against other `ready`
-units found via the *existing* `hybrid_search()` call (searching on the
-relation's subject+predicate, not the unit's full text -- see the bug
-writeup in docs/DECISIONS.md for why that distinction mattered); a
-mismatch adds an advisory `potential_conflicts` marker to both sides,
-never deletes or supersedes either. Retrieval-side: `format_evidence()`
-renders a `[Conflict] ...` line for any evidence unit carrying one, and
-the answer-generation prompt is instructed to state the disagreement
-explicitly ("You have two stored memories that conflict: one says X and
-another says Y") rather than silently pick a side. This is the only
-place conflict presentation happens. No truth-maintenance database, no
-temporal belief revision, no "newest wins" rule -- all explicitly out of
-scope per the spec, documented as future options in docs/TODO.md.
+Previously missing entirely: no backend route served an attachment's
+original bytes, and the UI only ever rendered a filename as plain text.
+New `GET /api/attachments/{id}/file` (no new auth code -- nginx's
+existing Basic Auth already covers it). `SourceOut`/`ChunkSourceOut`
+extended to carry attachment info so a retrieved memory's sources can
+link to their originals too. The frontend gained one shared
+fetch-as-blob-then-open-or-download helper, wired into the Store page,
+the Browse tab, and the Recall page.
 
-## 6. Clarification
+## 7. Multi-file upload
 
-Fully rebuilt around sequential, re-evaluated-after-every-answer
-questioning instead of a pre-generated queue:
+Investigated as part of this work (reported as single-file-only) and
+found already fully correct end-to-end -- `<input multiple>` with
+cross-picker accumulation on the frontend, `list[UploadFile]` on both
+upload endpoints on the backend. No code change. If still observed as
+single-file in the deployed app, the most likely cause is a stale
+published GitHub Pages build (the frontend is published separately via
+`scripts/build_frontend.py`, not served by this backend) -- rebuild and
+republish before assuming a code regression.
 
-- **Sequential flow**: one question surfaced at a time
-  (`pending_clarification`); answering it re-analyzes the unit exactly
-  once (`reanalyze_unit`), which both re-derives semantics and decides
-  whether a further question is still warranted. Bounded at
-  `MAX_CLARIFICATION_ROUNDS = 3`.
-- **Direct structured metadata**: an optional JSON `metadata` form field
-  on `POST /api/captures` (location/date/people/organizations/topics),
-  always authoritative over the same inferred field, with a genuine
-  conflict surfaced as its own clarification question. A small UI
-  (collapsed `<details>` block on the Remember page) was added for this,
-  not just the API.
-- **Unknown/declined handling**: a deterministic, no-LLM-call classifier
-  recognizes "I don't know" vs. "I'd rather not say" vs. an actual
-  answer from the free-text reply. A field marked declined/unknown is
-  hard-coded (in code, not just the prompt) to never be re-asked, even
-  if the model proposes it again -- verified by a dedicated test that
-  configures the fake model to keep asking about the same field and
-  confirms it's suppressed.
-- **Prior-memory context**: a cheap SQL lexical lookup (no LLM/embedding
-  call) injects up to 3 snippets from existing ready memories as
-  context into the analysis prompt, explicitly marked as
-  context-not-authority -- prevents re-asking about an already-explained
-  term without paying for a semantic search.
+## 8. Local LLM setup
 
-All four were verified against the real model via a live multipart
-request to the dev server: submitting explicit metadata that
-conflicted with the model's own inference produced exactly the designed
-clarification question, with both values retained pending the answer.
-
-## 7. Local LLM setup
-
-Unchanged from the previous phase's decision and re-confirmed, not
-re-litigated: `gemma4:12b` for every generation/structured-output call,
+Unchanged: `gemma4:12b` for every generation/structured-output call,
 `nomic-embed-text` (768-dim) for embeddings, both via the system Ollama
-service, no second generation model resident (VRAM/eviction-thrashing
-reasons documented in CLAUDE.md and docs/DECISIONS.md predate this
-phase and still hold). This phase's own real-model testing surfaced one
-new, concrete finding about this model specifically: **gemma4:12b
-sometimes emits the literal string `"null"` (or `"none"`) for an
-empty/unset field instead of `""`** -- a structured-output quirk, not an
-intentional value. Found live (an `event_date` field came back as the
-string `"null"`), fixed in `app/ingestion/analysis.py`'s string-parsing
-helpers, and covered by a regression test. `scripts/model-doctor.sh`
-(unchanged) continues to be the environment-level check that both
-configured models are present and respond correctly.
+service. No new model, no new config. The per-image caption call is
+joined by one new structured-extraction call per image (same model,
+same multimodal path) -- still well within the single-generation-model
+VRAM budget documented in CLAUDE.md, since nothing here changes which
+models are loaded, only how many `generate_structured` calls happen per
+image.
 
-## 8. Deferred functionality
+## 9. Deferred / not done
 
-Explicitly deferred this phase, each with a documented reason in
-docs/TODO.md:
+- **`docs/REPORT.md`'s own historical sections** (this file, previous
+  phase) on contradiction handling, recall-session deferred items, and
+  the eval-threshold sweep are unaffected by this work and weren't
+  re-verified here -- see the superseded report's sections 5/8/9/10 if
+  still relevant.
+- **No wall-clock baseline** for the background task's own total
+  duration (see section 3) -- nothing is waiting on it, so not
+  instrumented.
+- **GitHub Pages republish** -- code-correct already, but the live
+  site wasn't rebuilt/republished as part of this work (see section 7);
+  that's a deploy step, not a code change.
 
-- **"Save as memory" has no frontend affordance.** The backend
-  (`POST /api/recall/sessions/{id}/save-as-memory`, restricted to text
-  provably said by the user in that session) is implemented and tested;
-  the UI isn't, because the recall page is one-shot-only today and shows
-  no session/cue history to attach a button to -- building that would be
-  a materially larger piece of work than this feature itself.
-- **`retry_attachment_chunking()` has no API route.** The function is
-  implemented, idempotent, and tested; nothing calls it from `app/api/`
-  yet.
-- **Recall-session history is not searchable.** Confirmed out of scope
-  per this phase's spec explicitly, not just unaddressed.
-- **Causal/automatic forgetting.** Not implemented; explicit user
-  deletion remains the only destructive path, as before.
-- **A real threshold sweep** for the new deterministic shortcut's and
-  ambiguity detector's constants. Sanity-checked against one real-model
-  eval run, not swept across a range -- the 30-case corpus is small
-  enough that a swept threshold risks overfitting it.
+## 10. Remaining risks
 
-## 9. Remaining technical risks
-
-**Engineering risks** (fixable with more implementation time, not more
-research):
-
-- The two eval regressions (section 4) aren't yet isolated to a specific
-  cause among three candidate changes (ingestion collapse, iteration/
-  reformulation reduction, the new shortcut). A multi-run baseline
-  comparison would resolve this.
-- `retry_attachment_chunking()` and "save as memory"'s UI are both
-  functionally complete but unreachable from the product surface.
-- No wall-clock latency baseline exists for this phase's changes, only
-  call counts.
-
-**Research/product risks** (need a product decision or more evidence,
-not just more engineering):
-
-- Whether the deterministic shortcut's thresholds (`0.80`/`0.20`) and
-  the ambiguity floor (`0.45`) generalize beyond a 30-case hand-written
-  corpus is genuinely unknown without a larger, more representative eval
-  set.
-- Whether recall-session history should ever become searchable, whether
-  causal forgetting is wanted at all, and what "save as memory" should
-  look like in the UI once/if the interactive recall surface itself gets
-  built, are all still open product questions (docs/TODO.md), not
-  engineering ones.
-
-## 10. Recommended next experiment
-
-**Isolate the two eval regressions.** Re-run `scripts/run-eval.sh`
-3-5 times unchanged to establish how much result variance is pure model
-sampling noise on this 30-case corpus. If `clarification_alias_second_term`
-and `user_specific_terminology` fail consistently (not just once), bisect
-by re-enabling one changed subsystem at a time against the new code
-(first: restore `MAX_AGENT_ITERATIONS=3`/`MAX_REFORMULATIONS_PER_ROUND=2`
-alone and re-run just `user_specific_terminology`'s category; separately:
-compare `analyze_capture()`'s clarification-decision behavior against
-the old dedicated `generate_questions()` prompt on the Flimvex case
-specifically) to determine which specific streamlining decision, if any,
-is the actual cause -- rather than guessing from one combined run. This
-is the most direct way to find out whether this phase traded real
-accuracy for latency, or just got unlucky on two cases out of thirty.
+- The dedicated clarify call's prompt-adherence fix (section 4) was
+  validated against one concrete failure mode found live, not swept
+  across the 30-case eval corpus (`scripts/run-eval.sh`) -- worth a full
+  eval re-run before treating this as fully closed, the same caveat the
+  streamlining phase's own regressions carried.
+- Image structured-data extraction (section 5) was validated by
+  targeted reasoning about the prompt/schema and the existing test
+  suite, not against a real photographed prescription -- the acceptance
+  test for "does this actually work" is trying it with a real photo
+  through the dev server, not yet done here.

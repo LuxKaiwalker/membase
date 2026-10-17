@@ -2257,3 +2257,108 @@ are all gone from `app.js`.
 order for *why* something is sorted first (no separate heading/divider
 between "pending" and "everything else") -- the sort alone was judged
 sufficient; revisit if the list ever gets long enough that it isn't.
+
+---
+
+## Restore the multi-call ingestion pipeline; make saving instant
+
+**Decision:** Reversed the "too bloaty" streamlining pass (see
+"Collapse the five-call ingestion pipeline" above) now that interactive
+recall lives entirely in Browse/Remember and saving no longer needs to
+return a fully-analyzed result synchronously. `create_capture()`
+(`app/ingestion/pipeline.py`) shrinks to Phase 0 only: persist
+`raw_text` + attachments, zero LLM calls, return immediately --
+`capture.units` is always `[]` on return. `POST /api/captures`
+schedules exactly one new background task, `process_capture_fully()`,
+and returns right after Phase 0 commits: this is the instant "saved"
+acknowledgement the moment data reaches the server, not a UI
+affordance layered on top of a still-synchronous analysis call.
+
+`process_capture_fully()` is the one place all of a capture's
+LLM-dependent work now happens, in order: (1) caption + structured-
+extract every image attachment (see below) -- foreground within this
+task, so no longer "runs blind" relative to what follows; (2) chunk any
+now-captioned image attachment that crosses the chunking threshold; (3)
+`segmentation.segment_capture()` -- a dedicated, content-only call,
+restored from the pre-collapse design; (4) per proposed unit,
+`clarify.generate_question()` -- a dedicated clarification call with
+full attachment context available, skipped entirely (no call spent)
+when a unit is about to be blocked on a question anyway; (5) otherwise
+`enrichment.enrich_unit()` -- the restored 3-way narrative/entities/
+retrieval-aids split; (6) embed + chain directly into `finish_structuring()`
+for any unit that reaches "ready". `resolve_clarification()` and
+`correct_unit()` were rewired to the same clarify/enrich composition
+(dropping the collapsed `reanalyze_unit()`); `resolve_clarification()`
+now *always* eventually calls `enrich_unit()` once no further question
+will be surfaced (previously, a unit whose only candidate question got
+suppressed by `declined_or_unknown_fields` or the round budget could
+reach "ready" with never-enriched empty semantics -- fixed here, not
+just inherited).
+
+A capture-level processing lease (`Capture.processing_status`/
+`processing_token`/`processing_started_at`, new columns, migration
+`d4a1f9c7b3e2`) guards `process_capture_fully()` against running twice
+concurrently, mirroring the existing per-unit lease one level up, and
+backs a new `POST /api/captures/{id}/retry` recovery endpoint
+(`retry_capture_processing()`) for a capture whose background task
+never finished. `capture.explicit_metadata`/`allow_clarification` are
+staged as columns at Phase 0 for the background task to read, since
+they no longer have anywhere else to live between the two phases.
+
+**Reason:** The streamlining pass traded quality for synchronous-
+request latency (documented there: 28/30 vs 30/30 on the eval set, one
+regression explicitly attributed to losing the dedicated clarification
+call's focused attention). That trade only made sense while a capture's
+full analysis had to finish before the HTTP response could return. Once
+saving is fully backgrounded, the trade's entire premise disappears --
+the richer pipeline can be restored at zero perceived latency cost.
+
+**Image structured-data extraction (fixes a real bug):** image
+captioning (`_describe_image()`) was, and remains, a single free-text
+caption prompt -- adequate for "what's in this photo" but not for
+transcribing exact labeled values (e.g. a glasses prescription's OD/OS
+sphere/cylinder/axis numbers), which a prose caption can garble or drop
+with no safety net. New `_extract_image_structured_data()` is a second,
+schema-constrained call per image (`has_structured_data: bool`,
+`fields: [{label, value}]`), prompted to transcribe any form/table/
+prescription/measurement data verbatim; its output is appended to the
+caption as a `"Structured data:\n..."` block in `Attachment.extracted_text`
+(`_caption_and_extract_image()`). `enrichment.py`'s retrieval-aids
+sub-prompt gained one new instruction: promote each labeled pair in
+that block into its own `relations` entry rather than summarizing it in
+prose -- this is the line that makes a prescription's numbers land in
+`semantic.relations` as queryable data instead of inert text. Two
+images in one capture are labeled `"Image 1:"`/`"Image 2:"` in the
+combined `attachment_text` (`_attachment_text_for()`) so one photo's OD
+values and another's OS values can be merged into one unit's
+`relations` by a single `enrich_unit()` call.
+
+**Attachment view/download:** no endpoint previously served an
+attachment's original bytes at all. New `GET /api/attachments/{id}/file`
+(`app/api/attachments.py`) does, gated by nothing beyond nginx's
+existing `auth_basic` (no new auth code). `SourceOut` gained
+`attachments: list[AttachmentOut]`; `ChunkSourceOut` gained
+`attachment_id`; both populated in `retrieval/session.py`'s source
+snapshotting. `app.js` gained a shared `openAttachment()`/
+`buildAttachmentList()` helper (fetch via the existing `fetchWithTimeout`
+for its Authorization header, since a plain `<a href>` can't carry it,
+then blob + `URL.createObjectURL` -- open in a new tab for an image,
+trigger a download otherwise), wired into the Store page, the Browse
+tab, and the Recall page's rendered sources.
+
+**What this changes for the Store page:** `capture.units` being always
+`[]` on return means there's no derived-semantics preview left to show
+-- `buildCaptureCard()`/`runCapture()` were simplified to a fixed
+"Saved." heading + a static "processing in the background, check
+Browse" note. The pending-clarification note is gone too (nothing to
+check yet at response time); this is a continuation of "Clarification
+moved to Browse" above, not a reversal of it.
+
+**Not done:** multi-file upload was investigated as part of this work
+and found already fully correct end-to-end (frontend `<input multiple>`
++ accumulation across picker re-opens, backend `list[UploadFile]` on
+both upload endpoints) -- no code change. If it's still observed as
+single-file in the deployed app, the likely cause is a stale published
+GitHub Pages build (`scripts/build_frontend.py`'s output is published
+separately from this backend, see "API-only backend" above); rebuild
+and republish to rule that out before assuming a code regression.

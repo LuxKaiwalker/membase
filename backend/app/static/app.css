@@ -130,6 +130,18 @@ button {
 
 button:hover { opacity: 0.9; }
 
+.attachment-link {
+  margin-top: 0;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--accent);
+  font-weight: 400;
+  text-decoration: underline;
+  display: inline;
+}
+.attachment-link:disabled { opacity: 0.6; cursor: wait; text-decoration: none; }
+
 .status { margin-top: 1rem; color: var(--muted); }
 .status.error { color: #d6336c; }
 .hidden { display: none; }

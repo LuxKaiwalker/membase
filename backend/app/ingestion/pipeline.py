@@ -12,10 +12,12 @@ from app.db import get_sessionmaker
 from app.ingestion.analysis import (
     Semantics,
     UnitAnalysis,
-    analyze_capture,
     build_retrieval_text,
-    reanalyze_unit,
+    empty_semantics,
 )
+from app.ingestion.clarify import generate_question
+from app.ingestion.enrichment import enrich_unit
+from app.ingestion.segmentation import segment_capture
 from app.ingestion.chunking import chunk_attachment
 from app.ingestion.files import ProcessedFile, UnsupportedFileError, extract_pdf_pages, process_upload
 from app.ingestion import structurer
@@ -76,8 +78,24 @@ def _attachment_text_for(capture: Capture) -> str:
     """Full, uncapped combined attachment text -- used for the full-text
     search index (_build_searchable_text), which has no model context
     budget to protect. Never pass this directly into an LLM prompt; see
-    _attachment_text_for_analysis() below."""
-    return "\n\n".join(a.extracted_text for a in capture.attachments if a.extracted_text)
+    _attachment_text_for_analysis() below.
+
+    Each image attachment's text is labeled "Image N:" so a later
+    enrichment call sees multiple photos as distinct, orderable sources
+    (e.g. OD values from one photo and OS values from another) rather
+    than one undifferentiated blob -- see docs/DECISIONS.md.
+    """
+    parts: list[str] = []
+    image_n = 0
+    for a in capture.attachments:
+        if not a.extracted_text:
+            continue
+        if a.content_type.startswith("image/"):
+            image_n += 1
+            parts.append(f"Image {image_n}:\n{a.extracted_text}")
+        else:
+            parts.append(a.extracted_text)
+    return "\n\n".join(parts)
 
 
 # A generation call's context window is shared between its input prompt
@@ -87,8 +105,8 @@ def _attachment_text_for(capture: Capture) -> str:
 # semantics), an uncapped attachment_text is an INPUT-side version of
 # the same risk: a large PDF, or several attachments concatenated with
 # no limit, crowds out the budget the model needs for its own response,
-# on every analyze_capture()/reanalyze_unit() call a capture's siblings
-# ever make. Capped independently of should_chunk()'s indexing
+# on every clarify/enrich call a capture's units ever make. Capped
+# independently of should_chunk()'s indexing
 # threshold -- that constant governs a different concern (whether
 # AttachmentChunk rows are worth creating), not how much raw attachment
 # text is safe to paste into one generation prompt.
@@ -242,69 +260,114 @@ async def _describe_image(llm: LLMProvider, data: bytes) -> str | None:
     return description or None
 
 
+_IMAGE_STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "has_structured_data": {"type": "boolean"},
+        "fields": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"label": {"type": "string"}, "value": {"type": "string"}},
+                "required": ["label", "value"],
+            },
+        },
+    },
+    "required": ["has_structured_data", "fields"],
+}
+
+_IMAGE_STRUCTURED_PROMPT = (
+    "Look for any form, table, label, prescription, measurement, or other "
+    "data with named fields and values in this image (e.g. a glasses/contact "
+    "lens prescription's OD/OS sphere/cylinder/axis values, a nutrition "
+    "label, a receipt's line items, a gauge reading). If you find any, set "
+    "has_structured_data=true and list each as a {label, value} pair, "
+    "transcribing numbers and units exactly as shown -- do not round, infer, "
+    "or normalize them. If nothing like that is present, set "
+    "has_structured_data=false and return an empty list."
+)
+
+
+async def _extract_image_structured_data(llm: LLMProvider, data: bytes) -> str:
+    """Returns a "Structured data:\\n..." text block if the image contains
+    any labeled field/value data (forms, tables, prescriptions,
+    measurements), or "" if none was found or the call failed.
+
+    Kept separate from _describe_image()'s free-text caption -- a
+    dedicated schema-constrained call is what actually gets exact
+    numeric values transcribed into a form later enrichment can promote
+    into `semantic.relations` (see app/ingestion/enrichment.py), instead
+    of them staying buried, possibly garbled, in a general-purpose prose
+    caption (see docs/DECISIONS.md).
+    """
+    try:
+        raw = await llm.generate_structured(
+            _IMAGE_STRUCTURED_PROMPT, schema=_IMAGE_STRUCTURED_SCHEMA, images=[data]
+        )
+    except LLMError:
+        return ""
+    if not raw.get("has_structured_data"):
+        return ""
+    fields = raw.get("fields")
+    if not isinstance(fields, list):
+        return ""
+    lines = []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        label, value = f.get("label"), f.get("value")
+        if isinstance(label, str) and label.strip() and isinstance(value, str) and value.strip():
+            lines.append(f"- {label.strip()}: {value.strip()}")
+    return "Structured data:\n" + "\n".join(lines) if lines else ""
+
+
+async def _caption_and_extract_image(llm: LLMProvider, data: bytes) -> str | None:
+    """The free-text caption plus, when present, a structured label/value
+    block -- this combined text is what gets written into
+    Attachment.extracted_text, both for a capture's own images
+    (_caption_one_image, called from process_capture_fully) and for a
+    posthoc attachment (add_attachments())."""
+    description = await _describe_image(llm, data)
+    if description is None:
+        return None
+    structured = await _extract_image_structured_data(llm, data)
+    return f"{description}\n\n{structured}" if structured else description
+
+
 def is_uncaptioned_image(attachment: Attachment) -> bool:
     return attachment.content_type.startswith("image/") and attachment.extraction_status == "unsupported"
 
 
-async def finish_image_captioning(attachment_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
-    """Background-task entry point: captions one image attachment after
-    the triggering request has already returned (see docs/DECISIONS.md
-    "Decouple image captioning"). Deliberately NOT in the synchronous
-    ingestion path any more -- a text memory's formation (segmentation +
-    clarification) never waits on this. The trade-off, accepted
-    explicitly: the *first* analysis pass for a capture with images runs
-    without their captions as context, so a vague reference an image
-    would have resolved may get asked about anyway.
-
-    By the time this runs, any sibling unit may already be "ready" (its
-    embedding was built with no knowledge of this caption) -- the same
-    light re-indexing path add_attachment() uses for a posthoc attachment
-    is reused here so the caption still becomes searchable, either via
-    chunking (if long enough) or folded into sibling units' retrieval
-    text (if not).
+async def _caption_one_image(db: Session, llm: LLMProvider, attachment: Attachment) -> None:
+    """Caption (+ structured-extract) one image attachment, in the
+    foreground of process_capture_fully() -- deliberately BEFORE
+    segmentation/clarification/enrichment ever run for this capture, so
+    an image's content can inform both (see docs/DECISIONS.md "Restore
+    the multi-call ingestion pipeline": no longer an accepted "runs
+    blind" trade-off now that all of this is backgrounded anyway).
     """
-    db = get_sessionmaker()()
     try:
-        if llm is None:
-            llm = get_llm_provider()
-        attachment = db.get(Attachment, attachment_id)
-        if attachment is None or not is_uncaptioned_image(attachment):
+        data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+        description = await _caption_and_extract_image(llm, data)
+        if not description:
             return
-        try:
-            data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
-            description = await _describe_image(llm, data)
-            if not description:
-                return
-            attachment.extracted_text = description
-            attachment.extraction_status = "ok"
-            db.commit()
-
-            if should_chunk(description):
-                processed = ProcessedFile(
-                    stored_path=attachment.stored_path,
-                    content_type=attachment.content_type,
-                    size_bytes=attachment.size_bytes,
-                    extracted_text=description,
-                    extraction_status="ok",
-                    pages=None,
-                )
-                await _index_attachment_chunks(db, llm, attachment, processed)
-            await _refresh_ready_units_with_attachment_excerpt(db, llm, attachment.capture)
-        except Exception:
-            # Fire-and-forget background task -- an unhandled exception
-            # here (e.g. the file went missing on disk between upload
-            # and now) would otherwise vanish silently with no record
-            # anywhere that this attachment's captioning never finished.
-            logger.exception("Unexpected failure captioning attachment %s", attachment_id)
-    finally:
-        db.close()
+        attachment.extracted_text = description
+        attachment.extraction_status = "ok"
+        db.commit()
+    except Exception:
+        # An unhandled exception here (e.g. the file went missing on
+        # disk between upload and now) must not abort the rest of
+        # process_capture_fully for the capture's other attachments/
+        # units -- this attachment just stays uncaptioned.
+        logger.exception("Unexpected failure captioning attachment %s", attachment.id)
 
 
 async def finish_attachment_chunking(attachment_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
-    """Background-task entry point for chunk-level indexing, scheduled
-    after an attachment is created (and, for an image, independently of
-    -- not chained after -- finish_image_captioning; a short caption
-    rarely needs chunking at all, see should_chunk below).
+    """Background-task entry point for chunk-level indexing of a
+    non-image attachment, scheduled right after it's created (an image
+    attachment's chunking decision instead happens inline inside
+    process_capture_fully(), since it depends on a caption that doesn't
+    exist yet at schedule time -- see should_chunk below).
 
     Re-derives `pages`/`extracted_text` from the already-persisted
     Attachment row (and, for a PDF, a cheap local re-extraction -- no
@@ -736,22 +799,22 @@ def _unit_from_analysis(
 
 async def create_capture(
     db: Session,
-    llm: LLMProvider,
     *,
     text: str,
     uploads: list[tuple[str, bytes]],
     explicit_metadata: dict | None = None,
     allow_clarification: bool = True,
 ) -> Capture:
-    """`allow_clarification=False` (see docs/DECISIONS.md "Disable
-    follow-up questions") removes the clarification round-trip from
-    this capture's storage cycle entirely: no resulting unit can ever
-    reach `status="awaiting_clarification"`, regardless of what the
-    model proposes or whether explicit metadata conflicts with
-    inference. Every unit goes straight to `"processing"` -- the
-    analysis call itself still runs (segmentation/semantics are not
-    optional), but the unbounded, human-paced wait for an answer is
-    what's eliminated.
+    """Phase 0 ONLY: persist the capture's raw text and attachments, with
+    zero LLM calls, so POST /api/captures can return an instant "saved"
+    acknowledgement as soon as the data has reached the server (see
+    docs/DECISIONS.md "Restore the multi-call ingestion pipeline"). No
+    `llm` parameter -- nothing here ever calls the model. All
+    LLM-dependent work (segmentation, clarification, enrichment, image
+    understanding, embedding) is scheduled separately as
+    process_capture_fully(), run entirely in a background task (see
+    app/api/captures.py::create()). `capture.units` is always `[]` on
+    return.
     """
     text = text.strip()
     if not text:
@@ -759,13 +822,15 @@ async def create_capture(
     max_chars = get_settings().membase_max_text_chars
     if len(text) > max_chars:
         raise IngestionError(f"text exceeds max length of {max_chars} characters")
-    explicit_metadata = explicit_metadata or {}
 
-    capture = Capture(raw_text=text)
+    capture = Capture(
+        raw_text=text,
+        explicit_metadata=explicit_metadata or {},
+        allow_clarification=allow_clarification,
+    )
     db.add(capture)
     db.flush()
 
-    new_attachments: list[Attachment] = []
     for filename, data in uploads:
         try:
             processed = process_upload(filename, data, capture.id)
@@ -782,27 +847,213 @@ async def create_capture(
             extraction_status=processed.extraction_status,
         )
         db.add(attachment)
-        new_attachments.append(attachment)
-    db.commit()  # Phase 0: capture + attachments durably saved, no LLM call yet
-
-    # Image captioning is NOT run here -- it's scheduled as a background
-    # task by the API layer alongside chunking, decoupled from text
-    # memory formation entirely (see docs/DECISIONS.md "Decouple image
-    # captioning"). Non-image attachment text (plain extraction, no LLM)
-    # is already available and *is* used below.
-    attachment_text = _attachment_text_for_analysis(capture)
-    prior_context = _find_related_context(db, text)
-
-    analyses = await analyze_capture(llm, text, attachment_text, prior_context)
-    units = [_unit_from_analysis(capture.id, a, explicit_metadata, allow_clarification) for a in analyses]
-    db.add_all(units)
-    db.commit()  # Phase 1: every unit's authoritative_content + analysis durably saved
-
-    for unit in units:
-        if unit.status != "awaiting_clarification":
-            _claim_processing(db, unit)
+    db.commit()  # capture + attachments durably saved, no LLM call yet
 
     db.refresh(capture)
+    return capture
+
+
+# --- capture-level processing lease (see docs/DECISIONS.md "Restore the
+# multi-call ingestion pipeline") -- same claim-token-commit pattern as
+# the per-unit lease above (_claim_processing/_commit_if_token_matches),
+# one level up: guards process_capture_fully() against being run twice
+# concurrently for the same capture (a duplicate schedule, or a manual
+# /retry racing a still-live background task).
+
+def _claim_capture_processing(db: Session, capture: Capture) -> str:
+    token = uuid.uuid4().hex
+    capture.processing_status = "processing"
+    capture.processing_token = token
+    capture.processing_started_at = dt.datetime.now(dt.UTC)
+    db.commit()
+    return token
+
+
+def _commit_capture_if_token_matches(db: Session, capture_id: uuid.UUID, token: str, values: dict) -> bool:
+    result = db.execute(
+        update(Capture)
+        .where(Capture.id == capture_id, Capture.processing_token == token)
+        .values(**values, processing_token=None, processing_started_at=None)
+    )
+    db.commit()
+    return result.rowcount > 0
+
+
+async def _analyze_one_unit(
+    llm: LLMProvider, content: str, attachment_text: str, prior_context: list[str], allow_clarification: bool
+) -> UnitAnalysis:
+    """Dedicated clarify call, then -- only if no question will actually
+    be surfaced -- the dedicated enrichment call. Mirrors the pre-collapse
+    ordering (see docs/DECISIONS.md): a unit about to be blocked on a
+    question never wastes an enrichment call first. `allow_clarification`
+    gates whether clarify.generate_question() is even called, not just
+    whether its result is used -- when follow-up questions are disabled
+    for this capture, enrichment must still run unconditionally.
+    """
+    question = None
+    if allow_clarification:
+        question = await generate_question(llm, content, [], attachment_text, prior_context)
+    if question:
+        return UnitAnalysis(
+            content=content, semantic=empty_semantics("ok"),
+            clarification_question=question["question"], clarification_field=question["field"],
+        )
+    semantic = await enrich_unit(llm, content, [], attachment_text, prior_context)
+    return UnitAnalysis(content=content, semantic=semantic)
+
+
+async def process_capture_fully(
+    capture_id: uuid.UUID, llm: LLMProvider | None = None, *, auto_structure: bool = True
+) -> None:
+    """Background-task entry point scheduled exactly once per capture
+    (see app/api/captures.py::create()) -- the ONE place all of a
+    capture's LLM-dependent work happens: image understanding,
+    segmentation, clarification decisions, enrichment, embedding, and
+    (for units that don't need a question) the membase structurer's
+    deeper pass. Nothing here blocks the HTTP response that created the
+    capture -- create_capture() already returned before this ever runs.
+
+    Ordering within this one coroutine reproduces the ordering guarantee
+    BackgroundTasks used to provide across several separately-scheduled
+    tasks (sequential registration order) -- here it's just sequential
+    `await`s in one function, nothing to schedule. In particular, units
+    don't exist yet when this is scheduled (segmentation hasn't run),
+    so captures.py can no longer pre-schedule a per-unit finish_structuring
+    task the way it used to -- this function chaining it internally,
+    right after a unit reaches "ready", is what replaces that.
+
+    `auto_structure=False` is a testability knob only (see
+    tests/helpers.py's create_capture_and_finish_unstructured) -- there
+    is no production caller that ever wants a unit to stay unstructured.
+    """
+    db = get_sessionmaker()()
+    try:
+        if llm is None:
+            llm = get_llm_provider()
+        capture = db.get(Capture, capture_id)
+        if capture is None or capture.processing_status not in ("pending", "failed"):
+            return
+        token = _claim_capture_processing(db, capture)
+
+        try:
+            # Image understanding runs first and in full, before
+            # anything downstream ever sees this capture's text -- no
+            # longer an accepted "runs blind" trade-off now that this
+            # whole function is backgrounded anyway (see
+            # docs/DECISIONS.md).
+            for attachment in capture.attachments:
+                if is_uncaptioned_image(attachment):
+                    await _caption_one_image(db, llm, attachment)
+            db.refresh(capture)
+
+            # Only an image's chunking decision belongs here -- it's the
+            # one case that depends on state only this function just
+            # produced (a caption that didn't exist at schedule time). A
+            # non-image attachment's extracted_text already existed at
+            # Phase 0, so its chunking is scheduled independently, right
+            # alongside capture creation (see app/api/captures.py) --
+            # redoing it here too would just be a wasted duplicate
+            # _index_attachment_chunks() call (idempotent, but pointless).
+            for attachment in capture.attachments:
+                if attachment.content_type.startswith("image/") and should_chunk(attachment.extracted_text):
+                    processed = ProcessedFile(
+                        stored_path=attachment.stored_path, content_type=attachment.content_type,
+                        size_bytes=attachment.size_bytes, extracted_text=attachment.extracted_text,
+                        extraction_status=attachment.extraction_status, pages=None,
+                    )
+                    await _index_attachment_chunks(db, llm, attachment, processed)
+
+            attachment_text = _attachment_text_for_analysis(capture)
+            prior_context = _find_related_context(db, capture.raw_text)
+
+            proposed_contents = await segment_capture(llm, capture.raw_text)
+            analyses: list[UnitAnalysis] = []
+            for content in proposed_contents:
+                try:
+                    analyses.append(
+                        await _analyze_one_unit(llm, content, attachment_text, prior_context, capture.allow_clarification)
+                    )
+                except Exception:
+                    logger.exception("Unexpected failure analyzing a proposed unit for capture %s", capture.id)
+                    analyses.append(UnitAnalysis(content=content, semantic=empty_semantics("unavailable")))
+
+            units = [
+                _unit_from_analysis(capture.id, a, capture.explicit_metadata, capture.allow_clarification)
+                for a in analyses
+            ]
+            db.add_all(units)
+            db.commit()  # every unit's authoritative_content + analysis durably saved
+
+            for unit in units:
+                if unit.status == "awaiting_clarification":
+                    continue
+                unit_token = _claim_processing(db, unit)
+                await _finalize_unit(db, llm, unit, unit_token, attachment_text)
+                db.refresh(unit)
+                if auto_structure and unit.status == "ready":
+                    await finish_structuring(unit.id, llm)
+        except Exception:
+            # Phase-0 data (raw_text, attachments) was already committed
+            # by create_capture() long before this ever ran, so a crash
+            # here never loses the user's words -- only this capture's
+            # derived processing is left incomplete, retryable via
+            # retry_capture_processing().
+            logger.exception("Unexpected failure processing capture %s", capture_id)
+            _commit_capture_if_token_matches(db, capture_id, token, {"processing_status": "failed"})
+            return
+
+        _commit_capture_if_token_matches(db, capture_id, token, {"processing_status": "done"})
+    finally:
+        db.close()
+
+
+async def retry_capture_processing(db: Session, llm: LLMProvider, capture: Capture) -> Capture:
+    """Recovery path for a capture whose process_capture_fully() never
+    finished (e.g. a server restart dropped the background task) or
+    failed outright. Mirrors retry_enrichment()'s staleness check for
+    the per-unit lease.
+    """
+    if capture.processing_status == "done":
+        return capture
+
+    if capture.processing_status == "processing":
+        stale_after = get_settings().membase_processing_lease_stale_seconds
+        started = capture.processing_started_at
+        age = (dt.datetime.now(dt.UTC) - started).total_seconds() if started else float("inf")
+        if age < stale_after:
+            return capture  # still plausibly in flight; nothing to reclaim yet
+
+    if not capture.units:
+        # Segmentation never completed (or never started) -- nothing
+        # was ever committed past the capture-level lease claim, so
+        # it's safe to run the whole pipeline again from scratch.
+        capture.processing_status = "pending"
+        capture.processing_token = None
+        capture.processing_started_at = None
+        db.commit()
+        await process_capture_fully(capture.id, llm)
+        db.refresh(capture)
+        return capture
+
+    # Segmentation already succeeded -- never re-segment (that would
+    # duplicate units). Delegate to the existing per-unit recovery for
+    # any unit stuck in draft/processing/failed instead.
+    attachment_text = _attachment_text_for(capture)
+    for unit in capture.units:
+        if unit.status not in ("draft", "failed", "processing"):
+            continue
+        updated = await retry_enrichment(db, llm, unit)
+        if updated.status == "processing" and updated.processing_token:
+            unit_token = updated.processing_token
+            await _finalize_unit(db, llm, updated, unit_token, attachment_text)
+            db.refresh(updated)
+            if updated.status == "ready":
+                await finish_structuring(updated.id, llm)
+
+    db.refresh(capture)
+    if all(u.status in ("ready", "awaiting_clarification", "discarded") for u in capture.units):
+        capture.processing_status = "done"
+        db.commit()
     return capture
 
 
@@ -811,11 +1062,16 @@ async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit,
     docs/DECISIONS.md) -- a blank/omitted answer skips this question:
     nothing is added to `clarifications`. A non-blank answer is
     classified (answered/unknown/declined, see _classify_outcome) and
-    recorded either way, then the unit is re-analyzed exactly once
-    (sequential clarification -- never a pre-generated queue): the
-    single reanalyze_unit() call both re-derives semantic fields with
-    the new answer as context AND decides whether a further question is
-    still warranted.
+    recorded either way.
+
+    Then, mirroring process_capture_fully()'s own ordering: a dedicated
+    clarify.generate_question() call decides whether a FURTHER question
+    is still warranted given everything answered so far; only once no
+    further question will actually be surfaced (none proposed, the round
+    budget is exhausted, or the only candidate was already declined/
+    unknown) does enrichment.enrich_unit() run to re-derive the real
+    semantic fields -- so a unit can never reach "processing" with a
+    unit.semantic that was never actually enriched.
     """
     answer = (answer or "").strip()
     max_chars = get_settings().membase_max_text_chars
@@ -846,28 +1102,35 @@ async def resolve_clarification(db: Session, llm: LLMProvider, unit: MemoryUnit,
     attachment_text = _attachment_text_for_analysis(unit.capture)
     prior_context = _find_related_context(db, unit.authoritative_content)
 
+    question = None
     if unit.clarification_round < MAX_CLARIFICATION_ROUNDS:
-        analysis = await reanalyze_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
-        semantic = dict(analysis.semantic)
-        metadata_question = _apply_explicit_metadata(semantic, unit.explicit_metadata)
-        unit.semantic = semantic
-        question = metadata_question or analysis.clarification_question
-        field = "metadata conflict" if metadata_question else analysis.clarification_field
-        # Never re-ask about a field the user already declined or
-        # couldn't answer -- a hard guarantee in code, not just a prompt
-        # instruction (see docs/DECISIONS.md), since the whole point of
-        # tracking the outcome is to make re-asking impossible, not just
-        # discouraged.
-        if question and field not in declined_or_unknown_fields:
-            unit.clarification_round += 1
-            unit.pending_clarification = {"question": question, "field": field, "round": unit.clarification_round}
-            unit.status = "awaiting_clarification"
-            db.commit()
-            db.refresh(unit)
-            return unit
+        question = await generate_question(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+    # Never re-ask about a field the user already declined or couldn't
+    # answer -- a hard guarantee in code, not just a prompt instruction
+    # (see docs/DECISIONS.md), since the whole point of tracking the
+    # outcome is to make re-asking impossible, not just discouraged.
+    if question and question["field"] not in declined_or_unknown_fields:
+        unit.clarification_round += 1
+        unit.pending_clarification = {"question": question["question"], "field": question["field"], "round": unit.clarification_round}
+        unit.status = "awaiting_clarification"
+        db.commit()
+        db.refresh(unit)
+        return unit
 
-    # No further question (or the round budget is exhausted): finalize
-    # in the background, same as a unit that never needed clarification.
+    semantic = await enrich_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+    semantic = dict(semantic)
+    metadata_question = _apply_explicit_metadata(semantic, unit.explicit_metadata)
+    unit.semantic = semantic
+    if metadata_question:
+        unit.clarification_round += 1
+        unit.pending_clarification = {"question": metadata_question, "field": "metadata conflict", "round": unit.clarification_round}
+        unit.status = "awaiting_clarification"
+        db.commit()
+        db.refresh(unit)
+        return unit
+
+    # No further question: finalize in the background, same as a unit
+    # that never needed clarification.
     _claim_processing(db, unit)
     db.refresh(unit)
     return unit
@@ -905,8 +1168,8 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
 
     attachment_text = _attachment_text_for_analysis(unit.capture)
     prior_context = _find_related_context(db, unit.authoritative_content)
-    analysis = await reanalyze_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
-    semantic = dict(analysis.semantic)
+    semantic = await enrich_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+    semantic = dict(semantic)
     _apply_explicit_metadata(semantic, unit.explicit_metadata)
     unit.semantic = semantic
     unit.retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
@@ -958,9 +1221,12 @@ async def _refresh_ready_units_with_attachment_excerpt(db: Session, llm: LLMProv
     every already-"ready" sibling unit's retrieval/searchable text and
     re-embed -- without re-running full analysis (an unbounded number of
     attachment adds would otherwise mean an unbounded number of analysis
-    calls over a capture's lifetime). Shared by add_attachment() (a
-    posthoc file) and finish_image_captioning() (a caption that arrived
-    after the unit was already embedded).
+    calls over a capture's lifetime). Used by add_attachments() for a
+    posthoc file added after the capture's units are already "ready" --
+    a capture's own images are captioned before segmentation ever runs
+    (see process_capture_fully), so their content is already part of
+    the units' semantics by the time they're first embedded and never
+    needs this lighter excerpt-only path.
     """
     attachment_text = _attachment_text_for(capture)
     ready_units = [u for u in capture.units if u.status == "ready"]
@@ -1044,7 +1310,7 @@ async def add_attachments(
     for attachment, processed in staged:
         if is_uncaptioned_image(attachment):
             data_bytes = (get_settings().uploads_dir / processed.stored_path).read_bytes()
-            description = await _describe_image(llm, data_bytes)
+            description = await _caption_and_extract_image(llm, data_bytes)
             if description:
                 attachment.extracted_text = description
                 attachment.extraction_status = "ok"

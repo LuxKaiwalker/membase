@@ -111,196 +111,200 @@ naming once instead of re-deriving from each section below:
 
 ## Data flow: ingestion
 
-**Streamlining-phase rewrite** (see docs/DECISIONS.md "Streamlining
-phase"): `app/ingestion/clarify.py`, `enrichment.py`, and
-`segmentation.py` are deleted. Everything they did -- deciding
-segmentation, deciding whether a question is needed, and producing the
-full semantic representation -- is now one call,
-`analyze_capture()` (`app/ingestion/analysis.py`), per capture. A
-clarification round costs exactly one further call,
-`reanalyze_unit()`, which both re-derives semantics and decides whether
-a *further* question is still warranted. There is no pre-generated
-clarification queue any more -- clarification is strictly sequential,
-one question at a time.
+**Restored multi-call pipeline, fully backgrounded** (see
+docs/DECISIONS.md "Restore the multi-call ingestion pipeline" --
+reverses the earlier "Streamlining phase" collapse now that saving no
+longer needs to return a synchronously-analyzed result). `create_capture()`
+(`app/ingestion/pipeline.py`) does **Phase 0 only**: persist `raw_text` +
+attachments, zero LLM calls, return immediately -- `capture.units` is
+always `[]` on return. `POST /api/captures` schedules exactly one
+background task, `process_capture_fully()`, and the HTTP response
+returns right after Phase 0 commits: the "saved" acknowledgement is
+instant because nothing after it is awaited, not because the analysis
+itself got any faster.
 
 ```
 capture text + files
       |
       ├─ process each file (app/ingestion/files.py): sniff real mime type,
       |   reject unsupported, save original, best-effort text extraction
-      |   (images are stored but not captioned here -- no LLM call before
-      |   phase 0 commits, same rule as everything else derived)
+      |   (images are stored but not captioned here -- no LLM call at
+      |   Phase 0, same rule as everything else derived)
       |
-      ├─ COMMIT (phase 0): capture + attachments durably saved
+      ├─ COMMIT (Phase 0): capture + attachments durably saved,
+      |   capture.explicit_metadata/allow_clarification staged as columns
+      |   for process_capture_fully() to read later
       |
-      ├─ _find_related_context() (app/ingestion/pipeline.py): cheap,
-      |   non-LLM lexical lookup (regex-extracted proper-noun-shaped
-      |   terms + SQL ILIKE against ready units' retrieval_text) --
-      |   up to 3 short snippets, injected as context-only (never
-      |   authority) into the analysis call below.
-      |
-      ├─ analyze_capture() (app/ingestion/analysis.py): ONE structured-
-      |   output call. Decides segmentation (each unit's content must be
-      |   a verbatim excerpt of raw_text, or the whole text is kept as
-      |   one unit -- safety fallback, see "Segmentation" below) AND,
-      |   for each resulting unit, its full semantic representation
-      |   (meaning/people/organizations/locations/aliases/topics/
-      |   definitions/relations/event_date) AND whether it needs a
-      |   clarifying question -- all in one pass. Takes attachment_text
-      |   (non-image attachments only -- see the image-captioning note
-      |   below) and the prior-context snippets above as prompt context.
-      |
-      ├─ explicit metadata applied (app/ingestion/pipeline.py
-      |   `_apply_explicit_metadata`): a user-supplied location/date/
-      |   people/organizations/topics field always overrides the same
-      |   inferred field; a genuine conflict becomes a synthetic
-      |   clarification question (see docs/DECISIONS.md "Explicit
-      |   metadata authority").
-      |
-      ├─ COMMIT (phase 1): every unit's authoritative_content + full
-      |   analysis durably saved, status="draft" (or
-      |   "awaiting_clarification" if a question -- model-proposed or a
-      |   metadata conflict -- is pending)
-      |
-      └─ for each unit with no pending question: _claim_processing()
-          (app/ingestion/pipeline.py) sets status="processing" + a fresh
-          processing_token, COMMIT -- the HTTP response returns here.
-          Finalization (below) runs as a scheduled FastAPI BackgroundTask
-          (finish_unit_processing()), after the request/response cycle.
-
-api/captures.py also schedules, per attachment: finish_image_captioning()
-for an uncaptioned image, or finish_attachment_chunking() (below) if the
-attachment's extracted text clears the chunking size threshold --
-both fully independent of each other and of the synchronous path above.
+      └─ background_tasks.add_task(process_capture_fully, capture.id)
+          -- the HTTP response returns here. Non-image attachment
+          chunking is scheduled independently, right alongside (see
+          below); an image attachment is never chunkable yet at this
+          point (no caption exists until process_capture_fully runs).
 ```
 
 ```
-finish_image_captioning() (background task, own DB session)
+process_capture_fully() (ONE background task, own DB session, capture-
+level processing lease)
       |
-      └─ the generation model's native multimodal understanding
-          describes the image (best-effort; a failure leaves the image
-          attached but uncaptioned -- never blocks or fails the
-          capture, see docs/DECISIONS.md "Decouple image captioning").
-          Explicit trade-off: analyze_capture() above already ran
-          without this caption as context, since captioning is no
-          longer in the synchronous path. If the caption clears the
-          chunking threshold it's chunked (below); otherwise it's
-          folded as a short excerpt into every already-"ready" sibling
-          unit's retrieval_text and re-embedded (the same light path
-          add_attachment() uses for a posthoc file), so it still
-          becomes searchable either way.
+      ├─ for each uncaptioned image attachment: _caption_one_image() --
+      |   runs in full, in the foreground of this task, BEFORE anything
+      |   below ever sees this capture's text. No longer an accepted
+      |   "runs blind" trade-off (the old synchronous path's reason for
+      |   deferring this doesn't apply once everything here is already
+      |   backgrounded) -- see "Image understanding" below for what this
+      |   actually extracts.
+      |
+      ├─ any now-captioned image attachment that clears the chunking
+      |   threshold gets chunked here too (should_chunk() depends on
+      |   the caption that was just produced).
+      |
+      ├─ _find_related_context(): cheap, non-LLM lexical lookup
+      |   (regex-extracted proper-noun-shaped terms + SQL ILIKE against
+      |   ready units' retrieval_text) -- up to 3 short snippets,
+      |   injected as context-only (never authority) into the calls
+      |   below.
+      |
+      ├─ segmentation.segment_capture() (app/ingestion/segmentation.py):
+      |   a dedicated, content-ONLY structured-output call -- decides
+      |   how to split raw_text into units (each must be a verbatim
+      |   excerpt, see "Segmentation" below), no semantic fields at all.
+      |
+      ├─ per proposed unit:
+      |   ├─ clarify.generate_question() (app/ingestion/clarify.py): a
+      |   |   dedicated call deciding whether this unit needs a
+      |   |   clarifying question, given full attachment context
+      |   |   (including any image caption/structured data -- already
+      |   |   available, unlike before). Skipped entirely (no call) when
+      |   |   `allow_clarification` is False for this capture.
+      |   ├─ if a question is surfaced: semantic stays empty for now
+      |   |   (enrichment never runs for a unit about to be blocked on a
+      |   |   question -- matches the pre-collapse design).
+      |   └─ otherwise: enrichment.enrich_unit() (app/ingestion/enrichment.py)
+      |       -- the narrative/entities/retrieval-aids 3-way split (see
+      |       below), producing the full semantic representation.
+      |
+      ├─ explicit metadata applied (`_apply_explicit_metadata`): a
+      |   user-supplied location/date/people/organizations/topics field
+      |   always overrides the same inferred field; a genuine conflict
+      |   becomes a synthetic clarification question (see
+      |   docs/DECISIONS.md "Explicit metadata authority").
+      |
+      ├─ COMMIT: every unit's authoritative_content + analysis durably
+      |   saved, status="draft" (or "awaiting_clarification" if a
+      |   question -- model-proposed or a metadata conflict -- is
+      |   pending)
+      |
+      └─ for each unit with no pending question, in the same coroutine
+          (plain sequential `await`s reproduce the ordering
+          BackgroundTasks used to guarantee across separately-scheduled
+          tasks -- there's nothing left to schedule, since units didn't
+          exist yet when the one task above was scheduled):
+          ├─ _claim_processing() + _finalize_unit(): build_retrieval_text()
+          |   (pure Python) + embed() (best-effort) + status="ready"
+          |   + _detect_conflicts() (see below, unchanged)
+          └─ finish_structuring() chained immediately once "ready" --
+              the membase structurer's own deeper pass (unchanged, see
+              "The membase structurer" below).
+
+Capture-level lease: _claim_capture_processing()/
+_commit_capture_if_token_matches() mirror the per-unit lease one level
+up (Capture.processing_status/processing_token/processing_started_at),
+guarding against two concurrent runs of this function for the same
+capture. POST /api/captures/{id}/retry (retry_capture_processing())
+re-runs this whole function from scratch if no units were ever
+committed, or delegates to the existing per-unit retry_enrichment() if
+segmentation already succeeded (never re-segments, which would
+duplicate units).
 ```
 
-```
-finish_attachment_chunking() (background task, own DB session)
-      |
-      └─ should_chunk(): skipped entirely if the attachment's extracted
-          text is under membase_min_chars_for_chunking (2000 chars) --
-          the parent unit's own full-text search already covers a
-          document that short (see docs/DECISIONS.md "Lazy attachment
-          chunking"). Otherwise, _index_attachment_chunks() chunks the
-          text (app/ingestion/chunking.py, capped at
-          membase_max_chunks_per_attachment) and best-effort embeds each
-          chunk into attachment_chunks. Idempotent (clears existing
-          chunks first), which is what makes retry_attachment_chunking()
-          safe to call again after a dropped background task -- no
-          separate pending/processing status needed for chunks.
-```
+**Image understanding.** `_describe_image()` (free-text caption, native
+multimodal) is unchanged. New alongside it:
+`_extract_image_structured_data()` -- a second, schema-constrained call
+per image (`has_structured_data: bool`, `fields: [{label, value}]`),
+prompted to transcribe any form/table/prescription/measurement data
+exactly as shown. `_caption_and_extract_image()` combines both into one
+`Attachment.extracted_text` (`"<caption>\n\nStructured data:\n- label: value\n..."`
+when fields were found). `enrichment.enrich_unit()`'s retrieval-aids
+sub-prompt is told to promote each such labeled pair into its own
+`relations` entry rather than just summarizing the block in prose --
+this is what makes e.g. a photographed prescription's numbers land as
+queryable `semantic.relations`, not inert text. Multiple images in one
+capture are labeled `"Image 1:"`/`"Image 2:"` in the combined
+`attachment_text` (`_attachment_text_for()`) so one photo's values and
+another's can be merged into one unit's `relations` by a single
+`enrich_unit()` call.
 
-```
-finish_unit_processing() (background task, own DB session + processing lease)
-      |
-      ├─ build_retrieval_text(): deterministic (non-LLM) text combining
-      |   original + clarifications + meaning + aliases + definitions +
-      |   relations -- pure Python, using semantic fields the analysis
-      |   call already produced. No LLM call here any more.
-      ├─ searchable_text = authoritative_content + attachment text
-      |   + retrieval_text  (feeds the GIN full-text index)
-      ├─ embed(retrieval_text) -> pgvector column (best-effort; failure
-      |   leaves embedding NULL, unit still full-text searchable) --
-      |   this is the ONLY LLM-adjacent call left in this background step.
-      ├─ _commit_if_token_matches(): status="ready" (or "failed" on a
-      |   genuinely unexpected exception), committed only if this call's
-      |   processing_token still matches the row's -- a concurrent retry
-      |   that claimed the unit first already landed its own result, so
-      |   this one is simply dropped rather than stomping it (see
-      |   "Processing lease" below).
-      └─ _detect_conflicts(): reuses hybrid_search() to find other ready
-          units whose relations share a (subject, predicate) but
-          disagree on the object; marks both units' potential_conflicts
-          (advisory only -- see docs/DECISIONS.md "Contradiction
-          detection").
-```
-
-**Processing lease, not a held row lock.** The previous phase held
-`SELECT ... FOR UPDATE` for the entire duration of
-`finish_unit_processing()`, including the LLM calls. This phase
-replaces that with a lease: `_claim_processing()` sets
-`status="processing"` plus a fresh random `processing_token` and
-`processing_started_at` in a short transaction and commits immediately
--- no lock is held while the embedding call runs. The finalization step
-commits its result only if `processing_token` still matches
-(`_commit_if_token_matches()`, a single `UPDATE ... WHERE id=? AND
-processing_token=?` checked via `rowcount`); a mismatch means a
-concurrent attempt already finished first, so this one's result is
-dropped rather than applied on top of it. `POST /memory-units/{id}/retry`
-only reclaims a unit stuck in `"processing"` if `processing_started_at`
-is older than `membase_processing_lease_stale_seconds` (300s) -- a fresh
-lease is left alone, since a live background task is presumably still
-going to finish it.
+**Processing lease, not a held row lock** (per-unit level, unchanged by
+the above): `_claim_processing()` sets `status="processing"` plus a
+fresh random `processing_token` and `processing_started_at` in a short
+transaction and commits immediately -- no lock is held while the
+embedding call runs. The finalization step commits its result only if
+`processing_token` still matches (`_commit_if_token_matches()`, a
+single `UPDATE ... WHERE id=? AND processing_token=?` checked via
+`rowcount`); a mismatch means a concurrent attempt already finished
+first, so this one's result is dropped rather than applied on top of
+it. `POST /memory-units/{id}/retry` only reclaims a unit stuck in
+`"processing"` if `processing_started_at` is older than
+`membase_processing_lease_stale_seconds` (300s) -- a fresh lease is
+left alone, since a live background task is presumably still going to
+finish it.
 
 This two-phase-commit structure is what guarantees "authoritative content
 persists even if derived processing fails" (spec section 25): the
 authoritative text is committed *before* any LLM call in the derived
 stage runs, in a separate transaction.
 
-If `analyze_capture()` (or a metadata conflict) surfaces a question, the
-unit's status becomes `"awaiting_clarification"` instead of `"ready"` --
-**gated**: it is durably saved (survives a restart) but invisible to
-recall until answered, because `hybrid_search()` only ever considers
-`status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`)
+If `clarify.generate_question()` (or a metadata conflict) surfaces a
+question, the unit's status becomes `"awaiting_clarification"` instead
+of `"ready"` -- **gated**: it is durably saved (survives a restart) but
+invisible to recall until answered, because `hybrid_search()` only ever
+considers `status='ready'` rows. Answering it (`POST /memory-units/{id}/clarify`)
 classifies the answer deterministically as answered/unknown/declined (no
 LLM call -- `_classify_outcome`), appends the verbatim Q&A to
 `clarifications`, then -- if the round budget
-(`MAX_CLARIFICATION_ROUNDS`) allows -- calls `reanalyze_unit()` exactly
-once to re-derive semantics AND decide whether a further question is
-still warranted; a field already marked declined/unknown is hard-coded
-to never be re-asked regardless of what the model proposes. Once no
-further question is pending (or the round budget is exhausted), the unit
-moves to `status="processing"` and background finalization (above) runs
--- this is what makes a clarified term's aliases actually searchable
-afterward, not just present in a one-off answer.
+(`MAX_CLARIFICATION_ROUNDS`) allows -- calls `clarify.generate_question()`
+again to decide whether a *further* question is still warranted; a
+field already marked declined/unknown is hard-coded to never be
+re-asked regardless of what the model proposes. Once no further
+question will actually be surfaced (none proposed, round budget
+exhausted, or the only candidate was just suppressed as
+declined/unknown), `enrichment.enrich_unit()` runs to re-derive the real
+semantic fields -- guaranteed to run exactly once per settled round,
+so a unit can never reach `"processing"` carrying semantics that were
+never actually enriched. The unit then moves to `status="processing"`
+and background finalization (above) runs -- this is what makes a
+clarified term's aliases actually searchable afterward, not just
+present in a one-off answer.
 
 Answering is optional, never enforced by the API: `ClarifyRequest.answer`
 is `str | None`, and a blank/omitted answer skips the question -- nothing
-is appended to `clarifications`, the unit just proceeds through
-`_advance_unit()` exactly as if the question had never been asked. The
-user may also explicitly cancel an awaiting unit (`POST .../discard`,
-status becomes `"discarded"`) rather than answer or skip it -- the
-Browse tab's "skip all remaining follow-up questions" button is this,
-applied in bulk to every unit still pending across the whole list (see
-docs/DECISIONS.md "Clarification moved to Browse").
+is appended to `clarifications`, the unit just proceeds exactly as if
+the question had never been asked. The user may also explicitly cancel
+an awaiting unit (`POST .../discard`, status becomes `"discarded"`)
+rather than answer or skip it -- the Browse tab's "skip all remaining
+follow-up questions" button is this, applied in bulk to every unit
+still pending across the whole list (see docs/DECISIONS.md
+"Clarification moved to Browse").
 
-Clarification is bounded on two axes (`app/ingestion/pipeline.py`):
-`MAX_QUESTIONS_PER_ROUND = 3` candidate questions considered per check
-(asked one at a time, never as a batch), and `MAX_CLARIFICATION_ROUNDS =
-3` rounds of checking -- a "round" only counts if it actually surfaced a
-question, so an ordinary unit that never needed clarification stays at
-round 0 forever. After the round budget is exhausted, further questions
-the model proposes are discarded and enrichment proceeds regardless. A
-user-initiated correction (`POST /memory-units/{id}/correct`, spec
-section 30 -- free-text, re-runs enrichment directly, bypassing the
-clarification check entirely) does *not* consume this budget: the bound
-exists to stop the system from interrogating the user, not to limit how
-often the user can proactively fix something.
+Clarification is bounded by `MAX_CLARIFICATION_ROUNDS = 3`
+(`app/ingestion/pipeline.py`) rounds of checking -- a "round" only
+counts if it actually surfaced a question, so an ordinary unit that
+never needed clarification stays at round 0 forever. After the round
+budget is exhausted, further questions the model proposes are discarded
+and enrichment proceeds regardless. A user-initiated correction
+(`POST /memory-units/{id}/correct`, spec section 30 -- free-text,
+re-runs `enrich_unit()` directly, bypassing the clarification check
+entirely) does *not* consume this budget: the bound exists to stop the
+system from interrogating the user, not to limit how often the user can
+proactively fix something.
 
 ## Segmentation
 
-Segmentation is the first half of `analyze_capture()`'s single call
-(`app/ingestion/analysis.py`), asking the LLM to split `raw_text` into
-units in the same pass as deciding each unit's semantics and
-clarification need. Two hard safety rules, enforced in code (not just
-prompted), unchanged by the streamlining-phase call collapse:
+`segmentation.segment_capture()` (`app/ingestion/segmentation.py`) is a
+dedicated, content-only call -- asking the LLM to split `raw_text` into
+units with no semantic fields riding along. Two hard safety rules,
+enforced in code (not just prompted), unchanged since before the
+streamlining-phase collapse and its later reversal:
 
 1. **Verbatim requirement.** Every proposed unit's `content` must be a
    normalized substring of `raw_text`. If any proposed unit fails this
@@ -771,21 +775,25 @@ sites, one per narrow decision:
 
 | Call site | Module | Decides |
 |---|---|---|
-| `analyze_capture()` | `ingestion/analysis.py` | how many memory units this capture contains, each unit's full semantic representation, AND whether it needs a clarifying question -- all in one call (see docs/DECISIONS.md "Collapse ingestion LLM calls") |
-| `reanalyze_unit()` | `ingestion/analysis.py` | the same semantic representation plus further-clarification-needed, re-derived once per clarification round |
+| `segment_capture()` | `ingestion/segmentation.py` | how many memory units this capture contains (content only, no semantic fields) |
+| `generate_question()` | `ingestion/clarify.py` | whether this unit needs a clarifying question (and about what) -- a dedicated call, run before enrichment, with full attachment context available |
+| `enrich_unit()` | `ingestion/enrichment.py` | the full semantic representation, as three independent sub-calls (narrative, entities, retrieval aids) -- run only once no further clarification question will be surfaced |
+| `_extract_image_structured_data()` | `ingestion/pipeline.py` | labeled field/value pairs in an image (forms, tables, prescriptions, measurements), transcribed verbatim -- alongside `_describe_image()`'s free-text caption |
+| `structure_unit()` | `ingestion/structurer.py` | the membase structurer's own deeper, unsplit semantic pass + related-memory links (see "The membase structurer" above) |
 | `evaluate_sufficiency()` | `retrieval/pipeline.py` | whether retrieved evidence is enough to answer, and what to search next -- skipped entirely when a deterministic high-confidence check already says yes (see docs/DECISIONS.md "Deterministic sufficiency short-circuit") |
 | `generate_answer()` | `retrieval/pipeline.py` | the final answer text and whether it's grounded |
 | `extract_cues()` | `retrieval/cues.py` | structured cues from a RecallSession user reply (RecallSession only) |
 
-Streamlining-phase history: `enrich()` (`ingestion/enrichment.py`) used
-to make three independent sub-calls (narrative/entities/retrieval-aids),
-and a separate `generate_questions()` (`ingestion/clarify.py`) decided
-clarification need before it ever ran -- five calls total per capture
-in the worst case. `analyze_capture()` now does all of that in one call;
-see docs/DECISIONS.md for why the consolidation was judged not to cost
-retrieval quality the eval set could detect (two cases out of 30 did
-regress -- documented honestly there, not hidden). No call site calls
-back into another call site.
+History: a "streamlining phase" briefly collapsed segmentation +
+clarification-need + enrichment into one call per capture
+(`analyze_capture()`) to cut synchronous-request latency, documented
+in docs/DECISIONS.md alongside the quality cost that was judged
+acceptable at the time (two cases out of 30 on the eval set regressed --
+documented honestly there, not hidden). That collapse was reversed (see
+docs/DECISIONS.md "Restore the multi-call ingestion pipeline") once
+ingestion became fully backgrounded -- the whole premise of trading
+quality for request-latency no longer applied. No call site calls back
+into another call site.
 
 ## File handling, persistence, security
 

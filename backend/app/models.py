@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Computed, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import Boolean, Computed, DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +33,24 @@ class Capture(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # --- capture-level processing lease (see app/ingestion/pipeline.py
+    # "process_capture_fully") -- pending | processing | done | failed.
+    # Mirrors the per-unit processing_token/processing_started_at lease
+    # on MemoryUnit, one level up: guards the single background task
+    # that does ALL of this capture's LLM-dependent work (image
+    # understanding, segmentation, clarification, enrichment, embedding)
+    # against running twice concurrently.
+    processing_status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    processing_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Staged here at Phase 0 (create_capture(), zero LLM calls) and read
+    # by process_capture_fully() once it actually runs -- see
+    # docs/DECISIONS.md "Explicit metadata authority" / "Disable
+    # follow-up questions".
+    allow_clarification: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    explicit_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
     units: Mapped[list["MemoryUnit"]] = relationship(
         back_populates="capture", cascade="all, delete-orphan", order_by="MemoryUnit.created_at"

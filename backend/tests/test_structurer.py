@@ -2,7 +2,7 @@ import pytest
 
 from app.ingestion.pipeline import IngestionError, finish_structuring, retry_structuring
 from tests.fakes import FakeLLMProvider
-from tests.helpers import create_capture_and_finish
+from tests.helpers import create_capture_and_finish_unstructured as create_capture_and_finish
 
 # The "membase structurer" (see docs/DECISIONS.md "The 'membase
 # structurer'"): a second, independent background pass that deepens an

@@ -1,5 +1,4 @@
 
-from app.ingestion.pipeline import create_capture
 from app.retrieval.pipeline import hybrid_search, sibling_context
 from tests.helpers import create_capture_and_finish
 
@@ -31,7 +30,7 @@ async def test_irrelevant_units_do_not_dominate(db, fake_llm):
 
 
 async def test_no_match_returns_empty(db, fake_llm):
-    await create_capture(db, fake_llm, text="Something about gardening", uploads=[])
+    await create_capture_and_finish(db, fake_llm, text="Something about gardening")
     scored = await hybrid_search(db, fake_llm, "xyzzy nonexistent plugh quux")
     assert scored == []
 
@@ -42,8 +41,8 @@ async def test_sibling_context_expands_within_same_capture(db):
     llm = FakeLLMProvider(
         segmentation_response={
             "units": [
-                {"content": "Anna studies robotics.", "reason": "x", "independence": "independent"},
-                {"content": "Anna recommended a tactile sensing paper.", "reason": "x", "independence": "independent"},
+                {"content": "Anna studies robotics."},
+                {"content": "Anna recommended a tactile sensing paper."},
             ]
         }
     )

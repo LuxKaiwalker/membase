@@ -157,15 +157,13 @@ const membase = (() => {
 
   // A hung request (e.g. a stuck DB transaction server-side) must never
   // leave the page silently spinning forever with no feedback -- that's
-  // indistinguishable from a frozen UI. Sized to the server's own worst
-  // legitimate case, not guessed independently: the synchronous part of
-  // saving a capture makes at most one LLM call (analyze_capture -- see
-  // docs/DECISIONS.md "Collapse ingestion LLM calls"), up to the server's
-  // configured 90s llm_timeout_seconds -- embedding/finalization happens
-  // in a background task after this request already returned. A shorter
-  // client timeout would abort a slow-but-working request and misreport
-  // it as stuck; this still bounds the true-hang case to a visible error
-  // instead of an infinite wait.
+  // indistinguishable from a frozen UI. POST /api/captures itself makes
+  // no LLM call at all any more (see docs/DECISIONS.md "Restore the
+  // multi-call ingestion pipeline") and returns almost immediately, but
+  // other endpoints (recall, clarify, correct) still make one or more
+  // synchronous LLM calls -- this bounds those to a visible error
+  // instead of an infinite wait, rather than aborting a slow-but-working
+  // request and misreporting it as stuck.
   const REQUEST_TIMEOUT_MS = 150_000;
 
   async function fetchWithTimeout(path, options = {}) {
@@ -259,24 +257,75 @@ const membase = (() => {
     return `${err.message} (after ${elapsed})`;
   }
 
-  function renderUnits(derivedEl, units) {
-    const lines = units.map((u) => ({
-      content: u.authoritative_content,
-      meaning: u.semantic && u.semantic.meaning,
-      aliases: u.semantic && u.semantic.aliases,
-    }));
-    derivedEl.textContent = JSON.stringify(lines, null, 2);
+  // Fetches an attachment's bytes through fetchWithTimeout (the only
+  // thing that attaches the Authorization header this backend requires
+  // -- a plain <a href> can't carry it) and opens/downloads them client-
+  // side. Images open in a new tab; anything else triggers a download
+  // via a throwaway <a download>. Shared by the Store page, the Browse
+  // tab, and the Recall page's rendered sources -- the three places a
+  // memory's original attachments can surface.
+  async function openAttachment(attachment, triggerEl) {
+    const originalLabel = triggerEl ? triggerEl.textContent : null;
+    if (triggerEl) {
+      triggerEl.disabled = true;
+      triggerEl.textContent = "Loading...";
+    }
+    try {
+      const resp = await fetchWithTimeout(`/api/attachments/${attachment.id}/file`);
+      if (!resp.ok) throw new Error(`Failed to load attachment (${resp.status})`);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      if (attachment.content_type.startsWith("image/")) {
+        window.open(url, "_blank");
+      } else {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = attachment.original_filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      }
+      // Revoked after a delay rather than immediately -- the new tab/
+      // download needs time to actually read the blob first.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (err) {
+      alert(err.message || "Failed to open attachment");
+    } finally {
+      if (triggerEl) {
+        triggerEl.disabled = false;
+        triggerEl.textContent = originalLabel;
+      }
+    }
   }
 
-  // Whether a unit's background processing (the embedding step, and --
-  // see docs/DECISIONS.md "membase structurer" -- the deeper structurer
-  // pass) has actually finished is deliberately NOT waited for or
-  // polled on this page any more: the Store page shows "Saved" as soon
-  // as the text itself is durably persisted (authoritative_content and
-  // semantic fields are already set synchronously by the time this
-  // page's request returns -- only retrieval_text/embedding/structuring
-  // are backgrounded). Post-processing status/progress is visualized on
-  // the Browse page instead, which is the one place that view belongs.
+  // Builds "Attachments: name1, name2" as real DOM nodes (each name a
+  // clickable button wired to openAttachment), not a joined string --
+  // every attachment, of every supported type, gets a working view/
+  // download link wherever this is used.
+  function buildAttachmentList(attachments) {
+    const wrap = document.createElement("span");
+    if (!attachments || !attachments.length) return wrap;
+    wrap.appendChild(document.createTextNode("Attachments: "));
+    attachments.forEach((a, i) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "attachment-link";
+      button.textContent = a.original_filename;
+      button.addEventListener("click", () => openAttachment(a, button));
+      wrap.appendChild(button);
+      if (i < attachments.length - 1) wrap.appendChild(document.createTextNode(", "));
+    });
+    return wrap;
+  }
+
+  // POST /api/captures now returns the instant it has durably persisted
+  // the capture's raw text and attachments -- zero LLM calls in that
+  // request path at all (see docs/DECISIONS.md "Restore the multi-call
+  // ingestion pipeline"). `capture.units` is therefore always `[]` on
+  // return: there is nothing derived to preview here any more.
+  // Segmentation, clarification, enrichment, embedding, and structuring
+  // all happen afterward in one background task; the Browse page is the
+  // one place that progress is ever visualized (no polling here).
 
   function buildCaptureCard() {
     const card = document.createElement("div");
@@ -285,18 +334,15 @@ const membase = (() => {
       <p class="capture-saving muted"><span class="spinner" aria-hidden="true"></span>Saving...</p>
       <div class="capture-result hidden">
         <h2 class="capture-result-heading">Saved.</h2>
-        <p class="muted">Derived information (automatically extracted; your original text above is never changed by it):</p>
-        <pre class="derived"></pre>
         <p class="muted capture-attachment-list"></p>
-        <p class="muted capture-pending-note hidden">
-          One of these needs a quick follow-up question answered before
-          it's searchable -- see the Browse tab.
+        <p class="muted">
+          Processing in the background -- check the Browse tab shortly
+          for extracted details (and to answer a follow-up question, if
+          one comes up).
         </p>
         <p class="muted capture-safe-to-leave">
-          Your words are already saved. Everything else -- indexing it
-          for search, and the slower background enrichment pass -- keeps
-          running on the server, so it's safe to close this page now;
-          check the Browse page later if you want to see its progress.
+          Your words are already saved. Everything else keeps running on
+          the server, so it's safe to close this page now.
         </p>
       </div>
       <p class="capture-error status error hidden"></p>
@@ -306,26 +352,12 @@ const membase = (() => {
 
   // Drives one capture from submission to the result card, entirely
   // through this card's own elements -- nothing here is shared with any
-  // other card, so several captures can be mid-flight at once. No
-  // clarification handling here any more -- a unit that needs a
-  // follow-up question answered just stays awaiting_clarification;
-  // resolving it only ever happens on the Browse tab now (see
-  // docs/DECISIONS.md "Clarification moved to Browse"), never blocking
-  // this page.
+  // other card, so several captures can be mid-flight at once.
   function runCapture(card, formData) {
     const savingEl = card.querySelector(".capture-saving");
     const resultSection = card.querySelector(".capture-result");
-    const resultHeading = card.querySelector(".capture-result-heading");
-    const derivedEl = card.querySelector(".derived");
     const errorEl = card.querySelector(".capture-error");
     const attachmentListEl = card.querySelector(".capture-attachment-list");
-    const pendingNoteEl = card.querySelector(".capture-pending-note");
-
-    function renderAttachmentList(attachments) {
-      attachmentListEl.textContent = attachments.length
-        ? `Attachments: ${attachments.map((a) => a.original_filename).join(", ")}`
-        : "";
-    }
 
     function showError(message) {
       hide(savingEl);
@@ -339,11 +371,8 @@ const membase = (() => {
         if (!resp.ok) throw new Error(capture.detail || "Failed to save");
 
         hide(savingEl);
-        const units = capture.units;
-        resultHeading.textContent = units.length > 1 ? `Saved ${units.length} memories.` : "Saved.";
-        renderUnits(derivedEl, units);
-        renderAttachmentList(capture.attachments);
-        if (units.some((u) => u.pending_clarification)) show(pendingNoteEl);
+        attachmentListEl.innerHTML = "";
+        attachmentListEl.appendChild(buildAttachmentList(capture.attachments));
         show(resultSection);
       } catch (err) {
         showError(err.message);
@@ -423,6 +452,12 @@ const membase = (() => {
       li.innerHTML = `<strong>${escapeHtml(summary)}</strong><br>
         <span class="muted">Memory ${escapeHtml(s.id)} &middot; stored ${when}</span><br>
         <span class="caption">&ldquo;${escapeHtml(s.content)}&rdquo;</span>`;
+      if (s.attachments && s.attachments.length) {
+        const p = document.createElement("p");
+        p.className = "muted";
+        p.appendChild(buildAttachmentList(s.attachments));
+        li.appendChild(p);
+      }
       listEl.appendChild(li);
     }
   }
@@ -497,9 +532,7 @@ const membase = (() => {
           return `${statusBadge} ${structureBadge}`;
         })
         .join(" ");
-      const attachmentList = capture.attachments.length
-        ? `<p class="muted">Attachments: ${capture.attachments.map((a) => escapeHtml(a.original_filename)).join(", ")}</p>`
-        : "";
+      const attachmentListPlaceholder = capture.attachments.length ? `<p class="muted capture-attachments"></p>` : "";
       const failedStructureUnits = capture.units.filter((u) => u.structure_status === "failed");
       const restructureButtons = failedStructureUnits
         .map((u) => `<button type="button" class="capture-restructure" data-unit-id="${escapeHtml(u.id)}">Retry structuring</button>`)
@@ -532,11 +565,13 @@ const membase = (() => {
         <p>${escapeHtml(capture.raw_text)}</p>
         <p>${unitBadges}</p>
         ${clarificationBlocks}
-        ${attachmentList}
+        ${attachmentListPlaceholder}
         ${restructureButtons}
         <p class="capture-restructure-error status error hidden"></p>
         <button type="button" class="capture-delete">Delete</button>
       `;
+      const attachmentsEl = card.querySelector(".capture-attachments");
+      if (attachmentsEl) attachmentsEl.appendChild(buildAttachmentList(capture.attachments));
 
       for (const block of card.querySelectorAll(".capture-clarification")) {
         const unitId = block.dataset.unitId;

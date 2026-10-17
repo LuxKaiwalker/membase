@@ -22,7 +22,7 @@ async def test_create_capture_persists(db, fake_llm):
 
 async def test_create_capture_rejects_empty_text(db, fake_llm):
     with pytest.raises(IngestionError):
-        await create_capture(db, fake_llm, text="   ", uploads=[])
+        await create_capture(db, text="   ", uploads=[])
 
 
 async def test_attachment_persists_on_capture(db, fake_llm):
@@ -39,7 +39,6 @@ async def test_create_capture_rejects_unsupported_file(db, fake_llm):
     with pytest.raises(IngestionError):
         await create_capture(
             db,
-            fake_llm,
             text="bad file",
             uploads=[("virus.exe", b"MZ\x90\x00\x03\x00\x00\x00")],
         )
@@ -47,4 +46,4 @@ async def test_create_capture_rejects_unsupported_file(db, fake_llm):
 
 async def test_create_capture_rejects_empty_file(db, fake_llm):
     with pytest.raises(IngestionError):
-        await create_capture(db, fake_llm, text="empty file", uploads=[("empty.txt", b"")])
+        await create_capture(db, text="empty file", uploads=[("empty.txt", b"")])

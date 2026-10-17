@@ -84,6 +84,16 @@ def _negative_cue_texts(session: RecallSession) -> list[str]:
     return [c["text"] for c in session.cues if c["polarity"] == "negative"]
 
 
+def _snapshot_attachment(a) -> dict:
+    return {
+        "id": str(a.id),
+        "original_filename": a.original_filename,
+        "content_type": a.content_type,
+        "size_bytes": a.size_bytes,
+        "extraction_status": a.extraction_status,
+    }
+
+
 def _snapshot_sources(ranked) -> list[dict]:
     return [
         {
@@ -95,6 +105,7 @@ def _snapshot_sources(ranked) -> list[dict]:
             "vector_score": s.vector_score,
             "fts_score": s.fts_score,
             "fused_score": s.fused_score,
+            "attachments": [_snapshot_attachment(a) for a in s.unit.capture.attachments],
         }
         for s in ranked
     ]
@@ -105,6 +116,7 @@ def _snapshot_chunk_sources(ranked_chunks) -> list[dict]:
         {
             "id": str(c.chunk.id),
             "capture_id": str(c.chunk.capture_id),
+            "attachment_id": str(c.chunk.attachment_id),
             "attachment_filename": c.chunk.attachment.original_filename,
             "page_number": c.chunk.page_number,
             "excerpt": c.chunk.text[:500],

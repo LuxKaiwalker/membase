@@ -10,7 +10,7 @@ async def test_delete_capture_removes_row_and_file(db, fake_llm, tmp_path, monke
     from app import config as config_module
 
     monkeypatch.setattr(config_module.get_settings(), "uploads_dir", tmp_path)
-    capture = await create_capture(db, fake_llm, text="To be deleted", uploads=[("note.txt", b"content")])
+    capture = await create_capture(db, text="To be deleted", uploads=[("note.txt", b"content")])
     capture_dir = tmp_path / str(capture.id)
     assert capture_dir.exists()
 
@@ -63,7 +63,7 @@ async def test_correction_updates_semantic_representation(db):
 
 
 async def test_correction_rejects_empty_text(db, fake_llm):
-    capture = await create_capture(db, fake_llm, text="Something.", uploads=[])
+    capture = await create_capture_and_finish(db, fake_llm, text="Something.")
     from app.ingestion.pipeline import IngestionError
 
     with pytest.raises(IngestionError):

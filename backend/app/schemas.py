@@ -38,6 +38,10 @@ class CaptureOut(BaseModel):
     id: uuid.UUID
     raw_text: str
     created_at: datetime
+    # pending | processing | done | failed -- lets the client tell "not
+    # processed yet" (units still []) apart from "genuinely zero units"
+    # (see app/ingestion/pipeline.py's process_capture_fully).
+    processing_status: str
     attachments: list[AttachmentOut]
     units: list[MemoryUnitOut]
 
@@ -66,11 +70,17 @@ class SourceOut(BaseModel):
     vector_score: float | None
     fts_score: float | None
     fused_score: float
+    # The source unit's capture's own attachments -- lets the Recall/
+    # Remember UI offer a view/download link for a retrieved memory's
+    # original files, not just document-chunk excerpts (see
+    # app/retrieval/session.py's _snapshot_sources).
+    attachments: list[AttachmentOut] = []
 
 
 class ChunkSourceOut(BaseModel):
     id: uuid.UUID
     capture_id: uuid.UUID
+    attachment_id: uuid.UUID
     attachment_filename: str
     page_number: int | None
     excerpt: str

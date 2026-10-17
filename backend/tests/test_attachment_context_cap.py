@@ -1,21 +1,25 @@
 
-from app.ingestion.pipeline import MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS, create_capture
+from app.ingestion.pipeline import MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS
 from app.llm.base import LLMProvider
-from tests.helpers import resolve_clarification_and_finish
+from tests.helpers import create_capture_and_finish, resolve_clarification_and_finish
 
 # A generation call's context window is shared between its input prompt
 # and its output -- an uncapped attachment_text (a large PDF, or several
 # attachments) risks the same output-truncation failure fixed for
 # many-fact captures, just from the input side (see docs/DECISIONS.md
 # "Chunk long captures before analysis" and the attachment-text cap
-# added alongside it). These tests verify the cap is actually applied
-# at every LLM-prompt call site, not just the full-text search index.
+# added alongside it). These tests verify the cap is actually applied at
+# every LLM-prompt call site that receives attachment_text (clarify's
+# call and each of enrichment's three sub-calls -- segmentation itself
+# never sees attachment_text at all, see app/ingestion/segmentation.py).
 
 
 class _PromptCapturingLLM(LLMProvider):
-    """Records every prompt and returns a fixed response -- used here to
-    verify how much attachment text actually reaches a generation
-    prompt, since FakeLLMProvider dispatches purely by schema shape."""
+    """Records every prompt and returns a fixed response (which must
+    satisfy every schema this gets asked for -- segmentation, clarify,
+    and all three enrichment sub-calls -- since this doesn't dispatch by
+    schema shape the way FakeLLMProvider does) -- used here to verify
+    how much attachment text actually reaches a generation prompt."""
 
     def __init__(self, response: dict) -> None:
         self._response = response
@@ -41,34 +45,44 @@ class _PromptCapturingLLM(LLMProvider):
         return 768
 
 
+_NO_QUESTION_ALL_FIELDS = {
+    "units": [{"content": "A short memory."}],
+    "clarification_question": "", "clarification_field": "",
+    "meaning": "", "event_date": "", "people": [], "organizations": [], "locations": [],
+    "aliases": [], "topics": [], "definitions": [], "relations": [],
+}
+
+
 async def test_create_capture_caps_attachment_text_in_analysis_prompt(db):
     huge_text = "X" * 5000
-    llm = _PromptCapturingLLM({"units": [{"content": "A short memory."}]})
+    llm = _PromptCapturingLLM(dict(_NO_QUESTION_ALL_FIELDS))
 
-    await create_capture(db, llm, text="A short memory.", uploads=[("notes.txt", huge_text.encode())])
+    await create_capture_and_finish(db, llm, text="A short memory.", uploads=[("notes.txt", huge_text.encode())])
 
-    assert len(llm.prompts) == 1
-    prompt = llm.prompts[0]
-    # The capped excerpt is present...
-    assert "X" * MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS in prompt
-    # ...but the full 5000-char attachment never reached the prompt.
-    assert "X" * (MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS + 1) not in prompt
+    capped = "X" * MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS
+    overcapped = "X" * (MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS + 1)
+    # The capped excerpt reaches at least one prompt (clarify's, and
+    # each enrichment sub-call's)...
+    assert any(capped in p for p in llm.prompts)
+    # ...but the full 5000-char attachment never reaches ANY prompt.
+    assert all(overcapped not in p for p in llm.prompts)
 
 
 async def test_resolve_clarification_caps_attachment_text_in_reanalysis_prompt(db):
     huge_text = "Y" * 5000
-    llm = _PromptCapturingLLM(
-        {"units": [{"content": "A short memory.", "clarification_question": "What do you mean?", "clarification_field": "x"}]}
-    )
-    capture = await create_capture(db, llm, text="A short memory.", uploads=[("notes.txt", huge_text.encode())])
+    llm = _PromptCapturingLLM({
+        **_NO_QUESTION_ALL_FIELDS,
+        "clarification_question": "What do you mean?", "clarification_field": "x",
+    })
+    capture = await create_capture_and_finish(db, llm, text="A short memory.", uploads=[("notes.txt", huge_text.encode())])
     unit = capture.units[0]
     assert unit.status == "awaiting_clarification"
 
     llm.prompts.clear()
-    llm._response = {"meaning": "It means this."}
+    llm._response = {**_NO_QUESTION_ALL_FIELDS, "meaning": "It means this."}
     await resolve_clarification_and_finish(db, llm, unit, "It means this.")
 
-    assert len(llm.prompts) == 1
-    prompt = llm.prompts[0]
-    assert "Y" * MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS in prompt
-    assert "Y" * (MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS + 1) not in prompt
+    capped = "Y" * MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS
+    overcapped = "Y" * (MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS + 1)
+    assert any(capped in p for p in llm.prompts)
+    assert all(overcapped not in p for p in llm.prompts)

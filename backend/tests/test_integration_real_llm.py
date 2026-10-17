@@ -12,7 +12,6 @@ import httpx
 import pytest
 
 from app.config import get_settings
-from app.ingestion.pipeline import create_capture
 from app.llm.ollama_provider import OllamaProvider
 from app.retrieval.agent import run_agent
 from tests.helpers import create_capture_and_finish, resolve_clarification_and_finish
@@ -72,19 +71,17 @@ async def test_acceptance_clarification_alias_retrieval(db, real_llm):
 
 
 async def test_segmentation_acceptance_compound_vs_coherent(db, real_llm):
-    compound = await create_capture(
+    compound = await create_capture_and_finish(
         db,
         real_llm,
         text="My AHV number is 123456789. Anna is studying robotics. I need to renew my passport next March.",
-        uploads=[],
     )
     assert len(compound.units) >= 2, "unrelated facts should become independently retrievable units"
 
-    coherent = await create_capture(
+    coherent = await create_capture_and_finish(
         db,
         real_llm,
         text="I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing.",
-        uploads=[],
     )
     assert len(coherent.units) == 1, "a single coherent episode may remain one contextual unit"
 

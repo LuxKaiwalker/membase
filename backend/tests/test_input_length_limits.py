@@ -16,17 +16,17 @@ from tests.helpers import create_capture_and_finish
 async def test_capture_text_over_limit_is_rejected(db, fake_llm):
     max_chars = get_settings().membase_max_text_chars
     with pytest.raises(IngestionError):
-        await create_capture(db, fake_llm, text="x" * (max_chars + 1), uploads=[])
+        await create_capture(db, text="x" * (max_chars + 1), uploads=[])
 
 
 async def test_capture_text_at_limit_is_accepted(db, fake_llm):
     max_chars = get_settings().membase_max_text_chars
-    capture = await create_capture(db, fake_llm, text="x" * max_chars, uploads=[])
+    capture = await create_capture_and_finish(db, fake_llm, text="x" * max_chars)
     assert capture.units
 
 
 async def test_correction_over_limit_is_rejected(db, fake_llm):
-    capture = await create_capture_and_finish(db, fake_llm, text="A short memory.", uploads=[])
+    capture = await create_capture_and_finish(db, fake_llm, text="A short memory.")
     unit = capture.units[0]
     max_chars = get_settings().membase_max_text_chars
     with pytest.raises(IngestionError):
@@ -34,8 +34,8 @@ async def test_correction_over_limit_is_rejected(db, fake_llm):
 
 
 async def test_clarification_answer_over_limit_is_rejected(db):
-    llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
-    capture = await create_capture(db, llm, text="My Flimvex PIN is 42.", uploads=[])
+    llm = FakeLLMProvider(clarification_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
+    capture = await create_capture_and_finish(db, llm, text="My Flimvex PIN is 42.")
     unit = capture.units[0]
     max_chars = get_settings().membase_max_text_chars
     with pytest.raises(IngestionError):

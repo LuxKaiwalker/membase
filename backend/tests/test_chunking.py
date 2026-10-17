@@ -7,7 +7,7 @@ from app.ingestion.pipeline import (
     add_attachments,
     create_capture,
     finish_attachment_chunking,
-    finish_image_captioning,
+    process_capture_fully,
 )
 from app.models import Attachment, AttachmentChunk
 from app.retrieval.pipeline import hybrid_search, hybrid_search_chunks
@@ -97,8 +97,8 @@ async def test_chunk_search_is_gated_until_a_sibling_unit_is_ready(db, no_min_ch
     hasn't finished confirming leaking into retrieval. hybrid_search_chunks
     must require at least one ready sibling unit in the same capture."""
     asks_question = {"clarification_question": "What is a Zorblex code?", "clarification_field": "Zorblex code"}
-    llm = FakeLLMProvider(enrichment_response=asks_question)
-    capture = await create_capture(
+    llm = FakeLLMProvider(clarification_response=asks_question)
+    capture = await create_capture_and_finish(
         db, llm, text="My Zorblex code is 42.", uploads=[("notes.txt", b"the secret launch code is 9981")]
     )
     unit = capture.units[0]
@@ -117,7 +117,7 @@ async def test_chunk_search_is_gated_until_a_sibling_unit_is_ready(db, no_min_ch
 
 
 async def test_posthoc_attachment_chunks_are_also_indexed(db, fake_llm, no_min_chunk_chars):
-    capture = await create_capture(db, fake_llm, text="Meeting notes.", uploads=[])
+    capture = await create_capture(db, text="Meeting notes.", uploads=[])
     capture = await add_attachment(db, fake_llm, capture, "later.txt", b"the budget is 50000 dollars")
     chunks = db.query(AttachmentChunk).filter(AttachmentChunk.capture_id == capture.id).all()
     assert len(chunks) == 1
@@ -158,7 +158,7 @@ async def test_one_bad_file_in_a_batch_attaches_none_of_them(db, fake_llm):
     """Validation is atomic across the batch (see docs/DECISIONS.md) --
     a rejected file must not leave the other, otherwise-valid files of
     the same request attached."""
-    capture = await create_capture(db, fake_llm, text="Meeting notes.", uploads=[])
+    capture = await create_capture(db, text="Meeting notes.", uploads=[])
 
     with pytest.raises(IngestionError):
         await add_attachments(
@@ -208,20 +208,23 @@ async def test_uploaded_image_is_captioned_and_becomes_searchable(db):
 
 async def test_image_captioning_failure_leaves_image_stored_but_uncaptioned(db):
     """Best-effort, same tolerance as every other derived LLM step in
-    this pipeline -- and, per the streamlining mandate, captioning can't
-    block memory formation at all any more: create_capture() must
-    succeed (and never even call the LLM for the image) regardless of
-    whether captioning would later fail."""
+    this pipeline: create_capture() (Phase 0) never even calls the LLM
+    for the image, and a subsequent captioning failure inside
+    process_capture_fully() must not block the rest of the capture's
+    formation -- the unit still reaches "ready", just without this
+    image's content folded in."""
     llm = FakeLLMProvider(fail="unavailable")
-    capture = await create_capture(db, llm, text="Photo.", uploads=[("photo.png", _png_bytes())])
+    capture = await create_capture(db, text="Photo.", uploads=[("photo.png", _png_bytes())])
     attachment = db.query(Attachment).filter(Attachment.capture_id == capture.id).one()
     assert attachment.extraction_status == "unsupported"
     assert attachment.extracted_text is None
 
-    await finish_image_captioning(attachment.id, llm=llm)
+    await process_capture_fully(capture.id, llm=llm)
     db.refresh(attachment)
     assert attachment.extraction_status == "unsupported"
     assert attachment.extracted_text is None
+    db.refresh(capture)
+    assert capture.units[0].status == "ready"
 
 
 async def test_image_caption_response_accepts_a_list_for_per_image_captions(db):
@@ -231,20 +234,13 @@ async def test_image_caption_response_accepts_a_list_for_per_image_captions(db):
     (the documented convention every other param supports, for a
     different response per call) left raw strings in the queue, and
     next()["caption"] would crash with a TypeError on a plain string.
-    Each image is now captioned by its own independent background task
-    (see docs/DECISIONS.md "Decouple image captioning"), driven here one
-    at a time in upload order."""
+    Each image is captioned in attachment order (see
+    process_capture_fully), matching upload order here."""
     llm = FakeLLMProvider(image_caption_response=["first caption", "second caption"])
-    capture = await create_capture(
-        db,
-        llm,
-        text="Two photos.",
+    capture = await create_capture_and_finish(
+        db, llm, text="Two photos.",
         uploads=[("one.png", _png_bytes()), ("two.png", _png_bytes())],
     )
-    attachments = db.query(Attachment).filter(Attachment.capture_id == capture.id).order_by(Attachment.original_filename).all()
-    for attachment in attachments:
-        await finish_image_captioning(attachment.id, llm=llm)
-    db.expire_all()
 
     attachments = db.query(Attachment).filter(Attachment.capture_id == capture.id).order_by(Attachment.original_filename).all()
     captions = {a.original_filename: a.extracted_text for a in attachments}

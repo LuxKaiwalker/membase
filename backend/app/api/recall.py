@@ -4,7 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.ingestion.pipeline import IngestionError, create_capture, finish_unit_processing
+from app.ingestion.pipeline import IngestionError, create_capture, process_capture_fully
 from app.llm import get_llm_provider
 from app.llm.base import LLMProvider
 from app.models import RecallSession
@@ -146,7 +146,6 @@ async def save_as_memory(
     body: SaveAsMemoryRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    llm: LLMProvider = Depends(get_llm_provider),
 ):
     """Explicit user action (see docs/DECISIONS.md "Save as memory"):
     creates a brand-new Capture through the ordinary storage pipeline --
@@ -163,10 +162,8 @@ async def save_as_memory(
     if not text or text not in user_supplied_texts(session):
         raise HTTPException(status_code=400, detail="text must match something you said in this session")
     try:
-        capture = await create_capture(db, llm, text=text, uploads=[])
+        capture = await create_capture(db, text=text, uploads=[])
     except IngestionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    for unit in capture.units:
-        if unit.status == "processing":
-            background_tasks.add_task(finish_unit_processing, unit.id)
+    background_tasks.add_task(process_capture_fully, capture.id)
     return capture
