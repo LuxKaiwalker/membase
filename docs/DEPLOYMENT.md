@@ -383,7 +383,12 @@ was specifically about avoiding.
 ## Deployment checklist
 
 1. Run `scripts/run-prod.sh` (not `run-dev.sh`) for anything other than
-   active local development.
+   active local development. It runs against its own `membase_prod`
+   database (same Postgres cluster as the `membase` dev database, just
+   a different name -- see CLAUDE.md footgun #10) -- never point a
+   long-running, publicly-reachable backend process at plain `membase`,
+   since that's exactly what `pytest`'s `db` fixture truncates before
+   every test.
 2. Set up nginx + Cloudflare Tunnel per "nginx + Cloudflare Tunnel"
    above -- generate the htpasswd file with a real password before
    the tunnel is live, not the placeholder you tested with.

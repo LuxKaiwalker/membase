@@ -109,6 +109,19 @@ elsewhere.
    a time; `scripts/run-eval.sh`/`run-session-eval.sh`/
    `sweep-threshold.sh` avoid this by using an isolated `membase_eval`
    database instead, but the default `pytest` run does not.
+10. **The live production backend now runs against its own `membase_prod`
+    database, separate from the `membase` dev database `pytest` targets**
+    (`scripts/run-prod.sh`, same isolation pattern as #9's `membase_eval`
+    -- all three are just database names on the same project-local
+    Postgres cluster, same `PGHOST_DIR`/`PGPORT`). This exists because
+    footgun #9 used to apply to the *production* process too: before this
+    split, `pytest`'s `TRUNCATE` ran against the exact same database the
+    live backend was reading/writing in production, and really did wipe
+    every stored memory for real on this machine (see git history, the
+    "separate production database" commit) while this backend was
+    actively serving traffic. Never point `scripts/run-prod.sh` (or
+    whatever ends up running the live backend) at the plain `membase`
+    database again.
 
 ## Key architecture terms (see docs/ARCHITECTURE.md for the full picture)
 
