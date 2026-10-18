@@ -139,3 +139,7 @@ tests against fakes.
 
 What this investigation hasn't settled yet.
 </details>
+
+## License
+
+[MIT](LICENSE)

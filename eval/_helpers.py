@@ -1,18 +1,27 @@
-"""Shared helper for eval scripts: driving the now-backgrounded
-enrichment step to completion.
+"""Shared helpers for eval scripts: driving the now-backgrounded
+ingestion pipeline to completion.
 
 Mirrors backend/tests/helpers.py's create_capture_and_finish() -- eval
 scripts call the real pipeline functions directly (create_capture(),
-resolve_clarification()), not through the HTTP API, so there's no
-FastAPI BackgroundTasks machinery to run finish_unit_processing()
-automatically. Without this, every capture an eval script creates
-stays in status="processing" forever and is invisible to hybrid_search()
-(which only returns status="ready" units) -- see docs/DECISIONS.md.
+process_capture_fully(), resolve_clarification()), not through the HTTP
+API, so there's no FastAPI BackgroundTasks machinery to run
+process_capture_fully()/finish_unit_processing() automatically. Without
+this, every capture an eval script creates stays in status="processing"
+forever (and `capture.units` stays `[]`, since segmentation itself now
+happens inside process_capture_fully() -- see docs/DECISIONS.md "Restore
+the multi-call ingestion pipeline") and is invisible to hybrid_search()
+(which only returns status="ready" units).
 """
 
 from sqlalchemy import text as sql_text
 
-from app.ingestion.pipeline import finish_unit_processing
+from app.ingestion.pipeline import (
+    create_capture,
+    finish_attachment_chunking,
+    finish_unit_processing,
+    process_capture_fully,
+    should_chunk,
+)
 
 # Every eval entry point TRUNCATEs its tables per case/run. That's safe
 # against the isolated `membase_eval` database the scripts/*.sh wrappers
@@ -38,11 +47,38 @@ def assert_eval_database(db) -> None:
         )
 
 
+async def create_capture_and_finish(db, llm, *, text, uploads=None, explicit_metadata=None, allow_clarification=True):
+    """create_capture() (Phase 0: raw text + attachments, zero LLM calls)
+    + process_capture_fully() (segmentation, clarification, enrichment,
+    embedding) + a non-image attachment's independently-scheduled
+    chunking, synchronously -- the eval-script equivalent of "wait for
+    the background task to complete". Same pattern as
+    backend/tests/helpers.py's create_capture_and_finish(); duplicated
+    rather than imported since eval/ and backend/tests/ aren't on a
+    shared import path.
+    """
+    capture = await create_capture(
+        db, text=text, uploads=uploads or [], explicit_metadata=explicit_metadata, allow_clarification=allow_clarification
+    )
+    await process_capture_fully(capture.id, llm=llm)
+    db.expire_all()
+    db.refresh(capture)
+    for attachment in capture.attachments:
+        if not attachment.content_type.startswith("image/") and should_chunk(attachment.extracted_text):
+            await finish_attachment_chunking(attachment.id, llm=llm)
+    db.expire_all()
+    db.refresh(capture)
+    return capture
+
+
 async def finish_processing(db, llm, *captures) -> None:
     """For each given Capture, run finish_unit_processing() for every
-    unit still in status="processing" (i.e. not waiting on a pending
-    clarification question) -- the eval-script equivalent of "wait for
-    the background task to complete"."""
+    unit still in status="processing" -- used after resolve_clarification()
+    answers a pending question, which can put a unit back into
+    status="processing" until enrichment finishes. Captures returned by
+    create_capture_and_finish() are already fully processed, so calling
+    this on them again is a harmless no-op (no unit will be
+    status="processing")."""
     for capture in captures:
         for unit in capture.units:
             if unit.status == "processing":

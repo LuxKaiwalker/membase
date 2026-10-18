@@ -543,6 +543,8 @@ discarding, with no obligatory mode.
 
 ---
 
+## Gemma 4 migration
+
 **Decision:** Migrated the single generation model from
 `qwen2.5:14b-instruct-q4_K_M` to `gemma4:12b` (Google, released June
 2026), used for every generation/structured-output call exactly as qwen
@@ -905,6 +907,8 @@ behavioral difference the current UI/eval set exercises.)
 
 ---
 
+## Explicit metadata authority
+
 **Decision:** Direct structured metadata entry (Location, Date, People,
 Organizations, Topics) is accepted as an optional JSON-encoded `metadata`
 form field on `POST /api/captures`, stored verbatim on
@@ -1003,6 +1007,8 @@ docs/TODO.md for what evidence would justify any of those.
 
 ---
 
+## RecallSession canonical
+
 **Decision:** `RecallSession` (`app/retrieval/session.py`) is now the
 canonical retrieval architecture end to end, including for the
 "stateless" one-shot endpoint. `POST /api/recall` no longer calls
@@ -1031,6 +1037,8 @@ session machinery: the eval harness (`eval/run_eval.py`) and latency
 benchmarks. It is no longer used by any HTTP-facing path.
 
 ---
+
+## Deterministic sufficiency short-circuit
 
 **Decision:** A deterministic bypass (`_is_high_confidence` in
 `app/retrieval/agent.py`) skips the `evaluate_sufficiency()` LLM call
@@ -1061,6 +1069,8 @@ overfitting to 30 hand-written cases rather than reflecting a real
 distribution.
 
 ---
+
+## Reduce automatic retrieval iterations
 
 **Decision:** `MAX_AGENT_ITERATIONS` reduced 3 -> 2, and
 `MAX_REFORMULATIONS_PER_ROUND` reduced 2 -> 1 (`app/retrieval/agent.py`).
@@ -1182,6 +1192,8 @@ deferred item"), the backend capability is complete and tested
 docs/TODO.md.
 
 ---
+
+## Dedupe query embeddings
 
 **Decision:** `hybrid_search()` and `hybrid_search_chunks()`
 (`app/retrieval/pipeline.py`) now accept an optional `query_vector`
@@ -1344,6 +1356,29 @@ files" button) was added for this -- initially placed on the Browse
 page, then moved to the Store page's own post-save result card after
 feedback that it belongs where the user's attention already is right
 after saving (see "Store page simplified" below).
+
+---
+
+## Chunk long captures before analysis
+
+**Decision:** `segment_capture()` (`app/ingestion/segmentation.py`)
+splits a capture's raw text into sentence-bounded chunks (via
+`_chunk_text`, `MAX_SEGMENT_CHARS_PER_CALL = 600` chars) before
+segmenting, one LLM call per chunk, concatenating the results -- rather
+than always sending the whole capture as a single call. `MAX_SEGMENT_UNITS`
+(the cap on units one capture can produce) was raised from 8 to 24 once
+a long/dense capture became a correctly-handled case via this chunking,
+rather than something the cap needed to defend against.
+
+**Reason:** A single generation call's fixed context budget (~4096
+tokens, shared between input and output) previously meant a long capture
+with many distinct facts could come back as one collapsed blob instead
+of correctly split units -- the model's own output was budget-starved,
+not wrong about the content. Chunking the *input* keeps each call's
+proposed-units output small enough to fit comfortably, while
+`is_verbatim` (checked per chunk, never across a reconstructed whole)
+keeps the verbatim-content guarantee intact regardless of where a chunk
+boundary falls.
 
 ---
 

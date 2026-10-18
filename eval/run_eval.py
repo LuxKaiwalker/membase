@@ -15,9 +15,9 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from _helpers import assert_eval_database, finish_processing  # noqa: E402
+from _helpers import assert_eval_database, create_capture_and_finish, finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
-from app.ingestion.pipeline import create_capture, resolve_clarification  # noqa: E402
+from app.ingestion.pipeline import resolve_clarification  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
 from app.retrieval.agent import run_agent  # noqa: E402
 
@@ -30,26 +30,22 @@ async def run_case(db, llm, case: dict) -> tuple[bool, str, str]:
     own_captures = []
     own_units = []
     for text in case.get("memories", []):
-        capture = await create_capture(db, llm, text=text, uploads=[])
+        capture = await create_capture_and_finish(db, llm, text=text)
         own_captures.append(capture)
         own_units.extend(capture.units)
-    # Full enrichment is now a backgrounded step (see docs/DECISIONS.md)
-    # with no FastAPI BackgroundTasks machinery here to run it
-    # automatically -- without this, every unit stays status="processing"
-    # and is invisible to hybrid_search(), which only returns "ready".
-    await finish_processing(db, llm, *own_captures)
 
     if case.get("clarification_answer"):
         for unit in own_units:
             if unit.pending_clarification:
                 await resolve_clarification(db, llm, unit, case["clarification_answer"])
                 break
+        # Answering a question can put a unit back into status="processing"
+        # until enrichment finishes -- see eval/_helpers.py.
         await finish_processing(db, llm, *own_captures)
 
     distractor_captures = []
     for text in case.get("distractors", []):
-        distractor_captures.append(await create_capture(db, llm, text=text, uploads=[]))
-    await finish_processing(db, llm, *distractor_captures)
+        distractor_captures.append(await create_capture_and_finish(db, llm, text=text))
 
     segmentation_note = f"{len(own_units)} unit(s)"
     expect_units = case.get("expect_units")

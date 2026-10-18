@@ -1346,8 +1346,7 @@ def delete_capture(db: Session, capture: Capture) -> None:
 def discard_unit(db: Session, unit: MemoryUnit) -> MemoryUnit:
     """Explicit user cancellation of a unit awaiting clarification.
     Deliberately a status flip, not a hard delete. Plain `def`, not
-    `async def` -- no `await` inside, same reasoning as require_auth
-    in app/auth.py."""
+    `async def` -- no `await` inside."""
     unit.status = "discarded"
     unit.pending_clarification = None
     db.commit()

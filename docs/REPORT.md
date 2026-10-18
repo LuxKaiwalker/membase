@@ -157,11 +157,12 @@ image.
 
 ## 9. Deferred / not done
 
-- **`docs/REPORT.md`'s own historical sections** (this file, previous
-  phase) on contradiction handling, recall-session deferred items, and
-  the eval-threshold sweep are unaffected by this work and weren't
-  re-verified here -- see the superseded report's sections 5/8/9/10 if
-  still relevant.
+- **Earlier phases' findings on contradiction handling, recall-session
+  deferred items, and the eval-threshold sweep** are unaffected by this
+  work and weren't re-verified here. This file is fully rewritten each
+  phase rather than appended to, so those findings aren't preserved in
+  the working tree -- see `git log -- docs/REPORT.md` for prior
+  revisions if still relevant.
 - **No wall-clock baseline** for the background task's own total
   duration (see section 3) -- nothing is waiting on it, so not
   instrumented.

@@ -44,11 +44,17 @@ this app gates access to your stored memories.
   `Path(filename).name` (strips any directory components) plus a fresh
   UUID prefix -- a filename like `../../etc/passwd` can't escape the
   per-capture upload directory.
-- **No unauthenticated file-serving route exists at all.** `/static`
-  only serves `app/static/` (the JS/CSS themselves); uploaded
-  attachments are never served back over HTTP by any route -- they're
-  write-only from the API's perspective. (This is also a minor product
-  gap -- see "Known non-blocking gaps" below.)
+- **The backend is API-only -- no `/static` mount, no HTML page routes.**
+  The frontend (templates + static JS/CSS) is published separately to
+  GitHub Pages (see "Publishing the frontend to GitHub Pages" below); this
+  process never serves it over HTTP. `GET /api/attachments/{id}/file`
+  (`app/api/attachments.py`) is the one route that serves file bytes back
+  to a caller -- an uploaded attachment's original content, for
+  view/download in the Store/Browse/Recall UIs (see docs/DECISIONS.md
+  "Attachment view/download"). It's covered by the same nginx Basic Auth
+  as every other route; `stored_path` is always server-generated (never
+  derived from user input), so there's no path-traversal risk in serving
+  from it directly.
 - **Image decompression-bomb protection is intact.** Nothing in this
   codebase touches `PIL.Image.MAX_IMAGE_PIXELS`; Pillow's own default
   guard is untouched.
@@ -128,13 +134,20 @@ arbitrary custom domain).
 
 **Setup:**
 
+`deploy/nginx-membase.conf` and `deploy/cloudflared-config.yml` are
+tracked as generic templates with placeholder hostnames
+(`your-app-api.example.com`, `https://your-app.example.com`) and a
+placeholder tunnel ID -- substitute your own values rather than editing
+the tracked files in place, and keep your real, filled-in copies
+untracked (see "Keeping your real deploy config" below).
+
 1. **nginx**: copy `deploy/nginx-membase.conf` in (as a traditional
    `/etc/nginx/sites-enabled/` file, or adapted into a NixOS
    `services.nginx.virtualHosts` block's `extraConfig` -- the file
-   itself is portable either way). It listens on `127.0.0.1:8080` only
-   -- TLS is already terminated by Cloudflare's edge before
-   `cloudflared` ever forwards a request here, so nginx never needs
-   its own certificate.
+   itself is portable either way), with your real hostnames substituted
+   in. It listens on `127.0.0.1:8080` only -- TLS is already terminated
+   by Cloudflare's edge before `cloudflared` ever forwards a request
+   here, so nginx never needs its own certificate.
 2. **Basic Auth credentials**: generate the htpasswd file nginx's
    config points at:
    ```
@@ -143,34 +156,41 @@ arbitrary custom domain).
    (prompts for the password interactively; `openssl passwd -apr1` is
    used instead of requiring the separate `apache2-utils`/`httpd`
    package just for its `htpasswd` binary).
-3. **Cloudflare Tunnel**: uses `membase-api.vxliu.com`, **not** the
-   bare `membase.vxliu.com` -- that hostname is already GitHub Pages'
-   custom domain for the frontend (see "Publishing the frontend to
-   GitHub Pages" below and docs/DECISIONS.md "Cloudflare Tunnel for
-   CGNAT-safe public reachability"), and one hostname can't point at
-   both. Also deliberately *not* `api.membase.vxliu.com` -- that's two
-   subdomain levels below the zone apex, which Cloudflare's free
-   Universal SSL cert doesn't cover (only `vxliu.com` and `*.vxliu.com`,
-   one level); a hostname that deep gets a TLS handshake failure, not a
-   clean error, so this is easy to get wrong and only notice once you
-   actually test the connection. Requires `vxliu.com`'s DNS to be hosted
-   on Cloudflare first
-   (point the domain's nameservers at Cloudflare, or add it as a site
-   there) -- this covers `membase-api.vxliu.com` too, as a subdomain of
-   the same zone. Then:
+3. **Cloudflare Tunnel**: pick a backend hostname that's a **sibling**
+   subdomain of your frontend's (e.g. frontend `app.your-domain.com`,
+   backend `app-api.your-domain.com`), **not** a child of it (e.g.
+   `api.app.your-domain.com`) -- that's two subdomain levels below the
+   zone apex, which Cloudflare's free Universal SSL cert doesn't cover
+   (only the apex and one wildcard level, `*.your-domain.com`); a
+   hostname that deep gets a TLS handshake failure, not a clean error,
+   so this is easy to get wrong and only notice once you actually test
+   the connection. See docs/DECISIONS.md "Cloudflare Tunnel for
+   CGNAT-safe public reachability" for the full reasoning. Requires your
+   domain's DNS to be hosted on Cloudflare first (point its nameservers
+   at Cloudflare, or add it as a site there) -- this covers both
+   hostnames, since they're in the same zone. Then:
    ```
    cloudflared tunnel login
    cloudflared tunnel create membase
-   cloudflared tunnel route dns membase membase-api.vxliu.com
+   cloudflared tunnel route dns membase your-app-api.example.com
    ```
    Copy `deploy/cloudflared-config.yml` to wherever `cloudflared`
-   expects it, filling in the tunnel ID and credentials-file path
-   `tunnel create` printed. Run it (`cloudflared tunnel run membase`,
-   or via the NixOS `services.cloudflared` module / a systemd unit for
-   anything longer-running than a manual test).
-4. Confirm end to end: `curl -u yourusername https://membase-api.vxliu.com/api/captures`
+   expects it, filling in the tunnel ID, credentials-file path, and
+   hostname `tunnel create`/`route dns` used. Run it (`cloudflared
+   tunnel run membase`, or via the NixOS `services.cloudflared` module /
+   a systemd unit for anything longer-running than a manual test).
+4. Confirm end to end: `curl -u yourusername https://your-app-api.example.com/api/captures`
    should prompt for the password and then return `[]` (or your real
    captures) -- not a connection error, not an unauthenticated 200.
+
+### Keeping your real deploy config
+
+The tracked `deploy/*.conf`/`deploy/*.yml` files are generic templates,
+not your actual production config -- same convention as `.env.example`
+vs. `.env` (see `.env.example`'s own header comment). Keep your real,
+filled-in copies under `deploy/local/`, which `.gitignore` excludes
+entirely, so your actual hostnames/tunnel ID never need to touch a
+tracked file (or a commit) at all.
 
 This fully replaces the old "put *a* TLS-terminating reverse proxy in
 front" advice from earlier revisions of this doc -- nginx here never
@@ -185,7 +205,7 @@ Cloudflare can do several of the same things (security headers, rate
 limiting) at the edge. Reason: the backend machine is also on a
 Tailscale tailnet; an edge-only approach would only protect requests
 that actually go through the Cloudflare Tunnel hostname, leaving a
-direct Tailscale hit to the machine (bypassing `membase-api.vxliu.com`
+direct Tailscale hit to the machine (bypassing `your-app-api.example.com`
 entirely) with no auth at all, since the app itself has none anymore.
 nginx sits in front of the app regardless of which path a request
 takes to reach the machine, so it stays authoritative for Basic Auth.
@@ -201,11 +221,11 @@ covers:
    Strict-Transport-Security`, since it's set directly on the response
    the browser actually negotiated TLS with.
 2. **Rules → Transform Rules → Modify Response Header**, for
-   `membase-api.vxliu.com`: `X-Content-Type-Options: nosniff`,
+   `your-app-api.example.com`: `X-Content-Type-Options: nosniff`,
    `X-Frame-Options: DENY`, `Referrer-Policy:
    strict-origin-when-cross-origin` -- mirrors `deploy/nginx-membase.conf`'s
    headers, applied before the response ever re-enters the tunnel.
-3. **Security → WAF → Rate limiting rules**, for `membase-api.vxliu.com`:
+3. **Security → WAF → Rate limiting rules**, for `your-app-api.example.com`:
    a looser outer bound (e.g. 50 req/min per IP) than nginx's own
    `limit_req` (10 req/s) -- catches gross abuse before it ever
    consumes tunnel bandwidth, while nginx's tighter limit still does
@@ -220,12 +240,12 @@ dashboard rather than trusting a specific quota here.
 ## Publishing the frontend to GitHub Pages
 
 The frontend (`backend/app/templates/*.html` + `backend/app/static/`)
-is published separately from the backend, to GitHub Pages under the
-custom domain `membase.vxliu.com` -- **not** `membase-api.vxliu.com`,
-which is the backend's own hostname (see "nginx + Cloudflare Tunnel"
-above; the two can't be the same hostname, see docs/DECISIONS.md
-"Cloudflare Tunnel for CGNAT-safe public reachability" for how that
-conflict got resolved).
+is published separately from the backend, to GitHub Pages under its own
+custom domain (this project's live deployment uses `membase.vxliu.com`,
+set via the repo-root `CNAME` file) -- **not** whatever hostname you pick
+for the backend in "nginx + Cloudflare Tunnel" above; the two can't be
+the same hostname, see docs/DECISIONS.md "Cloudflare Tunnel for
+CGNAT-safe public reachability" for how that conflict got resolved.
 
 The four page templates (`create`, `recall`, `captures`, `docs`) render
 with an empty context -- no `{{ }}` variable interpolation in any of
@@ -260,8 +280,10 @@ the artifact is produced fresh per deploy.
 CORS is handled by nginx (`deploy/nginx-membase.conf`), not a backend
 env var -- see docs/DECISIONS.md "Move CORS to nginx: an app-level
 CORSMiddleware can't cover a proxy-level rejection". Nothing to set on
-the backend for this; the allowed origin is the hardcoded
-`https://membase.vxliu.com` in that nginx config file.
+the backend for this; the allowed origin is whatever hostname you put in
+that nginx config file's `Access-Control-Allow-Origin` -- it must match
+your frontend's real domain exactly (this project's live deployment uses
+`https://membase.vxliu.com`).
 
 ## Auth system ideas (alternatives considered)
 
@@ -422,7 +444,3 @@ was specifically about avoiding.
   staying current means tracking a newer `nixpkgs` revision in
   `flake.lock`, not a separate `pip`-style audit. Not checked how far
   behind the pinned revision currently is.
-- **Uploaded attachments can never be viewed/downloaded again** -- a
-  product gap noted during this audit, not a security one (if anything,
-  having zero file-serving routes is the safer state). Would need a new
-  authenticated route if ever wanted.

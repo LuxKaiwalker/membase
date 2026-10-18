@@ -12,12 +12,21 @@
 # FastAPI backend (127.0.0.1:8000) -- nginx is what does Basic Auth, security
 # headers, rate limiting, and the body-size cap; skipping it here would
 # bypass all of that.
+#
+# <TUNNEL_ID>, the credentials-file path, and the hostname below are all
+# placeholders -- `cloudflared tunnel create <name>` prints the real
+# tunnel ID and credentials-file path to fill in, and the hostname should
+# be your own backend hostname (see docs/DEPLOYMENT.md "nginx + Cloudflare
+# Tunnel" for why it should be a *sibling* subdomain of your frontend's,
+# not a child of it). Keep your real, filled-in copy untracked -- see
+# docs/DEPLOYMENT.md's "Keeping your real deploy config" for the
+# convention this repo uses for that.
 
-tunnel: 815ad8c7-1554-416e-a2f2-15a9f27bd98e
-credentials-file: /root/.cloudflared/815ad8c7-1554-416e-a2f2-15a9f27bd98e.json
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
-  - hostname: membase-api.vxliu.com
+  - hostname: your-app-api.example.com
     service: http://127.0.0.1:8080
   # Required catch-all -- cloudflared refuses to start without one.
   - service: http_status:404

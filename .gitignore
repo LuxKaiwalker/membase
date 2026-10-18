@@ -9,3 +9,9 @@ __pycache__/
 .direnv/
 result
 result-*
+
+# Real, filled-in deploy configs (see docs/DEPLOYMENT.md "Keeping your
+# real deploy config") -- deploy/*.yml and deploy/*.conf are tracked as
+# generic, placeholder-filled templates; keep your own real copies here,
+# never committed.
+deploy/local/

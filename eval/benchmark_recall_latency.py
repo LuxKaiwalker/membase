@@ -23,9 +23,9 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from _helpers import assert_eval_database, finish_processing  # noqa: E402
+from _helpers import assert_eval_database, create_capture_and_finish, finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
-from app.ingestion.pipeline import create_capture, resolve_clarification  # noqa: E402
+from app.ingestion.pipeline import resolve_clarification  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
 from app.llm.base import LLMProvider  # noqa: E402
 from app.retrieval.agent import run_agent  # noqa: E402
@@ -90,20 +90,20 @@ async def ingest_corpus(db, llm, cases: list[dict]) -> None:
         captures = []
         own_units = []
         for text in case.get("memories", []):
-            capture = await create_capture(db, llm, text=text, uploads=[])
+            capture = await create_capture_and_finish(db, llm, text=text)
             captures.append(capture)
             own_units.extend(capture.units)
-        await finish_processing(db, llm, *captures)
         if case.get("clarification_answer"):
             for unit in own_units:
                 if unit.pending_clarification:
                     await resolve_clarification(db, llm, unit, case["clarification_answer"])
                     break
+            # Answering a question can put a unit back into
+            # status="processing" until enrichment finishes.
             await finish_processing(db, llm, *captures)
         distractor_captures = [
-            await create_capture(db, llm, text=text, uploads=[]) for text in case.get("distractors", [])
+            await create_capture_and_finish(db, llm, text=text) for text in case.get("distractors", [])
         ]
-        await finish_processing(db, llm, *distractor_captures)
         print(f"  ingested: {case['name']}", flush=True)
 
 
@@ -113,8 +113,8 @@ async def main() -> int:
     # size (hybrid_search's own DB query is fast regardless; the slow
     # part is always the LLM calls) -- capping how many cases get
     # ingested keeps this benchmark's setup phase fast without making
-    # the actual timing numbers any less representative. Override with
-    # Defaults to 8 cases; set BENCHMARK_CASE_LIMIT=0 to use the full set.
+    # the actual timing numbers any less representative. Defaults to 8
+    # cases; set BENCHMARK_CASE_LIMIT=0 to use the full set.
     import os
 
     limit = int(os.environ.get("BENCHMARK_CASE_LIMIT", "8") or 0)

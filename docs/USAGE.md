@@ -38,10 +38,28 @@ scripts/dev-db.sh start     # inits/starts a project-local Postgres
 scripts/run-dev.sh          # starts uvicorn with --reload
 ```
 
-Open http://127.0.0.1:8000/ to store a memory,
-http://127.0.0.1:8000/recall to query it, and
-http://127.0.0.1:8000/captures to browse or delete what's stored. The
-server binds to localhost only, by design (see `docs/DECISIONS.md`).
+The backend is API-only (no HTML page routes, no `/static` mount --
+everything outside `/api/*` 404s, see `docs/DECISIONS.md` "API-only
+backend: stop serving the frontend's own HTML/static files"), so
+`127.0.0.1:8000` itself has no web UI to open. Hit the API directly, e.g.:
+
+```sh
+curl -X POST 127.0.0.1:8000/api/captures -F text="Dentist appointment next Tuesday at 3pm"
+curl -X POST 127.0.0.1:8000/api/recall -d '{"query": "when is my dentist appointment"}' -H 'Content-Type: application/json'
+```
+
+The actual web UI (`backend/app/templates/` + `backend/app/static/`) is
+published separately to GitHub Pages (see `docs/DEPLOYMENT.md`
+"Publishing the frontend to GitHub Pages") and its JS has this project's
+production backend URL hardcoded at the source level (`BACKEND_URL` in
+`app.js`, see `docs/DECISIONS.md` "Hardcode the backend URL instead of
+asking for it at login") -- it does not point at a local dev server out
+of the box. To exercise the UI against your local backend instead,
+temporarily point `BACKEND_URL` at `http://127.0.0.1:8000`, run
+`python3 scripts/build_frontend.py`, then serve `dist/` with a plain
+static file server (e.g. `python3 -m http.server --directory dist`) --
+the rendered pages reference `/static/...` as an absolute path, so they
+need to be served from a web root, not opened directly as `file://`.
 
 To stop Postgres: `scripts/dev-db.sh stop`.
 
@@ -77,9 +95,9 @@ A unit may surface a clarification question if something is genuinely
 unclear (an unfamiliar term, an unresolvable relative date) — a fast,
 narrow check that runs *before* the heavier semantic-extraction step, so
 you see the question without waiting on it (see `docs/ARCHITECTURE.md`).
-Up to 3 relevant questions can come out of one check (asked one at a
-time, never as a batch), and up to 3 rounds total if an answer reveals
-something new worth asking — bounded so the system can't turn into an
+Clarification is strictly sequential — one question at a time, never a
+pre-generated batch — and bounded to 3 rounds total if an answer reveals
+something new worth asking, so the system can't turn into an
 interrogation. **A unit with an open question is durably saved but not
 yet searchable** — it only becomes visible to recall once answered (via
 `POST /api/memory-units/{id}/clarify`) or explicitly discarded (`POST
@@ -94,6 +112,9 @@ Once no question is left pending, the heavier semantic-extraction step
 the save request — the unit sits briefly in `status="processing"` and
 the web UI polls until it's `"ready"` (see `docs/ARCHITECTURE.md`), so
 submitting a second memory never waits on the first one's enrichment.
+Once ready, a background "structurer" pass deepens the unit's semantic
+representation further over time, without ever blocking anything on it
+(see `docs/ARCHITECTURE.md`'s "The membase structurer" section).
 
 The original text and files are never modified by any of this. A
 committed memory can be corrected later in natural language (`POST
@@ -134,6 +155,7 @@ scripts/run-eval.sh            # 30-case one-shot hand-written eval set
 scripts/run-session-eval.sh    # iterative-recall eval set (multi-round, ambiguity, correction)
 scripts/run-interactive-benchmark.sh  # one-shot vs. LLM-assisted vs. interactive A/B/C comparison
 scripts/sweep-threshold.sh     # retrieval-threshold calibration experiment
+scripts/benchmark-recall-latency.sh   # per-round latency, broken down by LLM call kind
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings
 ```
 

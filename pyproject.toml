@@ -3,6 +3,7 @@ name = "membase"
 version = "0.1.0"
 description = "Self-hosted augmented personal memory MVP"
 requires-python = ">=3.13"
+license = "MIT"
 
 [tool.pytest.ini_options]
 pythonpath = ["backend"]

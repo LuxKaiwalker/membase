@@ -27,9 +27,9 @@ from sqlalchemy import text as sql_text
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from _helpers import assert_eval_database, finish_processing  # noqa: E402
+from _helpers import assert_eval_database, create_capture_and_finish, finish_processing  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
-from app.ingestion.pipeline import create_capture, resolve_clarification  # noqa: E402
+from app.ingestion.pipeline import resolve_clarification  # noqa: E402
 from app.llm import get_llm_provider  # noqa: E402
 import app.retrieval.pipeline as retrieval_pipeline  # noqa: E402
 
@@ -47,25 +47,24 @@ async def ingest_all_cases(db, llm, cases: list[dict]) -> list[dict]:
         own_ids: set = set()
         own_captures = []
         for text in case.get("memories", []):
-            capture = await create_capture(db, llm, text=text, uploads=[])
+            capture = await create_capture_and_finish(db, llm, text=text)
             own_captures.append(capture)
             for unit in capture.units:
                 if case.get("clarification_answer") and unit.pending_clarification:
                     unit = await resolve_clarification(db, llm, unit, case["clarification_answer"])
                 own_ids.add(unit.id)
-        # Full enrichment is now a backgrounded step (see
-        # docs/DECISIONS.md) -- without this, every unit stays
-        # status="processing" and hybrid_search() (status="ready" only)
-        # would score every threshold as zero recall.
+        # Answering a clarification question above can put a unit back
+        # into status="processing" until enrichment finishes -- without
+        # this, hybrid_search() (status="ready" only) would score every
+        # threshold as zero recall for that unit.
         await finish_processing(db, llm, *own_captures)
 
         distractor_ids: set = set()
         distractor_captures = []
         for text in case.get("distractors", []):
-            capture = await create_capture(db, llm, text=text, uploads=[])
+            capture = await create_capture_and_finish(db, llm, text=text)
             distractor_captures.append(capture)
             distractor_ids.update(u.id for u in capture.units)
-        await finish_processing(db, llm, *distractor_captures)
 
         results.append({"case": case, "own_ids": own_ids, "distractor_ids": distractor_ids})
         print(f"  ingested: {case['name']} ({len(own_ids)} own units, {len(distractor_ids)} distractor units)")

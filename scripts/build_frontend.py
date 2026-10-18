@@ -2,10 +2,12 @@
 """Builds the static frontend published to GitHub Pages (see
 docs/DEPLOYMENT.md "Publishing the frontend to GitHub Pages").
 
-The three page templates under backend/app/templates/ are pure structure
-with zero request-dependent data (app/web/routes.py renders each with an
-empty context dict) -- confirmed, not assumed, by grep: no `{{ }}`
-variable interpolation anywhere outside `{% block %}`/`{% extends %}`.
+The four page templates under backend/app/templates/ are pure structure
+with zero request-dependent data (rendered with an empty context dict,
+same as the backend's own app/web/routes.py used to before it was
+removed -- see docs/DECISIONS.md "API-only backend: stop serving the
+frontend's own HTML/static files") -- confirmed, not assumed, by grep: no
+`{{ }}` variable interpolation anywhere outside `{% block %}`/`{% extends %}`.
 That makes them safe to render exactly once, at build time, with plain
 Jinja2 (not FastAPI's Jinja2Templates wrapper, which needs a live
 Request object this script has no reason to construct).
