@@ -1,13 +1,15 @@
 # membase
 
-**A research prototype exploring augmented personal memory, combining
-information retrieval, language models, and human-computer
-interaction.**
+**A research prototype exploring augmented personal memory, combining information retrieval, language models, and human-computer interaction.**
 
-It is not a product. membase investigates what it takes to build a
-system that *remembers for you*. It should answer accurately and never
-invent things it doesn't actually know. That's different from a system
-that merely searches text or generates plausible-sounding answers.
+## Introduction
+
+As large language models increasingly rely on retrieval-augmented generation (RAG) and external memory systems, an important question is how information can be stored and retrieved in a way that feels natural to humans. Conventional information retrieval often assumes that users can formulate queries sufficiently close to the information they are looking for. Human recollection, however, is frequently incomplete and associative: people may remember a person, an event, a concept, or a vague connection without remembering the exact terminology or context.
+
+Membase is a investigation effort exploring how personal memory systems can accommodate this imperfect retrieval process. It combines semantic representations of stored information with lexical and vector search, while accomodating interactive retrieval mechanisms that help users refine their recollections through additional cues and clarification. Rather than attempting to reproduce the biological implementation of human memory, the project explores which of its functional characteristics can inform the design of external memory systems.
+
+The broader motivation is to make information safely offloadable to machines, allowing people to rely less on maintaining every detail in their own memory while retaining the ability to recover it when needed. The design principles investigated in membase may also inform memory architectures for AI agents and more general information retrieval interfaces.
+
 
 ## Areas of investigation
 
