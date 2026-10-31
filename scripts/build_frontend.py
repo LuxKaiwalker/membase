@@ -13,10 +13,12 @@ Jinja2 (not FastAPI's Jinja2Templates wrapper, which needs a live
 Request object this script has no reason to construct).
 
 Output layout (in `dist/`, the GitHub Pages publish artifact):
-    index.html              <- create.html (served at "/")
-    recall/index.html       <- recall.html (served at "/recall/")
-    captures/index.html     <- captures.html (served at "/captures/")
-    static/app.js, app.css  <- copied verbatim from backend/app/static/
+    index.html              <- landing.html (served at "/")
+    app/index.html          <- create.html (served at "/app/")
+    app/recall/index.html   <- recall.html (served at "/app/recall/")
+    app/captures/index.html <- captures.html (served at "/app/captures/")
+    static/app.js, app.css, landing.css
+                            <- copied verbatim from backend/app/static/
     .nojekyll               <- disables GitHub's Jekyll processing;
                                this is a plain static site, not a Jekyll
                                one, and Jekyll would otherwise try to
@@ -36,10 +38,10 @@ DIST_DIR = REPO_ROOT / "dist"
 
 # template name -> output path (relative to DIST_DIR)
 PAGES = {
-    "create.html": "index.html",
-    "recall.html": "recall/index.html",
-    "captures.html": "captures/index.html",
-    "docs.html": "docs/index.html",
+    "landing.html": "index.html",
+    "create.html": "app/index.html",
+    "recall.html": "app/recall/index.html",
+    "captures.html": "app/captures/index.html",
 }
 
 

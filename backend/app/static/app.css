@@ -85,7 +85,7 @@ header {
   z-index: 10;
 }
 
-.brand { font-weight: 700; }
+.brand { font-weight: 700; color: var(--fg); text-decoration: none; }
 
 nav a {
   color: var(--muted);

@@ -268,11 +268,12 @@ branch for it to prefer).
 `.github/workflows/pages.yml` handles the rest on every push to `main`
 that touches the frontend's own inputs (the templates,
 `backend/app/static/`, or the build script itself): runs
-`scripts/build_frontend.py` into `dist/` (`index.html` for `/`,
-`recall/index.html` for `/recall/`, `captures/index.html` for
-`/captures/`, `docs/index.html` for `/docs/`, `static/app.js`/`app.css`
-copied verbatim, a `.nojekyll` marker so GitHub's Jekyll processor
-leaves the plain HTML alone, and the repo-root `CNAME` copied in), then
+`scripts/build_frontend.py` into `dist/` (`index.html` for `/` -- the
+landing page -- `app/index.html` for `/app/`, `app/recall/index.html`
+for `/app/recall/`, `app/captures/index.html` for `/app/captures/`,
+`static/app.js`/`app.css`/`landing.css` copied verbatim, a `.nojekyll`
+marker so GitHub's Jekyll processor leaves the plain HTML alone, and the
+repo-root `CNAME` copied in), then
 publishes `dist/` via `actions/upload-pages-artifact` +
 `actions/deploy-pages`. Nothing built is ever committed to `main` --
 the artifact is produced fresh per deploy.

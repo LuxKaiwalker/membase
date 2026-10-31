@@ -1,0 +1,226 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1b1b1f;
+  --bg: #fafafa;
+  --muted: #6b6b76;
+  --accent: #3b5bdb;
+  --accent-soft: #e8ecfd;
+  --border: #ddd;
+  --card-bg: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #eaeaf0;
+    --bg: #15151a;
+    --muted: #9a9aa6;
+    --accent: #7c93f0;
+    --accent-soft: #23283f;
+    --border: #33333b;
+    --card-bg: #1d1d23;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.55;
+}
+
+.hidden { display: none !important; }
+
+a { color: var(--accent); }
+
+.landing-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.landing-header .brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.65rem 1.25rem;
+  border-radius: 999px;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+
+.button:hover { transform: translateY(-1px); }
+
+.button-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.button-ghost {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+main {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 4rem;
+}
+
+.hero {
+  text-align: center;
+  padding: 4rem 1rem 3rem;
+  background: radial-gradient(circle at 50% 0%, var(--accent-soft), transparent 60%);
+  border-radius: 24px;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 4vw, 2.75rem);
+  margin: 0 0 1rem;
+  letter-spacing: -0.01em;
+}
+
+.hero .tagline {
+  max-width: 640px;
+  margin: 0 auto;
+  color: var(--muted);
+  font-size: 1.1rem;
+}
+
+.hero-actions {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 2rem;
+  flex-wrap: wrap;
+}
+
+section.features,
+section.how-it-works {
+  margin-top: 3.5rem;
+}
+
+section.features h2,
+section.how-it-works h2,
+section.signin h2 {
+  font-size: 1.4rem;
+  margin-bottom: 1.25rem;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.feature-card {
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--card-bg);
+}
+
+.feature-card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.feature-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.how-it-works p {
+  max-width: 680px;
+}
+
+.how-it-works .muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+section.signin {
+  margin-top: 4rem;
+  display: flex;
+  justify-content: center;
+}
+
+.signin-card {
+  width: 100%;
+  max-width: 360px;
+  padding: 2rem;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--card-bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+  text-align: center;
+}
+
+.signin-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  text-align: left;
+}
+
+.signin-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.signin-card input {
+  padding: 0.6rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 1rem;
+}
+
+.signin-card button {
+  margin-top: 0.25rem;
+  padding: 0.7rem 1rem;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.signin-card button:hover { opacity: 0.92; }
+
+.signin-card .error {
+  color: #d64545;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.signin-card .muted.small {
+  margin-top: 1.25rem;
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.landing-footer {
+  text-align: center;
+  padding: 2rem 1rem 3rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}

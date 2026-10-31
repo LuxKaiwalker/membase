@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>membase — augmented personal memory</title>
+  <link rel="stylesheet" href="/static/landing.css" />
+</head>
+<body>
+  <header class="landing-header">
+    <div class="brand">membase</div>
+    <a class="button button-ghost" href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Offload your memory. Keep the ability to recover it.</h1>
+      <p class="tagline">
+        A research prototype exploring augmented personal memory,
+        combining information retrieval, language models, and
+        human-computer interaction.
+      </p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="#signin">Sign in</a>
+        <a class="button button-ghost" href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+      </div>
+    </section>
+
+    <section class="features">
+      <h2>What it does</h2>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <h3>Capture of memory units</h3>
+          <p>One submission can describe several unrelated facts. The
+          system splits it into independently retrievable units — you
+          never have to do that split yourself.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Enforced authority hierarchy</h3>
+          <p>What you typed outranks what you later clarified, which
+          outranks what the model inferred, which outranks the
+          fully-derived search index. Nothing downstream ever overwrites
+          something upstream of it.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Clarification gating</h3>
+          <p>A genuinely ambiguous term or date can hold a memory out of
+          search until it's answered. It's bounded and skippable, and a
+          real answer becomes part of the memory itself, not a transient
+          chat message.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Grounded retrieval, explicit abstention</h3>
+          <p>Search runs over the original text, its derived meaning, and
+          chunked attachments. If the evidence doesn't support an answer,
+          the system says so directly instead of guessing.</p>
+        </article>
+        <article class="feature-card">
+          <h3>Iterative recall</h3>
+          <p>When several stored memories could plausibly answer a query,
+          the system asks one concrete clarifying question instead of
+          picking one arbitrarily.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="how-it-works">
+      <h2>How storage works</h2>
+      <p>
+        Writing a memory never edits anything after the fact. What you
+        type is saved verbatim as a <strong>capture</strong> and never
+        rewritten — everything else (search index, extracted meaning,
+        later corrections) is layered on top of it, not in place of it.
+      </p>
+      <p>
+        A capture can become one or more <strong>memory units</strong> —
+        one independently retrievable piece of memory each. A single note
+        about two unrelated things becomes two units; one coherent story
+        stays one.
+      </p>
+      <p>
+        Each unit carries a strict order of authority: what you typed
+        outranks what you later clarified, which outranks what was
+        automatically inferred, which outranks the fully-derived search
+        index built from all of it. Nothing downstream ever overwrites
+        something upstream of it.
+      </p>
+      <p>
+        A unit with a genuinely ambiguous term or date may hold one
+        question before it becomes searchable — answer it, skip it, or
+        discard that unit from the Browse tab. Answering never changes
+        your original words; it just adds to what the unit knows about
+        itself.
+      </p>
+      <p>
+        Deleting a capture (Browse tab) is the only way a memory goes away
+        — there's no automatic expiry or relevance-based forgetting.
+      </p>
+      <p class="muted">
+        Full architecture, design decisions, and the evaluation history:
+        <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a>.
+      </p>
+    </section>
+
+    <section id="signin" class="signin">
+      <div class="signin-card">
+        <h2>Sign in</h2>
+        <form id="landing-login-form">
+          <label>
+            Username
+            <input type="text" id="landing-username" autocomplete="username" required />
+          </label>
+          <label>
+            Password
+            <input type="password" id="landing-password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">Enter membase</button>
+          <p id="landing-login-error" class="error hidden"></p>
+        </form>
+        <p class="muted small">
+          Self-service sign-up isn't available — credentials are
+          provisioned by the project owner.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="landing-footer">
+    <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a>
+  </footer>
+
+  <script>
+    (() => {
+      // Kept in sync with backend/app/static/app.js's CREDENTIALS_KEY /
+      // setCredentials -- the app pages read the exact same localStorage
+      // key, so signing in here is immediately picked up over there with
+      // no separate "verify" call (nginx checks credentials on the first
+      // real API request, same as app.js's own login overlay does).
+      const CREDENTIALS_KEY = "membase.basicAuth";
+
+      const form = document.getElementById("landing-login-form");
+      const usernameInput = document.getElementById("landing-username");
+      const passwordInput = document.getElementById("landing-password");
+      const errorEl = document.getElementById("landing-login-error");
+
+      form.addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        errorEl.classList.add("hidden");
+        if (!usernameInput.value || !passwordInput.value) {
+          errorEl.textContent = "Username and password are both required.";
+          errorEl.classList.remove("hidden");
+          return;
+        }
+        try {
+          localStorage.setItem(CREDENTIALS_KEY, btoa(`${usernameInput.value}:${passwordInput.value}`));
+        } catch {
+          // Not persisted across the navigation below -- the app page's
+          // own login overlay will just ask again, same as app.js does
+          // when localStorage is unavailable.
+        }
+        window.location.href = "/app/";
+      });
+    })();
+  </script>
+</body>
+</html>
