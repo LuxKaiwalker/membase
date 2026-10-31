@@ -74,11 +74,12 @@ def _build_searchable_text(authoritative_content: str, attachment_text: str, ret
     return "\n\n".join(parts)
 
 
-def _attachment_text_for(capture: Capture) -> str:
-    """Full, uncapped combined attachment text -- used for the full-text
-    search index (_build_searchable_text), which has no model context
-    budget to protect. Never pass this directly into an LLM prompt; see
-    _attachment_text_for_analysis() below.
+def _attachment_parts(capture: Capture) -> list[str]:
+    """Per-attachment text blocks, each already labeled ("Image N:" for
+    images), before any joining or length-capping -- shared by
+    _attachment_text_for() (uncapped join) and
+    _attachment_text_for_analysis() (per-part capped join) so both stay
+    in sync on how attachments are labeled/ordered.
 
     Each image attachment's text is labeled "Image N:" so a later
     enrichment call sees multiple photos as distinct, orderable sources
@@ -95,7 +96,16 @@ def _attachment_text_for(capture: Capture) -> str:
             parts.append(f"Image {image_n}:\n{a.extracted_text}")
         else:
             parts.append(a.extracted_text)
-    return "\n\n".join(parts)
+    return parts
+
+
+def _attachment_text_for(capture: Capture) -> str:
+    """Full, uncapped combined attachment text -- used for the full-text
+    search index (_build_searchable_text), which has no model context
+    budget to protect. Never pass this directly into an LLM prompt; see
+    _attachment_text_for_analysis() below.
+    """
+    return "\n\n".join(_attachment_parts(capture))
 
 
 # A generation call's context window is shared between its input prompt
@@ -113,14 +123,55 @@ def _attachment_text_for(capture: Capture) -> str:
 MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS = 1500
 
 
+# The marker _caption_and_extract_image() joins a free-text caption and
+# its "Structured data:" block with (see that function). When a single
+# attachment's own share of the budget isn't enough for both, the exact
+# transcribed values in the structured block are what clarify/enrich
+# actually need (see _extract_image_structured_data()'s docstring on why
+# it's kept separate from the prose caption in the first place) -- so
+# truncation below shortens the caption first and keeps the structured
+# block whole, rather than cutting wherever the flat character count
+# happens to land.
+_STRUCTURED_DATA_MARKER = "\n\nStructured data:\n"
+
+
+def _truncate_attachment_part(part: str, budget: int) -> str:
+    if len(part) <= budget:
+        return part
+    marker_at = part.find(_STRUCTURED_DATA_MARKER)
+    if marker_at == -1:
+        return part[:budget]
+    structured_block = part[marker_at:]
+    if len(structured_block) >= budget:
+        # The structured block alone doesn't fit either -- nothing left
+        # to prioritize, fall back to a flat slice.
+        return part[:budget]
+    caption_block = part[:marker_at]
+    return caption_block[: budget - len(structured_block)] + structured_block
+
+
 def _attachment_text_for_analysis(capture: Capture) -> str:
     """Bounded combined attachment text for an LLM prompt -- see
     MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS above. Still gives the model
     something to resolve a vague reference against (e.g. an image
     caption, or a document's opening section); a full large document's
     *content* remains separately searchable via AttachmentChunk
-    regardless of what's included here."""
-    return _attachment_text_for(capture)[:MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS]
+    regardless of what's included here.
+
+    The budget is split evenly across attachments and each one is
+    truncated on its own boundary -- a flat slice of the whole
+    concatenated blob instead spends the entire budget on the first
+    attachment(s) and silently drops later ones, which previously made
+    the model report a later image's description as "cut off" when it
+    had actually just never been included at all (e.g. a two-photo
+    eyeglasses prescription where the second photo's SPH/CYL/AXS/PSM
+    values never made it into the prompt -- see docs/user-todo.md).
+    """
+    parts = _attachment_parts(capture)
+    if not parts:
+        return ""
+    budget_per_part = max(MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS // len(parts), 1)
+    return "\n\n".join(_truncate_attachment_part(part, budget_per_part) for part in parts)
 
 
 # --- cheap prior-memory lookup (see docs/DECISIONS.md "Prior memory
