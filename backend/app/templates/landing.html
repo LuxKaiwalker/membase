@@ -7,64 +7,65 @@
   <link rel="stylesheet" href="/static/landing.css" />
 </head>
 <body>
-  <header class="landing-header">
-    <div class="brand">membase</div>
-    <a class="button button-ghost" href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">View on GitHub</a>
+  <header class="site-header">
+    <a class="site-brand" href="/">membase</a>
+    <nav class="top-nav">
+      <a href="#about">About</a>
+      <a href="#how-it-works">How it works</a>
+      <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href="#signin">Sign in</a>
+    </nav>
   </header>
 
-  <main>
-    <section class="hero">
-      <h1>Offload your memory. Keep the ability to recover it.</h1>
-      <p class="tagline">
+  <main class="page-content">
+    <section class="hero-panel">
+      <h1>membase</h1>
+      <p class="bio">
         A research prototype exploring augmented personal memory,
         combining information retrieval, language models, and
         human-computer interaction.
       </p>
-      <div class="hero-actions">
-        <a class="button button-primary" href="#signin">Sign in</a>
-        <a class="button button-ghost" href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">View on GitHub</a>
-      </div>
     </section>
 
-    <section class="features">
+    <section id="about" class="content-section">
       <h2>What it does</h2>
-      <div class="feature-grid">
-        <article class="feature-card">
-          <h3>Capture of memory units</h3>
+      <ul class="feature-list">
+        <li>
+          <span class="feature-title">Capture of memory units</span>
           <p>One submission can describe several unrelated facts. The
           system splits it into independently retrievable units — you
           never have to do that split yourself.</p>
-        </article>
-        <article class="feature-card">
-          <h3>Enforced authority hierarchy</h3>
+        </li>
+        <li>
+          <span class="feature-title">Enforced authority hierarchy</span>
           <p>What you typed outranks what you later clarified, which
           outranks what the model inferred, which outranks the
           fully-derived search index. Nothing downstream ever overwrites
           something upstream of it.</p>
-        </article>
-        <article class="feature-card">
-          <h3>Clarification gating</h3>
+        </li>
+        <li>
+          <span class="feature-title">Clarification gating</span>
           <p>A genuinely ambiguous term or date can hold a memory out of
           search until it's answered. It's bounded and skippable, and a
           real answer becomes part of the memory itself, not a transient
           chat message.</p>
-        </article>
-        <article class="feature-card">
-          <h3>Grounded retrieval, explicit abstention</h3>
+        </li>
+        <li>
+          <span class="feature-title">Grounded retrieval, explicit abstention</span>
           <p>Search runs over the original text, its derived meaning, and
           chunked attachments. If the evidence doesn't support an answer,
           the system says so directly instead of guessing.</p>
-        </article>
-        <article class="feature-card">
-          <h3>Iterative recall</h3>
+        </li>
+        <li>
+          <span class="feature-title">Iterative recall</span>
           <p>When several stored memories could plausibly answer a query,
           the system asks one concrete clarifying question instead of
           picking one arbitrarily.</p>
-        </article>
-      </div>
+        </li>
+      </ul>
     </section>
 
-    <section class="how-it-works">
+    <section id="how-it-works" class="content-section">
       <h2>How storage works</h2>
       <p>
         Writing a memory never edits anything after the fact. What you
@@ -96,37 +97,38 @@
         Deleting a capture (Browse tab) is the only way a memory goes away
         — there's no automatic expiry or relevance-based forgetting.
       </p>
-      <p class="muted">
+      <p class="muted small">
         Full architecture, design decisions, and the evaluation history:
         <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a>.
       </p>
     </section>
 
-    <section id="signin" class="signin">
-      <div class="signin-card">
-        <h2>Sign in</h2>
-        <form id="landing-login-form">
-          <label>
-            Username
-            <input type="text" id="landing-username" autocomplete="username" required />
-          </label>
-          <label>
-            Password
-            <input type="password" id="landing-password" autocomplete="current-password" required />
-          </label>
-          <button type="submit">Enter membase</button>
-          <p id="landing-login-error" class="error hidden"></p>
-        </form>
-        <p class="muted small">
-          Self-service sign-up isn't available — credentials are
-          provisioned by the project owner.
-        </p>
-      </div>
+    <section id="signin" class="content-section signin-section">
+      <h2>Sign in</h2>
+      <form id="landing-login-form" class="signin-form">
+        <label>
+          Username
+          <input type="text" id="landing-username" autocomplete="username" required />
+        </label>
+        <label>
+          Password
+          <input type="password" id="landing-password" autocomplete="current-password" required />
+        </label>
+        <button type="submit">Connect</button>
+        <p id="landing-login-error" class="error hidden"></p>
+      </form>
+      <p class="muted small">
+        Self-service sign-up isn't available — credentials are
+        provisioned by the project owner.
+      </p>
     </section>
   </main>
 
-  <footer class="landing-footer">
-    <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a>
+  <footer class="site-footer">
+    <div class="footer-meta">
+      <span>membase</span>
+      <span><a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">github.com/LuxKaiwalker/membase</a></span>
+    </div>
   </footer>
 
   <script>
