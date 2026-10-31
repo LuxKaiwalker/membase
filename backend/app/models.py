@@ -131,6 +131,14 @@ class MemoryUnit(Base):
     # strings, deliberately NOT a knowledge graph.
     related_unit_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
+    # Which pipeline code version last derived this unit's
+    # attachment-text-dependent state (see app/ingestion/pipeline.py's
+    # CURRENT_PIPELINE_VERSION and scripts/reprocess_memories.py, the
+    # low-priority background pass that re-derives units left behind by
+    # a fixed bug -- docs/DECISIONS.md "Reprocessing pipeline"). 0 for
+    # every row that existed before this column did.
+    pipeline_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # --- derived (LLM-derived semantic representation; regenerable) ---
     semantic: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     retrieval_text: Mapped[str] = mapped_column(Text, nullable=False, default="")

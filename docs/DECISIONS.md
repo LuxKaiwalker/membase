@@ -2397,3 +2397,98 @@ single-file in the deployed app, the likely cause is a stale published
 GitHub Pages build (`scripts/build_frontend.py`'s output is published
 separately from this backend, see "API-only backend" above); rebuild
 and republish to rule that out before assuming a code regression.
+
+## Reprocessing pipeline
+
+**Bug found (real user report):** a two-photo glasses-prescription
+capture got a clarification question claiming "the description of the
+second image is cut off," even though the second image was fully
+legible and its values were already in `Attachment.extracted_text`
+(see docs/user-todo.md). Root cause:
+`_attachment_text_for_analysis()` sliced the *combined* multi-attachment
+text at a flat `MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS` (1500), so the
+first image's text consumed the whole budget and the second image's
+text -- including its `"Structured data:\n..."` block with the actual
+SPH/CYL/AXS/PSM values (see "Image structured-data extraction" above)
+-- was silently dropped before `clarify.generate_question()` ever saw
+it. The model's question was an accurate report of truncated input, not
+a hallucination. Fixed by splitting the budget evenly across
+attachments (`_attachment_parts()` + `_truncate_attachment_part()`),
+and within each attachment's own share, preserving its structured-data
+block whole by shortening the free-text caption first -- the exact
+values are what clarify/enrich actually need; the prose caption is
+comparatively disposable.
+
+**The bigger problem the fix doesn't solve on its own:** a unit already
+stuck on the stale question stays stuck -- fixing the derivation code
+only changes what happens the *next* time a unit is processed, not
+units already sitting in the database. Something needs to go back and
+re-derive them. The obvious failure mode to avoid: naively re-running
+the full pipeline (clarify + enrich) over every old memory would open
+a NEW clarification round on units that already made it to "ready" --
+turning a silent backend bug fix into a flood of new questions for the
+user to answer, potentially worse than the bug itself for a large
+store.
+
+**Decision:** add `MemoryUnit.pipeline_version` (migration
+`b7c2e9a14f6d`, default 0 for every pre-existing row) and
+`CURRENT_PIPELINE_VERSION` (`app/ingestion/pipeline.py`) -- bumped
+whenever a change to attachment-text assembly, clarify, or enrichment
+would produce a materially different result for already-processed
+units. `reprocess_unit()` re-derives one unit, gated by two rules that
+together guarantee reprocessing can only ever help, never hurt:
+
+- **"ready" units never get re-gated.** Mirrors the membase
+  structurer's own invariant (see "The 'membase structurer'" above):
+  only `enrich_unit()` reruns, silently refreshing `semantic`/
+  retrieval/embedding with the corrected attachment text.
+  `clarify.generate_question()` is never called for a unit that's
+  already searchable -- reprocessing a huge ready backlog can never
+  make any of it less available.
+- **"awaiting_clarification" units are already excluded from search,
+  so there's no availability to protect** -- any progress here is pure
+  upside. `generate_question()` reruns with the corrected attachment
+  text: if nothing is left to ask, the unit resolves itself straight to
+  "ready" with zero user involvement (the actual fix for the
+  prescription bug). If a question is still warranted, it REPLACES the
+  unit's single `pending_clarification` slot in place -- never
+  appended -- so a unit that had exactly one open question still has
+  exactly one afterwards, just possibly reworded. A large backlog of
+  stuck units can therefore never leave the user with MORE open
+  questions than before, only fewer (auto-resolutions) or
+  better-worded ones. The existing declined/unknown-field guard
+  (enforced in code in `resolve_clarification()`, not just prompt
+  wording) is replicated here too -- reprocessing can never re-ask
+  something the user already said they didn't know or didn't want to
+  answer. `clarification_round` is deliberately left untouched: this is
+  the system re-deriving the SAME open round under corrected inputs,
+  not a new round the user answered into.
+
+**Shape: a standalone script, not an in-process background task.**
+`scripts/reprocess_memories.py` mirrors `scripts/reembed.py`'s existing
+precedent (argparse, `--dry-run`, sequential one-unit-at-a-time loop)
+rather than adding a persistent `asyncio` loop inside the FastAPI app.
+Reasons: (1) this codebase has no existing in-process scheduler of any
+kind -- `main.py` has no startup hook beyond closing the LLM client on
+shutdown -- and "not a worker daemon, not Celery/Redis" is an explicit,
+repeated constraint (see "The 'membase structurer'" above); (2) Ollama
+serializes requests (`-np 1`) regardless of how work gets scheduled, so
+an in-process task buys no real concurrency, only coordination
+complexity; (3) the deployment (`scripts/run-prod.sh`, single worker,
+`@lru_cache`-singleton LLM/DB handles) has no existing concept of a
+second concurrent in-process consumer to coordinate against. "Lowest
+priority" is realized as: run manually or via a cron/systemd timer
+during idle periods, process units strictly sequentially (no
+concurrency), and `--delay` (default 5s) between units so a long
+unattended run leaves gaps for live traffic instead of saturating the
+request queue back-to-back. `--only-with-attachments` scopes a run to
+captures that could plausibly be affected by this specific bug, without
+hardcoding attachment-awareness into the general version-gated
+selection query itself (`pipeline_version < CURRENT_PIPELINE_VERSION`,
+status in `ready`/`awaiting_clarification`, oldest first).
+
+**Not done:** no new concurrency primitive (semaphore, GPU-usage probe,
+"is the app idle" signal) gates the script against colliding with live
+traffic -- `--delay` is a manual throttle, not an active coordination
+mechanism. Acceptable for a single-user personal deployment; would need
+revisiting before running this against a shared/multi-tenant instance.

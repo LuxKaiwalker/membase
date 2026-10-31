@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 # See docs/DECISIONS.md "Sequential clarification".
 MAX_CLARIFICATION_ROUNDS = 3
 
+# Bump this whenever a change to attachment-text assembly, clarify, or
+# enrichment would produce a materially different result for units
+# already processed by the old code -- see docs/DECISIONS.md
+# "Reprocessing pipeline" and scripts/reprocess_memories.py, the
+# low-priority background pass that finds every MemoryUnit with
+# pipeline_version < CURRENT_PIPELINE_VERSION and re-derives it. Every
+# unit that successfully finishes derivation (_finalize_unit,
+# correct_unit, reprocess_unit) is stamped with this value. 1: fixes
+# _attachment_text_for_analysis() silently dropping a later
+# attachment's text entirely when several images' combined text
+# exceeded the old flat per-capture slice (see docs/user-todo.md).
+CURRENT_PIPELINE_VERSION = 1
+
 # Marker delimiting an attachment excerpt appended to a unit's
 # retrieval_text by add_attachment() -- used to strip a stale excerpt
 # before appending a fresh one, so repeated attachment adds don't
@@ -626,7 +639,12 @@ async def _finalize_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, token:
     try:
         retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, unit.semantic)
         searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, retrieval_text)
-        values: dict = {"retrieval_text": retrieval_text, "searchable_text": searchable_text, "status": "ready"}
+        values: dict = {
+            "retrieval_text": retrieval_text,
+            "searchable_text": searchable_text,
+            "status": "ready",
+            "pipeline_version": CURRENT_PIPELINE_VERSION,
+        }
         try:
             embedding = await llm.embed([retrieval_text])
             values["embedding"] = embedding[0]
@@ -1233,6 +1251,7 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
     except LLMError:
         logger.warning("Embedding failed during correction for unit %s", unit.id)
     unit.status = "ready"
+    unit.pipeline_version = CURRENT_PIPELINE_VERSION
     db.commit()
     db.refresh(unit)
     await _detect_conflicts(db, llm, unit)
@@ -1263,6 +1282,91 @@ async def retry_enrichment(db: Session, llm: LLMProvider, unit: MemoryUnit) -> M
         return unit
 
     _claim_processing(db, unit)
+    db.refresh(unit)
+    return unit
+
+
+# --- reprocessing pipeline (see docs/DECISIONS.md "Reprocessing
+# pipeline" and scripts/reprocess_memories.py) -- a low-priority,
+# manually/cron-triggered sweep over units with
+# pipeline_version < CURRENT_PIPELINE_VERSION, re-deriving whatever a
+# fixed pipeline bug would have gotten wrong. Two different policies by
+# current status, both built around one rule: reprocessing must never
+# make a unit LESS available than it already is.
+#
+# - "ready" units are already searchable. Mirrors the membase
+#   structurer's own invariant (see "membase structurer" above): never
+#   re-gate status, never call clarify.generate_question() here. Only
+#   enrich_unit() reruns, so corrected attachment text can promote
+#   values it previously missed into `semantic` -- the same thing
+#   correct_unit() does, minus appending a synthetic "(user
+#   correction)" entry to `clarifications`, which would misrepresent
+#   provenance for something the user never did.
+# - "awaiting_clarification" units are already excluded from search, so
+#   there is no availability to protect -- any progress here is pure
+#   upside. clarify.generate_question() reruns with the corrected
+#   attachment text: if it now finds nothing to ask, the unit resolves
+#   itself straight to "ready" with no user involvement at all (the
+#   eyeglasses-prescription bug's actual fix path -- see
+#   docs/user-todo.md). If a question is still warranted, it replaces
+#   the single `pending_clarification` slot in place -- never appended
+#   anywhere -- so a unit that already had exactly one open question
+#   still has exactly one afterwards. A huge backlog of stuck units can
+#   therefore never multiply the total number of questions a user sees;
+#   it can only shrink it (auto-resolutions) or improve the wording of
+#   what's already pending. `clarification_round` is deliberately left
+#   untouched -- this is the system re-deriving the SAME open round
+#   under corrected inputs, not a new round the user answered into.
+async def reprocess_unit(db: Session, llm: LLMProvider, unit: MemoryUnit) -> MemoryUnit:
+    if unit.status not in ("ready", "awaiting_clarification"):
+        return unit  # draft/processing/failed/discarded: not this pass's job
+
+    attachment_text = _attachment_text_for_analysis(unit.capture)
+    prior_context = _find_related_context(db, unit.authoritative_content)
+
+    if unit.status == "awaiting_clarification":
+        declined_or_unknown_fields = {
+            c["field"] for c in unit.clarifications if c.get("outcome") in ("declined", "unknown")
+        }
+        question = await generate_question(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+        if question and question["field"] not in declined_or_unknown_fields:
+            unit.pending_clarification = {
+                "question": question["question"], "field": question["field"], "round": unit.clarification_round,
+            }
+            unit.pipeline_version = CURRENT_PIPELINE_VERSION
+            db.commit()
+            db.refresh(unit)
+            return unit
+
+        # The fix removed the only remaining reason to ask -- resolve
+        # straight through, same as resolve_clarification()'s own
+        # no-further-question branch.
+        unit.pending_clarification = None
+        semantic = await enrich_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+        semantic = dict(semantic)
+        _apply_explicit_metadata(semantic, unit.explicit_metadata)
+        unit.semantic = semantic
+        token = _claim_processing(db, unit)
+        await _finalize_unit(db, llm, unit, token, attachment_text)
+        db.refresh(unit)
+        return unit
+
+    # status == "ready": silent re-enrichment only, never clarify.
+    semantic = await enrich_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, prior_context)
+    semantic = dict(semantic)
+    _apply_explicit_metadata(semantic, unit.explicit_metadata)
+    unit.semantic = semantic
+    unit.retrieval_text = build_retrieval_text(unit.authoritative_content, unit.clarifications, semantic)
+    unit.searchable_text = _build_searchable_text(unit.authoritative_content, attachment_text, unit.retrieval_text)
+    try:
+        embedding = await llm.embed([unit.retrieval_text])
+        unit.embedding = embedding[0]
+        unit.embedding_model = llm.embedding_model_name
+        unit.embedding_dim = llm.embedding_dim
+    except LLMError:
+        logger.warning("Embedding failed while reprocessing unit %s", unit.id)
+    unit.pipeline_version = CURRENT_PIPELINE_VERSION
+    db.commit()
     db.refresh(unit)
     return unit
 
