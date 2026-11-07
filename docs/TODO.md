@@ -424,15 +424,11 @@ Full reasoning for every item below is in docs/DECISIONS.md under
 
 ## Known technical gaps
 
-- **Found during a code audit, not a reported bug: `RecallResponse.
-  chunk_sources` (attachment-chunk evidence) is returned by
-  `POST /api/recall` but never rendered by the recall page** --
-  `renderSources()` in `app/static/app.js` only handles `data.sources`
-  (memory units), not `data.chunk_sources`. Pre-existing, not introduced
-  this phase. Low-impact (chunk evidence still contributes to the
-  answer text itself, it's just not shown as supporting evidence
-  alongside it) but worth fixing if large-attachment recall becomes a
-  more common case.
+- **Resolved: attachment-chunk evidence is rendered again.** The old recall
+  page's `renderSources()` handled only `data.sources` and silently dropped
+  `chunk_sources`, so a document excerpt could contribute to an answer without
+  ever being shown as the evidence for it. The rebuilt page
+  (`app/static/pages/recall.js`) renders both.
 - **Two eval regressions after this phase's call-count/iteration
   reduction, not yet root-caused in isolation.** Full detail in
   docs/DECISIONS.md's "Measured effect, honestly reported" -- summary:
