@@ -70,6 +70,27 @@ this benchmark caches:
 `--limit N` is part of the fingerprint, so an 8-memory smoke corpus can
 never satisfy a full run's cache check or be reported as a full run.
 
+**Per-memory seeding cost is extremely sensitive to concurrent load on the
+single local model, which is the main reason this cache exists.** Measured on
+this machine on the same corpus within one hour: ~77s per memory while the
+GPU was shared with other work (8 memories in 617s), degrading to ~70–95s and
+producing repeated `Segmentation LLM call failed; falling back to a
+deterministic sentence split` warnings when several processes were hitting
+Ollama at once. There is one generation model on one 11GB GPU
+(CLAUDE.md "Environment facts"); every concurrent caller queues behind the
+same llama.cpp slot, and a call that exceeds `llm_timeout_seconds` (90s) is
+*dropped*, degrading that memory's ingestion rather than merely slowing it.
+Two consequences: seed on an idle machine if you can, and check the
+degraded-unit count afterwards if you could not.
+
+One related footgun the benchmark works around in `eval/`: `app/db.py` sets
+`idle_in_transaction_session_timeout=180000`, and `create_capture_and_finish()`
+ends with a `refresh` that autobegins a read transaction. Left open across the
+next memory's minutes of model time, Postgres terminates the connection
+mid-seed — observed for real here under contention. `seed_corpus()` and the
+query loop therefore `db.commit()` after each unit of work; it costs nothing
+(`expire_on_commit=False`) and removes the failure mode.
+
 Either path then prints the association graph's size (entities, unit-entity
 links, unit associations) and how many ready units have
 `enrichment_status='unavailable'`, with a warning if either number is bad.

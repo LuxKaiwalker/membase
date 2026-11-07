@@ -1,184 +1,354 @@
-# Engineering report: restore the multi-call pipeline, instant save, image structured data, attachment access
+# Engineering report: the artificial memory engine
 
-This supersedes the previous report (the "streamlining phase," summarized
-below where it's still relevant). Scope: four related changes, driven by
-one premise the streamlining phase's own trade-off no longer holds under
--- interactive recall now lives entirely in Browse/Remember, so saving a
-memory no longer needs to return a synchronously-analyzed result at all.
+This supersedes the previous report (restore the multi-call pipeline / instant
+save / image structured data / attachment access), which is still accurate
+about the ingestion pipeline and is summarised where relevant below.
 
-1. **Restore the multi-call ingestion pipeline**, now fully backgrounded,
-   so the quality the streamlining phase traded away can come back at
-   zero perceived latency cost.
-2. **Make saving instant**: `POST /api/captures` returns the moment raw
-   text + attachments are durably persisted, before any LLM call.
-3. **Fix lost structured data in images** (the concrete bug that
-   motivated this work: a photographed glasses prescription's numeric
-   values were getting summarized into prose, or lost, instead of
-   becoming queryable facts).
-4. **Attachment view/download**, previously missing entirely -- a
-   retrieved memory with a photo attached had no way to actually see
-   the photo anywhere in the UI.
+Scope: turn a working augmented-memory MVP into a system that can retrieve a
+memory the query could never have matched directly — by building an explicit
+associative structure over what ingestion already extracts, making retrieval
+adaptive over that structure, grouping memories into episodes, exposing the
+evidence behind every result, and measuring whether any of it actually helps.
 
-Verified against the real local model throughout: the full fast pytest
-suite (161 tests, all passing, against fakes) and the real-`gemma4:12b`
-integration suite (5 tests, all passing -- one needed a prompt fix,
-documented in section 4).
+Verified against the real local model throughout. Fast suite: **392 tests
+passing** (up from 172), plus 7 real-`gemma4:12b` integration tests. All seven
+UI sections verified in a real browser against a live backend with real seeded
+data.
 
-## 1. Current architecture
+---
 
-Unchanged in *shape* from docs/ARCHITECTURE.md's description: a
-`Capture` decomposes into one or more `MemoryUnit`s; each unit carries
-authoritative content (verbatim, never rewritten), an append-only
-clarification history, a derived semantic representation, and a status
-gate (`draft -> awaiting_clarification -> processing -> ready`, or
-`failed`/`discarded`). What changed is *where* the LLM-dependent work
-happens, not what it produces: all of it (image understanding,
-segmentation, clarification, enrichment, embedding, structuring) now
-runs in one background task, `process_capture_fully()`, scheduled the
-instant `POST /api/captures` persists the raw text. `create_capture()`
-itself no longer calls the LLM at all.
+## 1. What was built
 
-## 2. Reversed: the streamlining-phase ingestion collapse
+### Associative memory graph
 
-The previous phase collapsed segmentation + clarification-need +
-enrichment into one call per capture (`analyze_capture()`) specifically
-to cut *synchronous-request* latency, trading some retrieval quality
-for it (documented there: 28/30 vs 30/30 on the eval set, one
-regression explicitly attributed to losing a dedicated clarification
-call's focused attention). That trade's entire premise -- a capture's
-full analysis has to finish before the HTTP response can return --
-stopped being true once saving became fully backgrounded. The restored
-`app/ingestion/segmentation.py`/`clarify.py`/`enrichment.py` (reconstructed
-from pre-collapse git history, adapted to the current `Semantics` shape
-and multi-image/prior-context support that didn't exist back then) cost
-more LLM calls per capture, but none of them are on any critical path a
-human is waiting on any more.
+`MemoryUnit.related_unit_ids` was explicitly "NOT a knowledge graph" — a flat
+advisory id list with no types, weights, provenance, or traversal. It is
+unchanged, and now additionally projected into a real one.
 
-`resolve_clarification()` and `correct_unit()` were rewired to the same
-clarify/enrich composition. One correctness gap in the collapsed design
-was fixed along the way, not just inherited: `resolve_clarification()`
-now *always* eventually calls `enrich_unit()` once no further question
-will be surfaced, closing a path where a unit's only candidate question
-got suppressed (round budget exhausted, or the field was already marked
-declined/unknown) and the unit could previously reach `"ready"` with
-semantics that were never actually enriched.
+Four typed tables: `memory_entities` (the canonical things memories are about),
+`unit_entity_links` (which memory mentions what, in which semantic field, and
+whether the user said it), `entity_relations` (subject-predicate-object triples,
+each asserted by one specific memory), `unit_associations` (weighted edges
+between memories). Four tables rather than one polymorphic edge table so every
+edge has real foreign keys and real indexes.
 
-## 3. Performance
+Entities are the hub nodes, and they are the whole mechanism: two memories
+sharing no wording at all are one hop apart if they name the same lake.
 
-LLM call counts, by inspection:
+Three properties were treated as requirements rather than nice-to-haves:
 
-| Flow | Streamlining phase | Now |
-|---|---|---|
-| Ordinary memory, no clarification | 1 generation call + 1 embed (synchronous) | up to 5 generation calls + 1 embed (segment, clarify, 3x enrich) -- **all backgrounded, zero synchronous calls** |
-| Memory needing 1 clarification round | 1 (initial) + 1 (`reanalyze_unit`) + 1 embed | 1 segment + 1 clarify (round 1) + 1 clarify (round 2, settles) + 3 enrich + 1 embed -- **still entirely backgrounded** |
-| Image attachment | captioned in a separate, later-scheduled background task, blind to the capture's first analysis pass | captioned (+ a new structured-extraction call) in the SAME background task, BEFORE segmentation/clarification/enrichment ever run, so they see its content |
-| `POST /api/captures` response latency | bounded by the synchronous analysis call (up to `llm_timeout_seconds`, 90s) | bounded by a DB commit only -- no LLM call in the request path at all |
+- **Zero additional LLM calls.** Every edge derives from fields ingestion
+  already produces. Entity resolution is a normalisation function, not a model
+  call. Ingestion already costs ~6 generation calls per capture on an 11 GB GPU
+  that fits exactly one generation model; spending more was never available.
+- **A projection, not primary data.** `project_unit()` is idempotent
+  (delete-then-rebuild), so it runs from four different pipeline commit points
+  with no change tracking, and a bug in it is fixable with
+  `scripts/rebuild_graph.py` rather than a re-ingest. At ~20-25s of model time
+  per memory, that distinction is the difference between a fixable bug and a
+  permanent one.
+- **`origin` is a column, not a heuristic**: `explicit` (the user said it) >
+  `extracted` (a model read it out of their words) > `inferred` (the system
+  computed it). This is the storage side's existing authority hierarchy carried
+  into the graph.
 
-The trade is the opposite of the streamlining phase's: more total LLM
-calls, in exchange for zero of them being on the critical path. Not
-measured: whether the background task's own total wall-clock time grew
-enough to matter for anything (nothing is waiting on it, so this was
-judged not worth instrumenting yet -- see docs/TODO.md if it ever is).
+The API (`/api/graph/*`) is read-only. The brief says not to turn this into a
+manually maintained knowledge graph; having no write endpoint makes that
+structural rather than a matter of discipline.
 
-## 4. Retrieval quality
+### Adaptive associative recall
 
-Re-running the real-model integration suite surfaced one live
-regression from restoring a *dedicated* clarification call: asked in
-isolation (no enrichment competing for its attention), `gemma4:12b`
-asked an unnecessary clarification question about a memory's missing
-optional detail (a recommended paper's title/author) -- directly
-violating its own prompt's explicit instruction that "a missing field
-is not, by itself, grounds for a question." This gated the unit out of
-search entirely, which is exactly the failure mode
-`test_indirect_multiconcept_relationship_query` exists to catch. Fixed
-by adding a concrete negative example matching this exact case to
-`clarify.py`'s system prompt; re-run confirmed fixed, deterministically
-(structured-output calls run at `temperature=0.0`, so this was a
-reliable prompt-adherence gap, not sampling noise). All 5 real-model
-integration tests pass after the fix.
+`app/retrieval/associative.py` runs as a *stage* after the existing
+`automatic_search`, which keeps its exact contract. It takes the ranked seeds,
+walks the graph, collects structured evidence, and re-ranks on relevance +
+contextual consistency + evidence quality.
 
-This is the same category of risk the streamlining phase itself
-flagged going the other direction ("a dedicated call, with no other
-task competing for its attention, [may ask more]") -- confirmed real
-here, and addressed by prompt wording rather than by abandoning the
-dedicated-call design, since the alternative (collapsing calls back
-together) is exactly the trade-off this whole effort exists to undo.
+Expansion is adaptive: `should_expand` declines to walk the graph when direct
+search already produced a dominant, evidentially-complete winner — the same
+three-signal test as the existing sufficiency short-circuit. A clear query
+costs exactly what it did before this feature existed, and the trail records
+that exploration was skipped deliberately.
 
-## 5. Image structured-data extraction
+**An inferred lead can never become an answer.** Three independent mechanisms,
+deliberately redundant: confidence caps at `weak`; `rerank` clamps the score
+below the moderate-direct-match threshold so no accumulated evidence lets it
+outrank a real match; and the answer prompt labels the block "Associated
+memory" with an explicit instruction not to answer from it alone.
 
-`_describe_image()`'s free-text caption is unchanged and still the
-image's general-purpose searchable description. New alongside it:
-`_extract_image_structured_data()`, a schema-constrained call
-(`has_structured_data: bool`, `fields: [{label, value}]`) prompted to
-transcribe any form/table/prescription/measurement data exactly as
-shown, appended to the caption as a `"Structured data:\n..."` block.
-`enrichment.py`'s retrieval-aids sub-prompt gained one instruction:
-promote each such labeled pair into its own `relations` entry rather
-than summarizing the block in prose -- this is the line that makes a
-photographed prescription's numbers land as queryable
-`semantic.relations` instead of staying inert text a free-text caption
-might also have garbled. Two images in one capture are labeled
-`"Image 1:"`/`"Image 2:"` in the combined attachment text so one
-photo's values and another's can be merged into one unit's `relations`
-by a single enrichment call.
+Clarifying questions are chosen by **expected information gain**, discounted by
+how answerable each attribute actually is (see §4 for why the second half is
+not a fudge factor).
 
-## 6. Attachment view/download
+### Episodic memory
 
-Previously missing entirely: no backend route served an attachment's
-original bytes, and the UI only ever rendered a filename as plain text.
-New `GET /api/attachments/{id}/file` (no new auth code -- nginx's
-existing Basic Auth already covers it). `SourceOut`/`ChunkSourceOut`
-extended to carry attachment info so a retrieved memory's sources can
-link to their originals too. The frontend gained one shared
-fetch-as-blob-then-open-or-download helper, wired into the Store page,
-the Browse tab, and the Recall page.
+Episodes are derived deterministically — no LLM call, including for titles —
+by three rules in descending confidence: same capture; compatible date *and*
+shared anchor entity; two shared anchors when undated.
 
-## 7. Multi-file upload
+Requiring both time and entity overlap is what stops an episode being either a
+calendar or a bag of every memory mentioning a recurring person. `topic`
+entities are excluded from anchors entirely: "hiking" is shared by every hike.
 
-Investigated as part of this work (reported as single-file-only) and
-found already fully correct end-to-end -- `<input multiple>` with
-cross-picker accumulation on the frontend, `list[UploadFile]` on both
-upload endpoints on the backend. No code change. If still observed as
-single-file in the deployed app, the most likely cause is a stale
-published GitHub Pages build (the frontend is published separately via
-`scripts/build_frontend.py`, not served by this backend) -- rebuild and
-republish before assuming a code regression.
+Uncertainty is represented rather than smoothed away. Dates are nullable and
+carry a precision (`day`/`month`/`season`/`year`/`unknown`) and a
+`boundary_confidence` (`asserted`/`inferred`/`uncertain`). An episode whose
+members carry no resolvable date has NULL dates and says so — it is never
+back-filled from `created_at`, because "I don't know when this was" and "this
+happened the day it was typed" are different claims and a user cannot tell them
+apart afterwards.
 
-## 8. Local LLM setup
+### Multimodal
 
-Unchanged: `gemma4:12b` for every generation/structured-output call,
-`nomic-embed-text` (768-dim) for embeddings, both via the system Ollama
-service. No new model, no new config. The per-image caption call is
-joined by one new structured-extraction call per image (same model,
-same multimodal path) -- still well within the single-generation-model
-VRAM budget documented in CLAUDE.md, since nothing here changes which
-models are loaded, only how many `generate_structured` calls happen per
-image.
+`semantic.visual_concepts` is now populated (it was read by the graph but
+written by nothing), through the existing retrieval-aids enrichment call — no
+new LLM call. An image of a lake and mountains yields `mountain range`,
+`body of water`, `snow-capped peaks`, which become `object` entities and
+therefore associative paths.
 
-## 9. Deferred / not done
+**Audio works.** Transcription runs through `gemma4:12b` via the existing
+`images` field on Ollama's `/api/chat`; no second model, which the 11 GB VRAM
+budget would not have allowed. Four empirical findings are recorded in
+`docs/DECISIONS.md`; the one worth repeating here is that a separate `audio`
+field on the message is silently discarded — HTTP 200, zero media tokens, a
+confident hallucinated transcript — so the obvious-looking "fix" to the working
+path would be a quiet correctness disaster.
 
-- **Earlier phases' findings on contradiction handling, recall-session
-  deferred items, and the eval-threshold sweep** are unaffected by this
-  work and weren't re-verified here. This file is fully rewritten each
-  phase rather than appended to, so those findings aren't preserved in
-  the working tree -- see `git log -- docs/REPORT.md` for prior
-  revisions if still relevant.
-- **No wall-clock baseline** for the background task's own total
-  duration (see section 3) -- nothing is waiting on it, so not
-  instrumented.
-- **GitHub Pages republish** -- code-correct already, but the live
-  site wasn't rebuilt/republished as part of this work (see section 7);
-  that's a deploy step, not a code change.
+### Inspectable results
 
-## 10. Remaining risks
+Both the ranking and the explanation are computed from one list of typed
+evidence items, so there is no display-only explanation that can drift from
+what actually drove the ranking. Each item carries one of four provenance
+levels: `original` (the user's words) / `extracted` / `inferred` / `hypothesis`
+(a search guess — displayed and auditable, excluded from scoring).
 
-- The dedicated clarify call's prompt-adherence fix (section 4) was
-  validated against one concrete failure mode found live, not swept
-  across the 30-case eval corpus (`scripts/run-eval.sh`) -- worth a full
-  eval re-run before treating this as fully closed, the same caveat the
-  streamlining phase's own regressions carried.
-- Image structured-data extraction (section 5) was validated by
-  targeted reasoning about the prompt/schema and the existing test
-  suite, not against a real photographed prescription -- the acceptance
-  test for "does this actually work" is trying it with a real photo
-  through the dev server, not yet done here.
+Confidence is a **category**, never a percentage: `strong` / `moderate` /
+`weak` / `insufficient`, defined by an explicit rule table. Nothing in this
+system produces a calibrated probability, so a number would be fabricated
+precision — the same class of error as inventing a date.
+
+`RecallSession` gained `strategy_trail` (one entry per round: strategies run,
+direct vs. expanded counts, what the user's cues ruled out, the question asked
+with its approximate information gain, the budget in force), `final_evidence`,
+`final_confidence`, and `abstention_reason`.
+
+### The interface
+
+Seven sections (Overview, Recall, Explorer, Timeline, Library, Evaluation,
+Store), rebuilt from three pages sharing one 755-line IIFE into a shared core
+plus per-section scripts and stylesheets, on a real design system.
+
+The Explorer's force-directed graph is written from scratch against `<canvas>`
+— velocity-Verlet with repulsion, springs, centring gravity and cooling. No
+library: the repo is dependency-free and the whole frontend build is
+`pip install jinja2`, so vendoring d3 to draw a few hundred nodes is not a
+trade worth making. It stops its animation loop once settled (measured: 264
+steps / 122 frames / 1999 ms for 68 nodes and 179 edges, `running=false`
+afterwards) and honours `prefers-reduced-motion`.
+
+---
+
+## 2. Measured results
+
+`scripts/run-strategy-benchmark.sh` compares four strategies over the **same**
+44 synthetic memories (51 ready units) and 40 queries across 8 categories.
+Full definitions and caveats in `docs/EVALUATION.md`.
+
+| strategy | recall@1 | recall@5 | correctness | false retrieval ↓ | abstention ↓ | questions | LLM calls | wall s |
+|---|---|---|---|---|---|---|---|---|
+| `vector` | 0.400 | 0.571 | 0.314 | **0.00** | 0.429 | 0 | 2.0 | 5.7 |
+| `semantic_rerank` | 0.457 | 0.629 | 0.486 | 0.80 | 0.114 | 0 | 5.6 | 12.0 |
+| `associative` | **0.486** | **0.829** | 0.600 | 0.40 | **0.029** | 0 | 5.1 | 14.7 |
+| `adaptive` | 0.371 | 0.800 | **0.629** | 0.40 | 0.229 | 1.28 | 11.4 | 30.4 |
+
+**What this supports.** Associative multi-hop retrieval is a large, real
+improvement in recall@5 — 0.829 against 0.571 for conventional vector
+similarity and 0.629 for hybrid search with LLM reformulation. It also has the
+best recall@1 and by far the lowest abstention rate on answerable queries
+(0.029). That is the project's central claim, and on this corpus it holds.
+
+**What this does not support, and must be said.** Adaptive iterative recall,
+with clarification, has the *best answer correctness* (0.629) but the *worst
+recall@1* (0.371 — below plain vector search), at 2× the LLM calls and ~30 s
+per query. Clarification improves the answer while making the top-ranked
+memory less reliable. That is a genuine trade-off, not a win.
+
+**The uncomfortable number.** False retrieval rate — the share of deliberately
+unanswerable queries a strategy answers anyway — is *worst for the more capable
+strategies*. Pure vector search never does it (0.00), because it abstains on
+43% of answerable queries too. `semantic_rerank` answers 4 of 5 unanswerable
+queries. Reformulation and association both make the system better at finding
+things and better at convincing itself it has found something. Any reading of
+the recall column that ignores this one is wrong, which is why the Evaluation
+page refuses to compute a combined score.
+
+**Caveats that matter.** Single run (`repeat: 1`) — on a 40-query set with a
+non-deterministic local model, one or two flips are plausible with no code
+change at all, so treat the ordering as a hypothesis rather than a measurement.
+Only 5 unanswerable queries, so false-retrieval rate has 0.2 granularity.
+Correctness is a substring proxy, not a judge. The corpus is synthetic and
+authored alongside the system being measured. The simulated user answers from
+post-ingestion semantic fields and is therefore an upper bound on how helpful a
+real person would be.
+
+---
+
+## 3. Database migrations and API changes
+
+Three migrations, all additive:
+
+| revision | what |
+|---|---|
+| `134238d01cd1` | `memory_entities`, `unit_entity_links`, `entity_relations`, `unit_associations` + indexes |
+| `0c4003935d6f` | `recall_sessions.strategy_trail / final_evidence / final_confidence / abstention_reason` |
+| `e5315b2fcda5` | `episodes`, `episode_memberships` |
+
+`alembic upgrade head` from `backend/`. Note that a production database must be
+migrated before running the new code against it; the live backend here has its
+own database (`membase_prod`), separate from the one `pytest` truncates.
+
+**No existing endpoint changed shape.** Eight new read-only routes
+(`/api/graph`, `/api/graph/stats`, `/api/graph/entities`,
+`/api/graph/entities/{id}`, `/api/graph/units/{id}/associations`,
+`/api/episodes`, `/api/episodes/{id}`, `/api/episodes/for-unit/{id}`), and
+additive fields on `RecallSessionOut` and `RecallResponse`. Accepted upload
+types extended with audio. Every existing client keeps working untouched.
+
+---
+
+## 4. What running the real model found
+
+The most useful decision in this phase was to drive the actual model over a
+real corpus early and often, rather than relying on a fake-LLM suite. Fifteen
+defects surfaced that way; a fake-model test suite could not have found any of
+them, because every one originates in what a real model actually emits.
+
+The four worth reading:
+
+**The noise filter silently disabled the entire feature.** The
+document-frequency ceiling that stops a ubiquitous entity connecting everything
+to everything is a *fraction*. With three stored memories, an entity in two of
+them sits at 0.67, over the 0.5 ceiling — so the single most informative entity
+in the store produced no association at all, and would not have until the
+corpus grew large. Compounded by plain IDF being exactly zero when `df == N`,
+which on a small store is the normal case rather than an edge case. Both fixed:
+the ceiling now also requires an absolute corpus size and mention count, and
+specificity is smoothed so a genuinely shared entity never collapses to no
+signal.
+
+**Information gain alone picks bad questions.** Maximising it chose *"Was this
+about Nature?"* — 0.98 of 2.32 bits, a near-perfect split — over asking about
+Markus or Lake Bled. It is close to optimal by the metric and useless to a
+person: the user never wrote the word "Nature", so neither answer carries the
+information the entropy calculation credits it with. Questions are now ranked
+by gain × answerability, which is a *better* estimate of expected gain rather
+than a departure from it.
+
+**The same signal was counted three times.** A confirmed cue was rewarded once
+by `apply_positive_cue_boost` upstream, again as a cue-match bonus, and a third
+time as a shared-entity bonus — pinning a memory about a conference talk to the
+score ceiling, at `strong` confidence, next to the photograph the user was
+actually looking for, because both mentioned the same person. Confidence now
+also judges on the pre-boost score: a user corroborating a detail does not make
+a memory a better match for the question.
+
+**The date parser invented a date, in exactly the case it exists to prevent.**
+The model produced an `event_date` of *"Not specified in the primary memory
+(though related memories suggest a timeframe between 2021 and 2023)"*, and the
+bare-year fallback read "2021" out of it and placed the memory on the timeline.
+A string that disclaims a date now short-circuits the parser.
+
+Also found and fixed: a memory's whole alias list was folded into *every*
+entity it mentioned (so the location "Switzerland" acquired the alias "avs
+number", corrupting resolution, since entities are looked up by alias); the
+model names the store's owner "Narrator"/"User (Owner of the AHV number)" where
+the text said "I", which would have made the owner the highest-degree node in
+the graph; one real thing fragmented into several nodes by role; image *medium
+and style* descriptors ("minimalist illustration") became `object` entities and
+grouped memories by how their pictures were drawn; re-projection never
+refreshed or pruned an entity a memory stopped mentioning, so a thing mentioned
+by nothing advertised three mentions; deleting a capture left a phantom episode
+on the timeline; and a constraint violation during projection poisoned the
+caller's transaction and marked a perfectly-ingested capture as failed —
+projection now runs inside a SAVEPOINT, because the graph is an index and a bug
+in it must never cost a memory.
+
+---
+
+## 5. Remaining limitations
+
+Full list in `docs/TODO.md`. The ones that would change how you read the
+results above:
+
+- **Entity resolution is exact-match plus conservative alias folding.** "ETH"
+  merges into "ETH Zurich"; "ETH Zurich" and "Swiss Federal Institute of
+  Technology" stay two nodes, as do a name and its misspelling. Deliberate —
+  wrongly merging two entities is unrecoverable while failing to merge one only
+  costs a missed association — but it is a real ceiling on recall.
+- **Every graph and episode threshold is an engineering default**, chosen by
+  reasoning plus one real-model corpus and not swept. The benchmark is now the
+  harness that *could* sweep them; on a 44-memory synthetic corpus a sweep would
+  mostly overfit it.
+- **Association weights go stale** as the corpus grows, until either endpoint is
+  re-projected or `scripts/rebuild_graph.py` runs.
+- **Episode clustering is greedy and order-dependent.** Re-running projection
+  converges; until then the grouping depends on ingestion order.
+- **Visual concepts are only as good as the caption**, and caption quality on
+  real photographs still has not been evaluated — the demonstration dataset
+  uses generated illustrations, which exercises the path but says nothing about
+  photographs.
+- **Audio transcription accuracy is not established** — only synthesised speech
+  was available to test with. The model demonstrably hears the audio but
+  rewrites clauses it cannot make out rather than marking them uncertain.
+- **No way to correct a wrong association or episode assignment** except by
+  correcting the underlying memory, because both APIs are deliberately
+  read-only. Whether a user-visible "these are not related" signal should exist,
+  and how it would survive a re-projection, is an open design question.
+
+---
+
+## 6. Running and demonstrating it
+
+```sh
+nix develop
+scripts/model-doctor.sh
+scripts/dev-db.sh start
+(cd backend && alembic upgrade head)
+scripts/run-dev.sh                      # API on 127.0.0.1:8000
+python3 scripts/seed_demo.py            # synthetic demo dataset, several minutes
+python3 scripts/build_frontend.py
+python3 -m http.server --directory dist 8099
+```
+
+Then in the browser console, once: `localStorage.setItem("membase.backendUrl",
+"http://127.0.0.1:8000")` and reload. (The dev server sends no CORS headers —
+nginx owns CORS in production — so cross-origin needs a same-origin `/api/*`
+proxy in front of `dist/`. See `docs/USAGE.md`.)
+
+**The demonstration.** Open `/app/recall/` and ask:
+
+> I am trying to remember a photograph from a trip a few years ago. I think we
+> were near a lake, possibly in Switzerland or Austria. There were mountains in
+> the background, and I remember taking it with a friend.
+
+The store contains three lake trips that each match that description partially
+and differ in one attribute. The system does not guess. It shows the five
+candidates it is choosing between, each with its evidence and an honest `weak`
+confidence, and asks one concrete question chosen for how much it would
+actually resolve — measured, and shown, in the retrieval trail.
+
+Answer it the way a real person would, including correcting your own wrong
+guess:
+
+> Actually no, not Switzerland. I am fairly sure it was with Markus.
+
+Cue extraction pulls three cues from that one sentence — the denial of the
+pending question, the denial of Switzerland, and the new detail "Markus" — rules
+out the memories the denials exclude, and raises the Lake Bled photograph to
+`strong`. From the result you can open its memory network (nine one-hop
+associations, each with a deterministic explanation of *why*), its episode, and
+the photograph itself.
+
+`/app/explorer/` shows the same structure as a graph; `/app/timeline/` shows it
+chronologically, with undated memories labelled rather than placed somewhere
+invented; `/app/evaluation/` shows whether any of it actually beats
+conventional retrieval.
