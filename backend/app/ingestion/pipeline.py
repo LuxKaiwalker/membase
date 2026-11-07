@@ -23,6 +23,12 @@ from app.ingestion.files import ProcessedFile, UnsupportedFileError, extract_pdf
 from app.ingestion import structurer
 from app.llm import get_llm_provider
 from app.llm.base import LLMError, LLMProvider
+# The graph projection is deliberately imported at module level, unlike
+# app/retrieval/pipeline.py's hybrid_search (imported locally inside
+# _finalize_structuring/_detect_conflicts to avoid an ingestion<->retrieval
+# cycle). app/memory/ depends only on app/models + app/config, so there is no
+# cycle to avoid here.
+from app.memory.graph import project_unit_safely
 from app.models import Attachment, AttachmentChunk, Capture, MemoryUnit
 
 logger = logging.getLogger(__name__)
@@ -661,6 +667,16 @@ async def _finalize_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, token:
     if committed and values.get("embedding") is not None:
         db.refresh(unit)
         await _detect_conflicts(db, llm, unit)
+    if committed:
+        # Project into the associative graph only after the unit is durably
+        # "ready" -- the graph is an index over committed state, and a node
+        # for a unit whose commit lost its lease race would be an index entry
+        # for a result that was dropped. Deliberately outside the
+        # embedding-present branch above: a unit whose embedding call failed
+        # is still fully searchable via full-text and still belongs in the
+        # graph (its entities came from `semantic`, not from the vector).
+        db.refresh(unit)
+        project_unit_safely(db, unit)
 
 
 async def finish_unit_processing(unit_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
@@ -784,7 +800,14 @@ async def _finalize_structuring(db: Session, llm: LLMProvider, unit: MemoryUnit,
         _commit_structuring_if_token_matches(db, unit.id, token, {"structure_status": "failed"})
         return
 
-    _commit_structuring_if_token_matches(db, unit.id, token, values)
+    if _commit_structuring_if_token_matches(db, unit.id, token, values):
+        # Re-project: structuring replaced `semantic` wholesale and wrote
+        # `related_unit_ids`, so both the entity links and the association
+        # edges derived from this unit are now stale. Projection being
+        # idempotent is what makes "just run it again" the correct response to
+        # any change in a unit's semantics.
+        db.refresh(unit)
+        project_unit_safely(db, unit)
 
 
 async def finish_structuring(unit_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
@@ -1255,6 +1278,7 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
     db.commit()
     db.refresh(unit)
     await _detect_conflicts(db, llm, unit)
+    project_unit_safely(db, unit)
     return unit
 
 
@@ -1368,6 +1392,7 @@ async def reprocess_unit(db: Session, llm: LLMProvider, unit: MemoryUnit) -> Mem
     unit.pipeline_version = CURRENT_PIPELINE_VERSION
     db.commit()
     db.refresh(unit)
+    project_unit_safely(db, unit)
     return unit
 
 
@@ -1506,4 +1531,10 @@ def discard_unit(db: Session, unit: MemoryUnit) -> MemoryUnit:
     unit.pending_clarification = None
     db.commit()
     db.refresh(unit)
+    # A discarded unit must leave the graph too, or the association edges it
+    # left behind would keep routing associative retrieval through content the
+    # user explicitly cancelled -- the exact gap the status filter in
+    # hybrid_search() exists to close. project_unit() on a non-ready unit
+    # removes and rebuilds nothing, which is precisely what's wanted here.
+    project_unit_safely(db, unit)
     return unit

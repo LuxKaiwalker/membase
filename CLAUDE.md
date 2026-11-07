@@ -63,6 +63,7 @@ scripts/run-session-eval.sh # iterative-recall eval set (multi-round/ambiguity),
 scripts/sweep-threshold.sh  # retrieval-threshold calibration experiment, same isolated DB
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings; drop --dry-run to fix
 python3 scripts/reprocess_memories.py --dry-run   # report units left behind by an older pipeline version; drop --dry-run to fix (low priority, run idle -- see docs/DECISIONS.md "Reprocessing pipeline")
+python3 scripts/rebuild_graph.py --dry-run   # report units missing from the associative graph; drop --dry-run to re-project them (no LLM calls, idempotent; --prune, --unit-id)
 scripts/dev-db.sh stop
 ```
 

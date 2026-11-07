@@ -145,3 +145,123 @@ class RecallSessionOut(BaseModel):
     updated_at: datetime
 
 
+
+
+# ---------------------------------------------------------------------------
+# Associative memory graph (see docs/ARCHITECTURE.md "Associative memory
+# graph"). Hand-built from app/memory/graph.py's dataclasses rather than
+# from_attributes'd off the ORM: what the explorer needs is a node/edge view
+# assembled across four tables, not a row-per-table dump.
+
+
+class GraphNodeOut(BaseModel):
+    id: str                      # "unit:<uuid>" | "entity:<uuid>"
+    node_type: str               # "unit" | "entity"
+    label: str
+    kind: str                    # "memory" for units; the entity kind otherwise
+    detail: str = ""
+    degree: int = 0
+    occurred_on: str | None = None
+    # day | month | season | year | unknown -- the UI must not render a date at
+    # more precision than this claims (see app/memory/temporal.py).
+    date_precision: str = "unknown"
+
+
+class GraphEdgeOut(BaseModel):
+    source: str
+    target: str
+    edge_type: str               # "mentions" | "association" | "relation"
+    kind: str
+    # explicit | extracted | inferred -- the authority distinction the UI
+    # renders differently, so a computed association never looks like
+    # something the user stated.
+    origin: str
+    weight: float
+    label: str = ""
+    explanation: str = ""
+
+
+class GraphOut(BaseModel):
+    nodes: list[GraphNodeOut]
+    edges: list[GraphEdgeOut]
+    # True when a node cap dropped part of the graph -- surfaced so the UI can
+    # say so rather than presenting a partial graph as the whole thing.
+    truncated: bool = False
+    total_units: int = 0
+    total_entities: int = 0
+
+
+class EntityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: str
+    display_name: str
+    normalized_name: str
+    aliases: list
+    mention_count: int
+
+
+class EntityDetailOut(BaseModel):
+    entity: EntityOut
+    # Memories mentioning this entity, with the role/origin of each mention so
+    # the caller can tell a user-stated attribution from an extracted one.
+    mentions: list["EntityMentionOut"]
+    relations: list["EntityRelationOut"]
+
+
+class EntityMentionOut(BaseModel):
+    unit_id: uuid.UUID
+    capture_id: uuid.UUID
+    content: str
+    role: str
+    origin: str
+    weight: float
+    provenance: dict
+    created_at: datetime
+
+
+class EntityRelationOut(BaseModel):
+    id: uuid.UUID
+    unit_id: uuid.UUID
+    subject: str
+    predicate: str
+    object: str
+    origin: str
+    weight: float
+    occurred_on: str | None
+    date_precision: str
+
+
+class AssociationStepOut(BaseModel):
+    from_unit_id: uuid.UUID
+    to_unit_id: uuid.UUID
+    kind: str
+    origin: str
+    weight: float
+    explanation: str
+
+
+class AssociatedUnitOut(BaseModel):
+    unit: MemoryUnitOut
+    strength: float
+    hops: int
+    path: list[AssociationStepOut]
+    # Deterministic, non-LLM justification for the whole path -- "why is this
+    # memory here?" answered without a model call.
+    why: str
+
+
+class GraphStatsOut(BaseModel):
+    ready_units: int
+    entities: int
+    entity_links: int
+    relations: int
+    associations: int
+    # Entity counts per kind, for the explorer's filter chips.
+    entities_by_kind: dict[str, int]
+    # Association counts per kind, same purpose.
+    associations_by_kind: dict[str, int]
+    # The most-connected entities, for an at-a-glance "what your memory is
+    # mostly about" panel on the overview page.
+    top_entities: list[EntityOut]

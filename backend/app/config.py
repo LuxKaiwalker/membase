@@ -62,6 +62,42 @@ class Settings(BaseSettings):
     # meant to stay cheap, not an exhaustive scan of the whole store.
     membase_conflict_check_candidates: int = 5
 
+    # --- associative memory graph (see docs/ARCHITECTURE.md "Associative
+    # memory graph" and app/memory/graph.py).
+    #
+    # All three exist to answer the same question -- "when is a connection
+    # worth storing?" -- from three directions, because the single biggest
+    # failure mode of an automatically-built memory graph is not missing edges
+    # but degenerating into one where everything connects to everything.
+    #
+    # An entity linked by more than this share of all ready memories is
+    # excluded from *generating association edges* (its link rows are still
+    # kept, as real provenance). Your own home city or employer legitimately
+    # appears in half your memories and says nothing about which two are
+    # related. 0.5 is an engineering default, not swept -- it only starts to
+    # bind once the corpus is large enough for an entity to reach that share,
+    # and the specificity weighting (see entity_specificity) already discounts
+    # common entities smoothly below it.
+    membase_graph_entity_df_ceiling: float = 0.5
+    # The ceiling above is a fraction, so it is meaningless on a small corpus:
+    # with 3 stored memories an entity in 2 of them is already at 0.67. Both
+    # of these must also hold before the ceiling may exclude an entity --
+    # without them, the most informative entity in a small store (a person
+    # named in two of three memories) got filtered out and the association
+    # feature silently did nothing until the corpus grew. Found by running the
+    # real model over a four-memory corpus, not by reasoning about it.
+    membase_graph_entity_df_min_units: int = 10
+    membase_graph_entity_df_min_mentions: int = 3
+    # Associations weaker than this are not written at all. Set relative to
+    # the weight a single shared mid-specificity topic produces (~0.1), so one
+    # shared generic theme is not by itself a connection, while a shared
+    # person or place comfortably clears it.
+    membase_graph_min_association_weight: float = 0.15
+    # Hard fan-out cap per memory, keeping the strongest. Bounds both storage
+    # and the worst-case cost of a 2-hop traversal (which is this value
+    # squared in the limit) without needing a recursive query planner.
+    membase_graph_max_associations_per_unit: int = 24
+
 
 @lru_cache
 def get_settings() -> Settings:
