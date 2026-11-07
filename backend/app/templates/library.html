@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% set nav_active = "library" %}
+{% block title %}membase — Library{% endblock %}
+{% block content %}
+<section class="panel panel-reading">
+  <div class="panel-head">
+    <p class="eyebrow">Library</p>
+    <h1>Everything you've stored</h1>
+    <p class="lede">
+      Anything still awaiting a follow-up question is listed first;
+      everything else, newest first. Deleting a capture removes its units
+      and attachments for good.
+    </p>
+  </div>
+
+  {# Element IDs are the contract with static/pages/library.js. #}
+  <button id="skip-all-followups" type="button" class="btn btn-secondary hidden">
+    Skip all remaining follow-up questions
+  </button>
+
+  <div id="status" class="status hidden"></div>
+  <div id="capture-list"></div>
+</section>
+{% endblock %}

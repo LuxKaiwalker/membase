@@ -39,6 +39,29 @@ def test_build_retrieval_text_includes_all_present_fields():
     assert "Event date: 2026-01-01" in text
 
 
+def test_build_retrieval_text_includes_visual_concepts():
+    """An image's visible contents must be embedded AND full-text indexed,
+    not only projected into the association graph -- otherwise a plain
+    semantic search for "a lake and mountains" still misses the photo."""
+    semantic = {
+        "meaning": "A hike above a lake.",
+        "aliases": [], "people": [], "organizations": [], "locations": [],
+        "topics": ["hiking"], "definitions": [], "relations": [], "event_date": "",
+        "visual_concepts": ["lake", "mountains", "snow"],
+    }
+    text = build_retrieval_text("That summer hike.", [], semantic)
+    assert "Visible in image: lake, mountains, snow" in text
+
+
+def test_build_retrieval_text_omits_visual_concepts_when_empty():
+    semantic = {
+        "meaning": "", "aliases": [], "people": [], "organizations": [], "locations": [],
+        "topics": [], "definitions": [], "relations": [], "event_date": "",
+        "visual_concepts": [],
+    }
+    assert "Visible in image" not in build_retrieval_text("Some content.", [], semantic)
+
+
 def test_build_retrieval_text_includes_clarifications():
     semantic = {"meaning": "", "aliases": [], "people": [], "organizations": [], "locations": [], "topics": [], "definitions": [], "relations": [], "event_date": ""}
     clarifications = [{"question": "What is X?", "answer": "X is Y."}]

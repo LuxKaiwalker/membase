@@ -61,8 +61,11 @@ pytest -q                   # fast fakes + real-LLM integration tests
 scripts/run-eval.sh         # 30-case one-shot eval set, isolated DB (membase_eval)
 scripts/run-session-eval.sh # iterative-recall eval set (multi-round/ambiguity), same isolated DB
 scripts/sweep-threshold.sh  # retrieval-threshold calibration experiment, same isolated DB
+scripts/run-strategy-benchmark.sh  # 4-way retrieval-strategy comparison (vector/semantic/associative/adaptive) on one cached corpus, same isolated DB -- see docs/EVALUATION.md (--self-check, --limit N, --repeat N, --reseed)
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings; drop --dry-run to fix
 python3 scripts/reprocess_memories.py --dry-run   # report units left behind by an older pipeline version; drop --dry-run to fix (low priority, run idle -- see docs/DECISIONS.md "Reprocessing pipeline")
+python3 scripts/rebuild_graph.py --dry-run   # report units missing from the associative graph; drop --dry-run to re-project them (no LLM calls, idempotent; --prune, --unit-id)
+python3 scripts/seed_demo.py --dry-run   # describe the SYNTHETIC demonstration dataset; drop --dry-run to ingest it (real pipeline, several minutes; refuses membase_prod without --allow-prod)
 scripts/dev-db.sh stop
 ```
 

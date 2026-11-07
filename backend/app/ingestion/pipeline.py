@@ -4,7 +4,7 @@ import re
 import shutil
 import uuid
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -23,6 +23,12 @@ from app.ingestion.files import ProcessedFile, UnsupportedFileError, extract_pdf
 from app.ingestion import structurer
 from app.llm import get_llm_provider
 from app.llm.base import LLMError, LLMProvider
+# The graph projection is deliberately imported at module level, unlike
+# app/retrieval/pipeline.py's hybrid_search (imported locally inside
+# _finalize_structuring/_detect_conflicts to avoid an ingestion<->retrieval
+# cycle). app/memory/ depends only on app/models + app/config, so there is no
+# cycle to avoid here.
+from app.memory.graph import project_unit_safely
 from app.models import Attachment, AttachmentChunk, Capture, MemoryUnit
 
 logger = logging.getLogger(__name__)
@@ -43,7 +49,12 @@ MAX_CLARIFICATION_ROUNDS = 3
 # _attachment_text_for_analysis() silently dropping a later
 # attachment's text entirely when several images' combined text
 # exceeded the old flat per-capture slice (see docs/user-todo.md).
-CURRENT_PIPELINE_VERSION = 1
+# 2: enrichment now extracts `semantic.visual_concepts` (see
+# app/ingestion/enrichment.py). Every photo stored before this ran has an
+# empty list there, and so contributes no "object" entities to the
+# association graph -- reprocessing is what makes "that photo with a lake
+# and mountains behind it" reach memories captured before the field existed.
+CURRENT_PIPELINE_VERSION = 2
 
 # Marker delimiting an attachment excerpt appended to a unit's
 # retrieval_text by add_attachment() -- used to strip a stale excerpt
@@ -98,15 +109,26 @@ def _attachment_parts(capture: Capture) -> list[str]:
     enrichment call sees multiple photos as distinct, orderable sources
     (e.g. OD values from one photo and OS values from another) rather
     than one undifferentiated blob -- see docs/DECISIONS.md.
+
+    An audio attachment's transcript is labeled the same way, for two
+    reasons: the model must not read a transcript as the user's own typed
+    words, and `visual_concepts` enrichment keys explicitly off the
+    "Image N:" label (see app/ingestion/enrichment.py), so an unlabeled
+    transcript full of concrete nouns would otherwise be mined for things
+    "visible in the image" of a memory that has no image at all.
     """
     parts: list[str] = []
     image_n = 0
+    audio_n = 0
     for a in capture.attachments:
         if not a.extracted_text:
             continue
         if a.content_type.startswith("image/"):
             image_n += 1
             parts.append(f"Image {image_n}:\n{a.extracted_text}")
+        elif is_audio(a):
+            audio_n += 1
+            parts.append(f"Audio recording {audio_n} (transcript):\n{a.extracted_text}")
         else:
             parts.append(a.extracted_text)
     return parts
@@ -402,6 +424,140 @@ def is_uncaptioned_image(attachment: Attachment) -> bool:
     return attachment.content_type.startswith("image/") and attachment.extraction_status == "unsupported"
 
 
+# --- audio transcription (see docs/DECISIONS.md) ------------------------
+# Empirically established against THIS machine's stack (Ollama 0.40.3 +
+# gemma4:12b, which advertises capabilities ["completion","vision","audio",
+# "tools","thinking"]) by POSTing real synthesized-speech files to
+# /api/chat directly, not by reading docs. Two findings drive the code
+# below, and both are the kind that are invisible until measured:
+#
+# 1. Audio must be passed in the message's EXISTING `images` array -- the
+#    same base64 field OllamaProvider._encode_images() already fills for
+#    photos. `{"role":"user","content":...,"images":[<b64 wav>]}` returned
+#    HTTP 200 with a real transcript. A separate `"audio":[<b64 wav>]`
+#    field on the message is NOT supported by this Ollama version, and --
+#    the dangerous part -- it does not error: the request returns HTTP 200
+#    while the audio is silently DISCARDED. The model then answers from the
+#    text prompt alone (prompt_eval_count collapsed from 164 to 36, i.e. no
+#    media tokens at all, and the reply was "NO SPEECH"). So no provider
+#    change is needed, and anyone "fixing" this to use an `audio` field
+#    would get a plausible-looking but entirely hallucinated transcript.
+#
+# 2. Only WAV, MP3 and FLAC actually decode. OGG (both Opus and Vorbis),
+#    M4A/AAC and WebM all came back HTTP 400 "Failed to load image or audio
+#    file". Those are still accepted and stored (see _ALLOWED_MIMES in
+#    app/ingestion/files.py -- never lose the original), but transcribing
+#    them is a guaranteed-failing LLM call, so they are skipped outright
+#    rather than attempted and logged. They keep extraction_status
+#    "unsupported" and remain downloadable via
+#    GET /api/attachments/{id}/file.
+#
+# Transcription *accuracy* is a separate matter and was NOT established:
+# the only speech available here was espeak-ng TTS, on which gemma4
+# demonstrably hears the audio (digits and "Thursday" came back exactly,
+# and "four o'clock" was misheard as the phonetically-adjacent "Oracle" --
+# a mishearing is itself proof the acoustic signal is being decoded) but
+# also rewrites whole clauses it can't make out. Worse, a non-speech input
+# (a pure 440Hz sine tone) produced a fluent, wholly invented paragraph
+# instead of reporting silence. Hence the prompt below insists on a
+# verbatim transcript and on NO_SPEECH for anything without speech, and
+# _transcribe_audio() treats that sentinel as "nothing to store" -- a
+# confabulated transcript indexed as a memory is worse than no transcript.
+TRANSCRIBABLE_AUDIO_MIMES = frozenset(
+    {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/flac", "audio/x-flac"}
+)
+
+# The sentinel the prompt asks for when there is no speech. Checked for
+# exactly because of finding (2) above: left to its own devices this model
+# invents dialogue for non-speech audio.
+_NO_SPEECH_SENTINEL = "NO_SPEECH"
+
+_AUDIO_TRANSCRIBE_PROMPT = (
+    "Transcribe the speech in this audio recording verbatim, as plain text. "
+    "Write only what is actually said -- do not summarize, translate, "
+    "correct, or continue it, and do not add commentary. If a passage is "
+    "unintelligible, write [inaudible] rather than guessing at the words. "
+    f"If the recording contains no speech at all, reply with exactly "
+    f"{_NO_SPEECH_SENTINEL} and nothing else. This transcript becomes the "
+    "recording's only searchable representation, so accuracy matters more "
+    "than fluency."
+)
+
+
+async def _transcribe_audio(llm: LLMProvider, data: bytes) -> str | None:
+    """Transcribe an audio file via the generation model's native
+    multimodal understanding -- the exact shape of _describe_image()
+    above, including passing the bytes as `images=[data]` (finding 1
+    above: that is the field Ollama reads audio from).
+
+    Deliberately no second model: this GPU has 11GB VRAM and gemma4:12b
+    alone measures ~8.7GB, so a dedicated speech model (Whisper or
+    otherwise) has nowhere to live -- see CLAUDE.md "Environment facts".
+
+    Best-effort in exactly the same way as image captioning: an LLMError
+    -- which is also how an undecodable container surfaces, since
+    Ollama's HTTP 400 becomes an LLMUnavailableError in
+    OllamaProvider._post -- leaves the recording stored (already
+    committed before this runs) but without a transcript, rather than
+    failing the capture.
+    """
+    try:
+        transcript = await llm.generate(_AUDIO_TRANSCRIBE_PROMPT, images=[data], temperature=0.0)
+    except LLMError:
+        logger.warning("Audio transcription failed; recording stored but not text-searchable")
+        return None
+    transcript = transcript.strip()
+    # Matched loosely on purpose: asked for "NO_SPEECH", the live model was
+    # observed replying "NO SPEECH" (space, no underscore), and a sentinel
+    # that misses by one character would store the sentinel itself as a
+    # memory's searchable transcript.
+    if not transcript or transcript.strip(" .\"'").upper().replace(" ", "_") == _NO_SPEECH_SENTINEL:
+        return None
+    return transcript
+
+
+def is_untranscribed_audio(attachment: Attachment) -> bool:
+    """Audio we have not transcribed yet AND can actually transcribe. The
+    mime gate is what keeps an OGG/M4A/WebM upload from costing a
+    guaranteed-400 LLM call on every pass -- see finding (2) above."""
+    return (
+        attachment.extraction_status == "unsupported"
+        and attachment.content_type in TRANSCRIBABLE_AUDIO_MIMES
+    )
+
+
+def is_audio(attachment: Attachment) -> bool:
+    """Includes "video/webm", which is how libmagic reports an audio-only
+    WebM recording -- see _ALLOWED_MIMES in app/ingestion/files.py."""
+    return attachment.content_type.startswith("audio/") or attachment.content_type == "video/webm"
+
+
+async def _transcribe_one_audio(db: Session, llm: LLMProvider, attachment: Attachment) -> None:
+    """Transcribe one audio attachment in the foreground of
+    process_capture_fully(), before segmentation/clarification/enrichment
+    -- the same lease/commit discipline as _caption_one_image(), and for
+    the same reason: a recording's contents must be able to inform all
+    three. The transcript lands in Attachment.extracted_text, so it flows
+    into searchable_text and chunking exactly like extracted PDF text
+    already does, with no downstream changes at all.
+    """
+    try:
+        data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+        transcript = await _transcribe_audio(llm, data)
+        if not transcript:
+            return
+        attachment.extracted_text = transcript
+        attachment.extraction_status = "ok"
+        db.commit()
+    except Exception:
+        # Same catch-all rationale as _caption_one_image(): one
+        # attachment's surprise failure (e.g. the file vanished from disk
+        # between upload and now) must not abort the rest of
+        # process_capture_fully for this capture's other attachments and
+        # units -- this recording just stays untranscribed.
+        logger.exception("Unexpected failure transcribing attachment %s", attachment.id)
+
+
 async def _caption_one_image(db: Session, llm: LLMProvider, attachment: Attachment) -> None:
     """Caption (+ structured-extract) one image attachment, in the
     foreground of process_capture_fully() -- deliberately BEFORE
@@ -661,6 +817,16 @@ async def _finalize_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, token:
     if committed and values.get("embedding") is not None:
         db.refresh(unit)
         await _detect_conflicts(db, llm, unit)
+    if committed:
+        # Project into the associative graph only after the unit is durably
+        # "ready" -- the graph is an index over committed state, and a node
+        # for a unit whose commit lost its lease race would be an index entry
+        # for a result that was dropped. Deliberately outside the
+        # embedding-present branch above: a unit whose embedding call failed
+        # is still fully searchable via full-text and still belongs in the
+        # graph (its entities came from `semantic`, not from the vector).
+        db.refresh(unit)
+        project_unit_safely(db, unit)
 
 
 async def finish_unit_processing(unit_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
@@ -784,7 +950,14 @@ async def _finalize_structuring(db: Session, llm: LLMProvider, unit: MemoryUnit,
         _commit_structuring_if_token_matches(db, unit.id, token, {"structure_status": "failed"})
         return
 
-    _commit_structuring_if_token_matches(db, unit.id, token, values)
+    if _commit_structuring_if_token_matches(db, unit.id, token, values):
+        # Re-project: structuring replaced `semantic` wholesale and wrote
+        # `related_unit_ids`, so both the entity links and the association
+        # edges derived from this unit are now stale. Projection being
+        # idempotent is what makes "just run it again" the correct response to
+        # any change in a unit's semantics.
+        db.refresh(unit)
+        project_unit_safely(db, unit)
 
 
 async def finish_structuring(unit_id: uuid.UUID, llm: LLMProvider | None = None) -> None:
@@ -1013,6 +1186,12 @@ async def process_capture_fully(
             for attachment in capture.attachments:
                 if is_uncaptioned_image(attachment):
                     await _caption_one_image(db, llm, attachment)
+                elif is_untranscribed_audio(attachment):
+                    # Same position in the sequence and the same reason as
+                    # captioning: a recording's transcript has to exist
+                    # before segmentation/clarify/enrich ever see this
+                    # capture's text.
+                    await _transcribe_one_audio(db, llm, attachment)
             db.refresh(capture)
 
             # Only an image's chunking decision belongs here -- it's the
@@ -1023,8 +1202,14 @@ async def process_capture_fully(
             # alongside capture creation (see app/api/captures.py) --
             # redoing it here too would just be a wasted duplicate
             # _index_attachment_chunks() call (idempotent, but pointless).
+            # Audio belongs in this same inline pass for exactly the
+            # reason the comment above gives for images: a transcript, like
+            # a caption, did not exist when captures.py scheduled the
+            # independent non-image chunking task, so that task saw an
+            # empty extracted_text and skipped. A long recording's
+            # transcript would otherwise never be chunk-indexed.
             for attachment in capture.attachments:
-                if attachment.content_type.startswith("image/") and should_chunk(attachment.extracted_text):
+                if (attachment.content_type.startswith("image/") or is_audio(attachment)) and should_chunk(attachment.extracted_text):
                     processed = ProcessedFile(
                         stored_path=attachment.stored_path, content_type=attachment.content_type,
                         size_bytes=attachment.size_bytes, extracted_text=attachment.extracted_text,
@@ -1255,6 +1440,7 @@ async def correct_unit(db: Session, llm: LLMProvider, unit: MemoryUnit, correcti
     db.commit()
     db.refresh(unit)
     await _detect_conflicts(db, llm, unit)
+    project_unit_safely(db, unit)
     return unit
 
 
@@ -1368,6 +1554,7 @@ async def reprocess_unit(db: Session, llm: LLMProvider, unit: MemoryUnit) -> Mem
     unit.pipeline_version = CURRENT_PIPELINE_VERSION
     db.commit()
     db.refresh(unit)
+    project_unit_safely(db, unit)
     return unit
 
 
@@ -1471,6 +1658,17 @@ async def add_attachments(
                 attachment.extraction_status = "ok"
                 processed.extracted_text = description
                 db.commit()
+        elif is_untranscribed_audio(attachment):
+            data_bytes = (get_settings().uploads_dir / processed.stored_path).read_bytes()
+            transcript = await _transcribe_audio(llm, data_bytes)
+            if transcript:
+                attachment.extracted_text = transcript
+                attachment.extraction_status = "ok"
+                # `processed` is kept in step with the row so the
+                # should_chunk() call just below sees the transcript --
+                # exactly as the captioning branch does for a caption.
+                processed.extracted_text = transcript
+                db.commit()
         if should_chunk(processed.extracted_text):
             await _index_attachment_chunks(db, llm, attachment, processed)
 
@@ -1492,8 +1690,29 @@ def delete_capture(db: Session, capture: Capture) -> None:
     anywhere in this codebase -- this is the only way a memory ever goes
     away, and it's always a direct user action.
     """
+    from app.memory.episodes import refresh_episode
+    from app.models import EpisodeMembership
+
     capture_dir = get_settings().uploads_dir / str(capture.id)
+    # Which episodes this capture's memories belonged to, captured BEFORE the
+    # delete: the DB cascade removes the membership rows, but an Episode row
+    # has no FK to anything and survives. Without this, deleting the last
+    # memory of an episode leaves a phantom timeline entry -- an episode with
+    # zero members still listed by GET /api/episodes, still titled after the
+    # memories that no longer exist. refresh_episode() deletes an episode left
+    # with no ready members, so re-running it for each affected episode after
+    # the cascade is what actually removes it.
+    affected_episode_ids = set(
+        db.execute(
+            select(EpisodeMembership.episode_id)
+            .join(MemoryUnit, MemoryUnit.id == EpisodeMembership.unit_id)
+            .where(MemoryUnit.capture_id == capture.id)
+        ).scalars()
+    )
     db.delete(capture)
+    db.commit()
+    for episode_id in affected_episode_ids:
+        refresh_episode(db, episode_id)
     db.commit()
     shutil.rmtree(capture_dir, ignore_errors=True)
 
@@ -1506,4 +1725,10 @@ def discard_unit(db: Session, unit: MemoryUnit) -> MemoryUnit:
     unit.pending_clarification = None
     db.commit()
     db.refresh(unit)
+    # A discarded unit must leave the graph too, or the association edges it
+    # left behind would keep routing associative retrieval through content the
+    # user explicitly cancelled -- the exact gap the status filter in
+    # hybrid_search() exists to close. project_unit() on a non-ready unit
+    # removes and rebuilds nothing, which is precisely what's wanted here.
+    project_unit_safely(db, unit)
     return unit

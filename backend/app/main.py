@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import attachments, captures, recall, units
+from app.api import attachments, captures, episodes, graph, recall, units
 from app.llm import get_llm_provider
 from app.llm.base import LLMError
 
@@ -36,6 +36,12 @@ app.include_router(captures.router)
 app.include_router(units.router)
 app.include_router(recall.router)
 app.include_router(attachments.router)
+# Read-only; see app/api/graph.py for why the memory graph deliberately has no
+# write endpoints.
+app.include_router(graph.router)
+# Also read-only -- episodes are derived, never hand-constructed (see
+# app/api/episodes.py).
+app.include_router(episodes.router)
 
 
 @app.exception_handler(LLMError)

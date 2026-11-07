@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% set nav_active = "store" %}
+{% block title %}membase — Store{% endblock %}
+{% block content %}
+<section class="panel panel-reading">
+  <div class="panel-head">
+    <p class="eyebrow">Store</p>
+    <h1>Write what you want to store</h1>
+    <p class="lede">
+      Your words are saved verbatim and never rewritten. Everything
+      derived from them is layered on top, in the background.
+    </p>
+  </div>
+
+  {# Element IDs are the contract with static/pages/store.js. #}
+  <form id="create-form">
+    <div class="field">
+      <textarea id="text" name="text" class="input" rows="5"
+        placeholder="e.g. I met Anna at ETH yesterday. She studies robotics and recommended a paper about tactile sensing."
+        required></textarea>
+    </div>
+
+    <div class="field">
+      <label for="files">Attachments (optional)</label>
+      <input id="files" type="file" multiple />
+      <ul id="selected-files" class="selected-files"></ul>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Save</button>
+  </form>
+
+  <!-- Each submission gets its own card below, independent of any other
+       in-flight capture -- submitting a second memory never waits on the
+       first one's clarification or background processing. -->
+  <div id="captures"></div>
+</section>
+{% endblock %}

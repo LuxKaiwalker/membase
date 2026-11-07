@@ -55,9 +55,19 @@ _SEMANTIC_PROPERTIES: dict[str, Any] = {
             "required": ["subject", "predicate", "object"],
         },
     },
+    # MUST be asked for here, not just in app/ingestion/enrichment.py: this
+    # pass REPLACES a unit's `semantic` dict wholesale (see
+    # _finalize_structuring in app/ingestion/pipeline.py), so any field this
+    # schema omits is silently dropped from an already-good first-pass
+    # result the moment the structurer runs. That would make an image's
+    # visual concepts -- and every "object" entity the association graph
+    # built from them -- disappear a few seconds after ingestion, which is
+    # far worse than never having extracted them.
+    "visual_concepts": {"type": "array", "items": {"type": "string"}},
 }
 _SEMANTIC_REQUIRED = [
     "meaning", "event_date", "people", "organizations", "locations", "aliases", "topics", "definitions", "relations",
+    "visual_concepts",
 ]
 
 _STRUCTURE_SCHEMA = {
@@ -83,6 +93,14 @@ _STRUCTURE_SYSTEM = (
     "surface implicit entities, indirect relations, and useful aliases "
     "a fast pass might have missed. Do not invent facts not supported "
     "by the text.\n\n"
+    "visual_concepts: when the attached content describes an IMAGE (a "
+    "block labeled 'Image N:'), list the concrete things actually VISIBLE "
+    "in it -- objects, scenery, setting -- as short noun phrases (e.g. "
+    "'lake', 'mountains', 'snow', 'whiteboard'), using the plain everyday "
+    "word for each, so a photograph can later be found by what is in it "
+    "rather than by its filename. Leave it [] when there is no image, or "
+    "when nothing concrete is described as visible; never invent "
+    "something the description doesn't mention.\n\n"
     "You are also given a numbered list of OTHER memories that might be "
     "related. For each, decide if it is genuinely related to THIS "
     "memory (same topic, event, person, or project -- not just a "

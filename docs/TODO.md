@@ -1,5 +1,142 @@
 # TODO / open questions
 
+## This phase: the artificial memory engine (graph, episodes, evidence, benchmark)
+
+### Known gaps, flagged rather than silently left
+
+- **A hedged clue is treated as a hard constraint.** "I think it was possibly
+  in Switzerland or Austria" is, to a human reader, the user saying they do not
+  know where it was. Retrieval reads it as the words "Switzerland" and
+  "Austria" and scores memories accordingly -- so a memory that actually is in
+  Switzerland can dominate clearly enough to suppress the clarifying question,
+  and the system answers from the user's own mistaken premise. The answer stays
+  honest (it reports `moderate`, not `strong`, and surfaces the contradicting
+  memory it found by association), but this is the opposite of what a system
+  for *imperfect* recall should do with an expression of uncertainty.
+
+  Not attempted this phase because it changes what the retrieval layer treats
+  as a constraint, which deserves its own measurement rather than being added
+  to make the demonstration land more reliably. Open questions: whether hedging
+  is detected lexically ("I think", "maybe", "possibly", "or") or by asking the
+  extraction step to mark which parts of a query the user is unsure about;
+  whether a hedged term should be down-weighted in scoring or merely barred
+  from *suppressing* ambiguity; and how it interacts with
+  `apply_positive_cue_boost`, where a cue the user marked `uncertain` currently
+  gets exactly the same boost as one they were certain about.
+
+- **Association now measured once, suggestively.** With the expansion defect
+  fixed, `associative` posts the best recall@5 (0.943 vs 0.886 for vector) with
+  expansion verified live on 30 of 38 queries. But the margin is two queries on
+  a 35-query answerable set at `repeat: 1`, which is inside what a re-run could
+  move on its own. `--repeat 3` is the obvious next measurement and is cheap
+  now the corpus is cached; until then the result is a direction, not a
+  finding. See docs/REPORT.md §2.
+- **Clarification measured as a net negative, and not yet explained.**
+  `adaptive` takes the best recall@1 and the worst correctness and worst false
+  retrieval, losing 8 pairwise queries to `associative` and winning 2. Putting
+  the right memory on top more often while producing a worse answer from it is
+  not a result the current design predicts, and nothing here diagnoses it. The
+  per-query trail data needed to do so is in
+  `eval/strategy_benchmark_results.json`; the likely suspects are the
+  simulated user (answering from post-ingestion semantic fields, so its cues
+  may be more confident than a real person's) and `POSITIVE_CUE_BOOST` at 0.3
+  reshaping the candidate set after each round.
+- **Entity resolution is exact-match plus conservative alias folding, not
+  fuzzy.** `is_alias_of` (`app/memory/entities.py`) folds an alias only when
+  one name's words contain the other's as a contiguous whole-word run, so
+  "ETH" merges into "ETH Zurich" but "ETH Zurich" and "Swiss Federal Institute
+  of Technology" stay two nodes, as do "Anna" and a misspelling of it. This is
+  a deliberate choice -- wrongly merging two entities is unrecoverable (there
+  is no un-merge) while failing to merge one only costs a missed association
+  -- but it is a real ceiling on recall. Embedding-based or LLM-assisted entity
+  resolution is the obvious next step and would need its own evaluation,
+  since a false merge is much more damaging than a miss.
+- **Association weights go stale as the corpus grows.** Specificity depends on
+  the ready-unit count at projection time, and nothing re-projects an untouched
+  memory when the corpus grows. An edge's weight is refreshed whenever either
+  endpoint is re-projected, and `scripts/rebuild_graph.py` recomputes
+  everything, but there is no automatic drift correction. Acceptable at this
+  scale; would need a periodic pass at a much larger one.
+- **The graph's noise thresholds are engineering defaults, not swept.**
+  `membase_graph_entity_df_ceiling` (0.5), `_df_min_units` (10),
+  `_df_min_mentions` (3), `membase_graph_min_association_weight` (0.15),
+  `membase_graph_max_associations_per_unit` (24), `HOP_DECAY` (0.55), and the
+  `ROLE_WEIGHTS`/`KIND_ASSOCIATION_WEIGHTS` tables were all chosen by
+  reasoning plus one real-model corpus, in the same spirit as
+  `AMBIGUITY_MIN_RUNNER_UP_SCORE` and the high-confidence shortcut's
+  thresholds. `eval/run_strategy_benchmark.py` is now the harness that could
+  sweep them; nothing has been swept yet, and a sweep on a ~40-memory
+  synthetic corpus would mostly overfit it.
+- **Episode titles are composed, not written.** See docs/DECISIONS.md
+  "Episodes: deterministic clustering, and no model-written titles" for the
+  cost reasoning. `Episode.title_source` exists so a model-written title can be
+  added later and distinguished; the field currently only ever holds
+  `"derived"`.
+- **Episode clustering is greedy and order-dependent.** A memory joins the
+  oldest compatible episode rather than the globally best one. Re-running
+  projection converges, but the grouping you get depends on ingestion order
+  until you do. No automatic re-clustering pass exists.
+- **Seasons are northern-hemisphere only.** `app/memory/temporal.py`'s
+  `_SEASONS` maps "summer" to a July anchor. Documented at the definition
+  rather than silently assumed; a southern-hemisphere user would need it
+  inverted. The 45-day season tolerance is wide enough that the anchor choice
+  does not drive a retrieval decision on its own.
+- **Day-first date convention.** "03.04.2024" is read as 3 April, not 4 March.
+  A documented convention (matching this deployment's user), not a per-input
+  guess -- but it is a convention, and a US-formatted date would be misread.
+- **`expected_gain_bits_approx` is an ordering signal, not a measurement.** The
+  candidate distribution comes from normalised fused retrieval scores, which
+  are not calibrated probabilities. The key name says `approx` for that reason.
+  Calibrating it would require knowing the true posterior, which this system
+  does not have.
+- **The information-gain question selector assumes a truthful user and correct
+  metadata.** A user who misremembers ("yes, Anna was there" when she was not)
+  is led away from the right memory. Mitigated by negative cues excluding
+  rather than permanently eliminating, and by the original query being
+  re-searched every round, but not solved.
+- **Visual concepts depend on caption quality, which is still not empirically
+  validated.** `semantic.visual_concepts` is extracted from the image caption
+  the vision pass produces, and the pre-existing gap below ("image captions are
+  not empirically quality-tested") now propagates into the graph: a caption
+  that misses the lake produces no lake entity. The demonstration dataset uses
+  generated illustrations rather than photographs, which exercises the path
+  but says nothing about caption quality on real photos.
+- **The demonstration dataset's images are synthetic illustrations.**
+  `scripts/seed_demo.py` draws flat-colour lake-and-mountain scenes with
+  Pillow. That exercises the full vision -> visual concepts -> entities ->
+  association -> retrieval path with no real personal data, but a real
+  photograph would produce a richer caption, and the demo's visual quality is
+  correspondingly modest.
+- **No UI for correcting a wrong association or episode assignment.** Both the
+  graph and episode APIs are deliberately read-only (see docs/DECISIONS.md),
+  so a user who sees a wrong edge can only fix it indirectly, by correcting the
+  underlying memory. Whether a user-visible "these are not related" signal
+  should exist -- and how it would survive a re-projection, which is the whole
+  reason the APIs are read-only -- is an open design question, not an
+  oversight.
+
+### Open questions this phase raises
+
+- **Should an association ever be promotable to an explicit relationship?** The
+  system can infer that two memories are related; the user cannot currently
+  confirm it. Confirming would mean storing something the user asserted, which
+  belongs in a capture, not in a projection -- so the mechanism would have to
+  be "record the confirmation as a memory", and it is not obvious that is what
+  a user would expect from clicking "yes, these are related".
+- **Should the graph inform ingestion, not just retrieval?** The pre-existing
+  gap "ingestion-time clarification/enrichment never checks what's already
+  stored" (below) now has a much better tool available than it did:
+  entity-based lookup instead of a regex `ILIKE`. Deliberately not attempted
+  this phase -- it changes what gets *stored*, which is a higher-stakes change
+  than anything retrieval-side, and the open questions listed in that item
+  (what counts as "the same term", how much context to inject) are unchanged.
+- **Should episodes be retrievable as first-class answers?** Today recall
+  returns memories, and episodes are a browsing surface. "What did I do in
+  Slovenia?" arguably wants an episode as the answer, not a list of memory
+  units. Not attempted; it would need an episode-level representation to search
+  against, which is a different indexing decision.
+
+
 ## Resolved this phase (restore the multi-call pipeline, instant save, image structured data, attachment access)
 
 Full reasoning for every item below is in docs/DECISIONS.md under
@@ -292,15 +429,11 @@ Full reasoning for every item below is in docs/DECISIONS.md under
 
 ## Known technical gaps
 
-- **Found during a code audit, not a reported bug: `RecallResponse.
-  chunk_sources` (attachment-chunk evidence) is returned by
-  `POST /api/recall` but never rendered by the recall page** --
-  `renderSources()` in `app/static/app.js` only handles `data.sources`
-  (memory units), not `data.chunk_sources`. Pre-existing, not introduced
-  this phase. Low-impact (chunk evidence still contributes to the
-  answer text itself, it's just not shown as supporting evidence
-  alongside it) but worth fixing if large-attachment recall becomes a
-  more common case.
+- **Resolved: attachment-chunk evidence is rendered again.** The old recall
+  page's `renderSources()` handled only `data.sources` and silently dropped
+  `chunk_sources`, so a document excerpt could contribute to an answer without
+  ever being shown as the evidence for it. The rebuilt page
+  (`app/static/pages/recall.js`) renders both.
 - **Two eval regressions after this phase's call-count/iteration
   reduction, not yet root-caused in isolation.** Full detail in
   docs/DECISIONS.md's "Measured effect, honestly reported" -- summary:

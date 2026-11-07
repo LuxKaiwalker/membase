@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% set nav_active = "overview" %}
+{% block title %}membase — Overview{% endblock %}
+{#
+  Home / memory overview (/app/). There is no dashboard endpoint by design;
+  static/pages/overview.js composes this page from GET /api/graph/stats,
+  GET /api/captures and GET /api/episodes?limit=5, and renders each panel
+  independently so one failing endpoint does not blank the page.
+
+  The two calls to action live here as static markup rather than being
+  rendered by JS: they are the point of the page and must be usable before
+  (and even if) any API call resolves.
+#}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <p class="eyebrow">Overview</p>
+    <h1>The state of your memory</h1>
+    <p class="lede">
+      What is stored, what it is mostly about, and where to pick it up
+      again. Everything here is counted from what you have actually
+      saved — nothing is projected or estimated.
+    </p>
+  </div>
+
+  <div class="row ov-actions">
+    <a class="btn btn-primary btn-lg" href="/app/recall/">Recall something</a>
+    <a class="btn btn-secondary btn-lg" href="/app/store/">Store a memory</a>
+  </div>
+
+  <p id="status" class="status hidden"></p>
+
+  <div id="overview-root" class="stack stack-loose"></div>
+</section>
+{% endblock %}

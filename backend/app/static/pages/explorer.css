@@ -1,0 +1,511 @@
+/* ==========================================================================
+   Explorer page styles.
+
+   Composes app.css's tokens and primitives; never redefines them. There is
+   not a single colour literal in this file -- every colour here is a
+   var(--token) from app.css, which is also where graph-canvas.js reads its
+   canvas palette from at runtime (getComputedStyle on :root), so the
+   drawing and the chrome around it cannot drift apart.
+
+   Sections:
+     1. Controls (search, filter chips, hop select)
+     2. Layout: stage + inspector
+     3. The canvas stage, tooltip, empty state
+     4. Legend
+     5. Inspector
+     6. Narrow viewports
+   ========================================================================== */
+
+/* ==========================================================================
+   1. CONTROLS
+   ========================================================================== */
+
+.explorer-controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* app.css's `form` baseline is a column; the search row wants to be a row
+   with the input eating the slack, which is what .form-inline + .input-grow
+   already do -- this only pins the label's width so it does not stretch. */
+.explorer-search {
+  margin: 0;
+  gap: var(--space-2);
+}
+
+.explorer-search-label {
+  flex: none;
+}
+
+/* Results of the entity search. A plain list of buttons: Tab reaches each
+   one and Enter activates it, with no custom combobox semantics to get
+   subtly wrong. */
+.explorer-results {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 14rem;
+  margin: 0;
+  padding: var(--space-1);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  list-style: none;
+}
+
+.explorer-result-button {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.explorer-result-button:hover {
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+
+.explorer-result-name {
+  font-weight: var(--weight-medium);
+}
+
+.explorer-filter-grid {
+  display: grid;
+  gap: var(--space-4);
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+}
+
+/* A <fieldset> is the right grouping for a set of filter toggles, but its
+   default border/padding is browser chrome this design system does not
+   use. */
+.explorer-filter {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.explorer-filter > legend {
+  margin-bottom: var(--space-2);
+  padding: 0;
+}
+
+.explorer-filter-narrow {
+  max-width: 12rem;
+}
+
+.explorer-chips {
+  margin-bottom: var(--space-2);
+}
+
+/* The count inside a chip -- quieter than the kind name beside it. */
+.explorer-chip-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chip[aria-pressed="true"] .explorer-chip-count {
+  color: var(--accent);
+}
+
+/* app.css makes `label > select` fill its label; here the label is a
+   narrow inline control, so it bounds the select instead. */
+.explorer-hops {
+  flex: none;
+  width: 9rem;
+}
+
+.explorer-actions {
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--hairline);
+}
+
+/* Truncation / "showing a focused slice" notices. Warning-toned because
+   they are statements about the graph being incomplete, which the user has
+   to be able to trust the absence of. */
+.explorer-notice {
+  margin: 0;
+  border-color: var(--warning);
+  border-left-width: 3px;
+  background: var(--warning-wash);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+/* ==========================================================================
+   2. LAYOUT
+   ========================================================================== */
+
+.explorer-layout {
+  display: grid;
+  gap: var(--space-4);
+  /* minmax(0, 1fr) rather than 1fr: a grid column sized `1fr` refuses to
+     shrink below its content's min-content width, which is how a canvas in
+     a grid ends up forcing the whole page to scroll horizontally. */
+  grid-template-columns: minmax(0, 1fr) 23rem;
+  align-items: start;
+}
+
+.explorer-stage-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* ==========================================================================
+   3. STAGE
+   ========================================================================== */
+
+.explorer-stage {
+  position: relative;
+  width: 100%;
+  height: clamp(20rem, 58vh, 36rem);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.explorer-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* The pointer affordance; graph-canvas.js swaps this for "pointer" over
+     a node or a link and "grabbing" while dragging. */
+  cursor: grab;
+  touch-action: none;
+}
+
+.explorer-canvas:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Hover readout, positioned by the page script next to the pointer.
+   pointer-events: none so it can never eat the hit-test it is describing. */
+.explorer-tooltip {
+  position: absolute;
+  z-index: 2;
+  max-width: 20rem;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-2);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  pointer-events: none;
+}
+
+.explorer-tooltip-title {
+  display: block;
+  margin-bottom: var(--space-1);
+  font-weight: var(--weight-semibold);
+}
+
+.explorer-tooltip-why {
+  display: block;
+  color: var(--text-secondary);
+}
+
+/* An empty graph has to look deliberate, not like a canvas that failed to
+   paint -- so it gets real copy centred in the stage. */
+.explorer-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.explorer-empty strong {
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.explorer-empty p {
+  max-width: 26rem;
+}
+
+.explorer-hint {
+  margin: 0;
+}
+
+/* ==========================================================================
+   4. LEGEND
+   ========================================================================== */
+
+.explorer-legend {
+  padding: var(--space-3);
+}
+
+.explorer-legend-second {
+  margin-top: var(--space-3);
+}
+
+.explorer-legend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  list-style: none;
+}
+
+.explorer-legend-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  white-space: nowrap;
+}
+
+/* Shape is the primary channel for node kind, so the legend shows the same
+   glyph the canvas draws; colour only reinforces it. The token per kind is
+   the same mapping graph-canvas.js uses (KIND_TOKENS). */
+.explorer-glyph {
+  font-size: var(--text-md);
+  line-height: 1;
+}
+
+.explorer-kind-memory { color: var(--accent); }
+.explorer-kind-person { color: var(--success); }
+.explorer-kind-organization { color: var(--warning); }
+.explorer-kind-location { color: var(--danger); }
+.explorer-kind-topic { color: var(--accent-strong); }
+.explorer-kind-concept { color: var(--text-secondary); }
+.explorer-kind-object { color: var(--text-muted); }
+
+/* Line style, not colour, is what separates an inferred link from a stated
+   one -- the same solid/dashed convention app.css's `.prov-*` classes use
+   for border-style. */
+.explorer-line {
+  width: 1.75rem;
+  height: 0;
+  border-top-width: 2px;
+}
+
+.explorer-line-explicit {
+  border-top-style: solid;
+  border-top-color: var(--text-secondary);
+}
+
+.explorer-line-extracted {
+  border-top-style: solid;
+  border-top-width: 1px;
+  border-top-color: var(--accent-edge);
+}
+
+.explorer-line-inferred {
+  border-top-style: dashed;
+  border-top-color: var(--warning);
+}
+
+/* ==========================================================================
+   5. INSPECTOR
+   ========================================================================== */
+
+.explorer-inspector {
+  position: sticky;
+  top: var(--space-4);
+  min-width: 0;
+  max-height: calc(100vh - var(--space-6));
+  overflow-y: auto;
+}
+
+.explorer-inspector-head {
+  margin-bottom: var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.explorer-inspector-head h2 {
+  margin: 0;
+}
+
+.explorer-inspector-placeholder {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* A labelled block inside the inspector. Several per panel, so the
+   hierarchy is carried by the eyebrow label and spacing rather than by
+   nesting more cards. */
+.explorer-section + .explorer-section {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--hairline);
+}
+
+.explorer-section > :last-child {
+  margin-bottom: 0;
+}
+
+.explorer-quote {
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.explorer-meaning {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.explorer-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.explorer-list-item {
+  padding: var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+}
+
+.explorer-list-item > :last-child {
+  margin-bottom: 0;
+}
+
+.explorer-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+
+.explorer-why {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* The "why are these connected?" answer. The backend computes this text
+   deterministically; it is the most important thing in the panel when a
+   link is selected, so it gets the accent treatment the clarification
+   block on the Library page uses. */
+.explorer-explanation {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--accent-edge);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-wash);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.explorer-kv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.explorer-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.explorer-semantic-field + .explorer-semantic-field {
+  margin-top: var(--space-2);
+}
+
+/* Each link on an inspected node, as a button -- the keyboard route to an
+   edge's explanation, since picking a line with a pointer is not one. */
+.explorer-edge-button {
+  display: block;
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.explorer-edge-button:hover {
+  border-color: var(--accent-edge);
+  background: var(--accent-wash);
+  color: var(--text-primary);
+}
+
+.explorer-edge-button-label {
+  display: block;
+  margin-bottom: 0.1rem;
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+}
+
+.explorer-inspector .btn {
+  margin-top: var(--space-1);
+}
+
+/* ==========================================================================
+   6. NARROW VIEWPORTS
+   ========================================================================== */
+
+@media (max-width: 64rem) {
+  .explorer-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .explorer-inspector {
+    position: static;
+    max-height: none;
+  }
+}
+
+@media (max-width: 36rem) {
+  .explorer-stage {
+    height: clamp(17rem, 52vh, 26rem);
+  }
+
+  .explorer-filter-narrow {
+    max-width: none;
+  }
+
+  .explorer-hops {
+    width: 100%;
+  }
+
+  /* app.css turns .form-inline into a stretched column here, which is the
+     right call for the search field + button. */
+  .explorer-search-label {
+    align-self: flex-start;
+  }
+}

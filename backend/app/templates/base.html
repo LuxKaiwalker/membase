@@ -1,3 +1,42 @@
+{#-
+  App shell for every page under /app/.
+
+  Adding a section is ONE edit here: append an entry to `sections` below.
+  That single registry drives the nav links, the active-item marker, the
+  page script that gets loaded, and the init call at the bottom of the
+  body -- so a child template only has to declare which section it is,
+  by setting `nav_active` to its key at the top of the child, right
+  after the extends line.
+
+  (A new section also needs its own entry in scripts/build_frontend.py's
+  PAGES dict, which decides the output path, and its own
+  static/pages/<script>.js file.)
+
+  Everything here is interpolated from template-local set-blocks, never
+  from request state -- scripts/build_frontend.py renders these once at
+  build time with an empty context (see docs/DECISIONS.md "API-only
+  backend: stop serving the frontend's own HTML/static files").
+-#}
+{#-
+  `stylesheet: true` additionally loads static/pages/<script>.css. Opt-in so a
+  section without its own CSS does not 404 a stylesheet request.
+
+  `needs_backend: false` marks a section that never calls the API, so the
+  credential overlay is not shown over it. Evaluation is the one such section:
+  it reads a static results file published alongside the site and is meant to
+  be a readable report, not something behind a login wall.
+-#}
+{%- set sections = [
+  {"key": "overview",   "url": "/app/",            "label": "Overview",   "script": "overview",   "init": "initOverviewPage",   "stylesheet": true},
+  {"key": "recall",     "url": "/app/recall/",     "label": "Recall",     "script": "recall",     "init": "initRecallPage",     "stylesheet": true},
+  {"key": "explorer",   "url": "/app/explorer/",   "label": "Explorer",   "script": "explorer",   "init": "initExplorerPage",   "stylesheet": true},
+  {"key": "timeline",   "url": "/app/timeline/",   "label": "Timeline",   "script": "timeline",   "init": "initTimelinePage",   "stylesheet": true},
+  {"key": "library",    "url": "/app/library/",    "label": "Library",    "script": "library",    "init": "initLibraryPage"},
+  {"key": "evaluation", "url": "/app/evaluation/", "label": "Evaluation", "script": "evaluation", "init": "initEvaluationPage", "stylesheet": true, "needs_backend": false},
+  {"key": "store",      "url": "/app/store/",      "label": "Store",      "script": "store",      "init": "initStorePage"},
+] -%}
+{%- set active_key = nav_active | default("", true) -%}
+{%- set current = sections | selectattr("key", "equalto", active_key) | list | first -%}
 <!doctype html>
 <html lang="en">
 <head>
@@ -5,19 +44,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}membase{% endblock %}</title>
   <link rel="stylesheet" href="/static/app.css" />
+  {#-
+    Per-section stylesheet, loaded automatically when
+    static/pages/<script>.css exists. Page-specific CSS lives in its own
+    file rather than in app.css so that the shared design system stays the
+    single source of tokens and primitives while a section's own layout
+    (a graph canvas, a timeline rail) does not have to be threaded through
+    it. app.css still owns every token, colour and primitive -- a page
+    stylesheet may only compose them, never redefine them.
+  -#}
+  {%- if current and current.get("stylesheet") %}
+  <link rel="stylesheet" href="/static/pages/{{ current.script }}.css" />
+  {%- endif %}
+  {% block extra_head %}{% endblock %}
 </head>
-<body>
-  <header>
+<body{% if current and current.get("needs_backend") is false %} data-requires-backend="false"{% endif %}>
+  <header class="app-header">
     <a href="/" class="brand">membase</a>
-    <nav>
-      <a href="/app/">Store</a>
-      <a href="/app/recall">Remember</a>
-      <a href="/app/captures">Browse</a>
+    <nav class="app-nav" aria-label="Sections">
+      {%- for section in sections %}
+      <a href="{{ section.url }}"{% if section.key == active_key %} aria-current="page"{% endif %}>{{ section.label }}</a>
+      {%- endfor %}
     </nav>
     <div class="settings">
       <button id="settings-toggle" class="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" title="Settings">&#9881;</button>
       <div id="settings-menu" class="settings-menu hidden">
-        <button id="logout-button" class="settings-logout" type="button">Forget backend credentials</button>
+        <button id="logout-button" class="btn btn-secondary settings-logout" type="button">Forget backend credentials</button>
       </div>
     </div>
   </header>
@@ -27,18 +79,32 @@
       <p class="muted">Sign in.</p>
       <label>
         Username
-        <input type="text" id="login-username" autocomplete="username" required />
+        <input type="text" id="login-username" class="input" autocomplete="username" required />
       </label>
       <label>
         Password
-        <input type="password" id="login-password" autocomplete="current-password" required />
+        <input type="password" id="login-password" class="input" autocomplete="current-password" required />
       </label>
-      <button type="submit">Connect</button>
+      <button type="submit" class="btn btn-primary">Connect</button>
       <p id="login-error" class="error hidden"></p>
     </form>
   </div>
   <main>
     {% block content %}{% endblock %}
   </main>
+
+  {#
+    Classic scripts, in order, at the end of the body: core.js defines the
+    single `membase` global (and runs initAuth/initSettingsMenu against the
+    chrome above), then this page's own script registers and runs its init.
+    Deliberately not type="module" -- modules break opening the built site
+    straight off disk via file:// and buy nothing here.
+  #}
+  <script src="/static/core.js"></script>
+  {%- if current %}
+  <script src="/static/pages/{{ current.script }}.js"></script>
+  <script>membase.{{ current.init }}();</script>
+  {%- endif %}
+  {% block extra_scripts %}{% endblock %}
 </body>
 </html>

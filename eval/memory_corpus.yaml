@@ -1,0 +1,217 @@
+# Multi-strategy retrieval benchmark corpus.
+#
+# One synthetic autobiographical world, authored to make the *differences*
+# between retrieval strategies measurable rather than to be easy. Used by
+# eval/strategy_benchmark.py together with eval/strategy_queries.yaml; see
+# docs/EVALUATION.md for what each structure below is for.
+#
+# Every memory is ingested as its own independent capture, so retrieval has
+# to find the right note among genuine competition rather than inside a
+# hand-grouped paragraph. Entity names are globally unique across the corpus
+# on purpose: eval/cases.yaml has documented cross-contamination from reusing
+# "Anna" between cases, and this corpus must not repeat that. None of the
+# names here appear in eval/interactive_benchmark.yaml either -- that is a
+# separate world with its own ground truth.
+#
+# Ids are sequential in file order, because `--limit N` seeds the first N
+# memories: with `--limit 8` the stored corpus is exactly M1..M8, which keeps
+# a smoke run's coverage obvious rather than something you have to work out.
+#
+# Structures deliberately present (see eval/strategy_queries.yaml for the
+# queries that exercise them):
+#
+#   recurring people       Priyanka Venn, Tobias Ahlgren, Mireille Dufort,
+#                          Hoshi Nakamura, Yusra Demirel, Fenwick Oye,
+#                          Cesar Oyelaran, Brendan Kiloh
+#   recurring projects     Saltmarsh, Kestrel, the driftwood bench,
+#                          the teapot series, the hall shelf
+#   recurring locations    Cape Bruny, Vellmar, Marrowbone Lane studio,
+#                          Ossian Street flat, Lake Teufelssee, Ravensgate
+#   recurring events       Halvard Festival, Stentor Conference
+#   dates                  explicit day (M7), month-only (M4, M27),
+#                          season-only (M2, M11), year-only (M20, M23, M24),
+#                          and a deliberate no-date-at-all set (M12, M13,
+#                          M14, M18, M19, M28, M29, M30, M33, M35, M37,
+#                          M38, M39)
+#   causal                 M2, M15, M31 ("we abandoned X because Y")
+#   ambiguous pairs        M8/M9   differ ONLY in the person
+#                          M13/M14 differ ONLY in the location
+#                          M23/M24 differ ONLY in the year
+#   contradiction pairs    M21/M22 (one child: daughter vs. son)
+#                          M34/M35 (boiler replaced in 2019 vs. never)
+#   lexical distractors    M26, M27 ("migration", "kestrel"), M28
+#                          ("battery"), M29 ("glazing"), M30 ("salt marsh")
+#   fragments              M18, M37, M38, M39
+#   multi-hop chains       M10 -> M11, M3 -> M4, M16 -> M17, M6 -> M44
+
+memories:
+  # --- Work: Project Saltmarsh -------------------------------------------
+  - id: M1
+    theme: work_saltmarsh
+    text: "In April 2024 I took over Project Saltmarsh, a wetland sensor network that logs water level and salinity at Cape Bruny. Priyanka Venn had been running it alone for a year before that, and she spent a whole afternoon walking me through the deployment map."
+  - id: M2
+    theme: work_saltmarsh
+    text: "We abandoned the tidal-gauge module on Saltmarsh in late summer because the enclosures kept filling with condensation and two boards corroded through. Priyanka Venn argued for a redesign, I argued we had no budget for one, and the no-budget side won."
+  - id: M3
+    theme: work_saltmarsh
+    text: "All of the Saltmarsh field hardware came from a small supplier called Thamesreach Instruments. Priyanka Venn picked them because they would sell single units instead of a minimum order of fifty."
+  - id: M4
+    theme: work_saltmarsh
+    text: "Thamesreach Instruments went out of business in March. Their support address bounces and the firmware downloads are gone, so anything still running their boards is on its own from here."
+  - id: M5
+    theme: work_saltmarsh
+    text: "The Saltmarsh cells drain about three times faster in winter than the datasheet claims. I logged it carefully for two months before raising it with anyone, because nobody believes a power complaint without numbers behind it."
+
+  # --- Work: Project Kestrel ---------------------------------------------
+  - id: M6
+    theme: work_kestrel
+    text: "Project Kestrel is the migration of our old on-premise records store into the new managed database. Yusra Demirel is accountable for it and I own the schema mapping."
+  - id: M7
+    theme: work_kestrel
+    text: "On 3 February 2025 the Kestrel migration's first dry run failed four hours in, because the legacy export wrote its timestamps without any time zone. We had assumed they were UTC. They were local."
+
+  # --- Ambiguous pair: identical except the person -----------------------
+  - id: M8
+    theme: ambiguous_pair_person
+    text: "I argued with Priyanka Venn about whether to rewrite the Kestrel migration from scratch instead of patching the legacy exporter. We sat on the cold steps outside the Marrowbone Lane studio afterwards and neither of us conceded anything."
+  - id: M9
+    theme: ambiguous_pair_person
+    text: "I argued with Yusra Demirel about whether to rewrite the Kestrel migration from scratch instead of patching the legacy exporter. We sat on the cold steps outside the Marrowbone Lane studio afterwards and neither of us conceded anything."
+
+  # --- Ceramics ----------------------------------------------------------
+  - id: M10
+    theme: ceramics
+    text: "Mireille Dufort runs the Thursday evening ceramics class. She is the person who finally taught me to centre clay properly, by making me do nothing but centre and collapse the same lump of it for three weeks."
+  - id: M11
+    theme: ceramics
+    text: "Mireille Dufort broke her wrist falling off a stepladder in the spring. The class ran as unsupervised open studio time for six weeks while she recovered, which was quieter and much worse."
+  - id: M12
+    theme: ceramics
+    text: "The teapot series is six pots, all the same body with six different handles. I am making them to find out which handle I actually like, not to sell any of them."
+
+  # --- Ambiguous pair: identical except the location ---------------------
+  - id: M13
+    theme: ambiguous_pair_place
+    text: "I sketched a teapot handle on a paper napkin, the curve I kept coming back to afterwards. I was sitting in the Vellmar station cafe with a cold coffee."
+  - id: M14
+    theme: ambiguous_pair_place
+    text: "I sketched a teapot handle on a paper napkin, the curve I kept coming back to afterwards. I was sitting in the Marrowbone Lane studio courtyard with a cold coffee."
+
+  - id: M15
+    theme: ceramics
+    text: "I moved the teapot series off the cone-6 glaze and onto a cone-10 celadon because the cone-6 kept pinholing wherever it ran over the iron slip. Working that out cost me two entire firings."
+
+  # --- Woodworking -------------------------------------------------------
+  - id: M16
+    theme: woodworking
+    text: "I bought the wood lathe second-hand from Hoshi Nakamura's cousin, Fenwick Oye, for far less than it was worth, because he was moving and wanted it gone that week."
+  - id: M17
+    theme: woodworking
+    text: "Fenwick Oye moved out to Cape Bruny and started renting kayaks to tourists from a shed on the harbour. He sounds happier on the phone than he ever did when he had a desk job."
+  - id: M18
+    theme: fragment
+    text: "He said: measure from the shoulder, not the end. I keep forgetting which shoulder he meant."
+  - id: M19
+    theme: woodworking
+    text: "The driftwood bench is made from four planks that washed up at Cape Bruny. It still has no back, and I have been building it on and off for a long time."
+
+  # --- People ------------------------------------------------------------
+  - id: M20
+    theme: people
+    text: "Tobias Ahlgren and I met at the Ravensgate climbing wall in 2019, both of us too proud to admit we were beginners. He is the one who got me going to music festivals."
+
+  # --- Contradiction pair: incompatible facts about the same person ------
+  - id: M21
+    theme: contradiction_pair_child
+    text: "Tobias Ahlgren has exactly one child, a daughter named Ines."
+  - id: M22
+    theme: contradiction_pair_child
+    text: "Tobias Ahlgren has exactly one child, a son named Rafe."
+
+  # --- Ambiguous pair: identical except the year -------------------------
+  - id: M23
+    theme: ambiguous_pair_date
+    text: "I went to the Halvard Festival with Tobias Ahlgren in 2022 and we camped in the overflow field because we had booked too late."
+  - id: M24
+    theme: ambiguous_pair_date
+    text: "I went to the Halvard Festival with Tobias Ahlgren in 2024 and we camped in the overflow field because we had booked too late."
+
+  # --- Events ------------------------------------------------------------
+  - id: M25
+    theme: events
+    text: "The Stentor Conference in Vellmar, September 2024, was the first time I gave a talk to more than thirty people. I presented the Saltmarsh power-drain numbers, and someone in the second row asked the one question I could not answer."
+
+  # --- Lexical distractors: share salient words, different subject -------
+  - id: M26
+    theme: distractor_lexical
+    text: "The best thing at the Stentor Conference was not a talk about data at all. It was an evening session on bird migration, where the speaker played recordings of nocturnal flight calls."
+  - id: M27
+    theme: distractor_lexical
+    text: "Driving back from Cape Bruny in February I watched an actual kestrel hovering over the fields outside Vellmar for a full minute without moving. I pulled over to watch it."
+  - id: M28
+    theme: distractor_lexical
+    text: "I replaced the battery in the smoke alarm in the Ossian Street flat hallway. It had been chirping for a week and I had been ignoring it for most of that."
+  - id: M29
+    theme: distractor_lexical
+    text: "The kitchen window glazing at the Ossian Street flat has gone cloudy where the seal failed. I was quoted far too much to have it done properly."
+  - id: M30
+    theme: distractor_lexical
+    text: "There is a salt marsh smell at low tide around the Cape Bruny harbour that I have never got used to, somewhere between rot and very clean air."
+
+  # --- Health ------------------------------------------------------------
+  - id: M31
+    theme: health
+    text: "I stopped going to the Thursday climbing session because my right shoulder impingement got worse every week I ignored it. Cesar Oyelaran, the physio, told me plainly that I was choosing between climbing now and climbing at fifty."
+  - id: M32
+    theme: health
+    text: "Cesar Oyelaran gave me three shoulder exercises. I do the first two. The third one, the one with the band held behind my back, I have done perhaps four times in six months."
+
+  # --- Woodworking, continued --------------------------------------------
+  - id: M33
+    theme: woodworking
+    text: "I borrowed a mortise chisel from Tobias Ahlgren for the hall shelf joints and I still have not given it back."
+
+  # --- Contradiction pair: incompatible facts about the same object ------
+  - id: M34
+    theme: contradiction_pair_boiler
+    text: "The Ossian Street flat's boiler was replaced in 2019, the year before I moved in. The landlord showed me the paperwork for it."
+  - id: M35
+    theme: contradiction_pair_boiler
+    text: "The Ossian Street flat's boiler has never been replaced. It is the original 1998 unit, and the engineer who serviced it laughed out loud when I asked how old it was."
+
+  # --- Travel ------------------------------------------------------------
+  - id: M36
+    theme: travel
+    text: "Lake Teufelssee is the only place I have ever swum where the water was genuinely black rather than dark green. I have no idea what year that was."
+  - id: M37
+    theme: travel
+    text: "Brendan Kiloh drove us out to Lake Teufelssee in his van, with a surfboard in the back for no reason either of us could explain."
+
+  # --- Fragments ---------------------------------------------------------
+  - id: M38
+    theme: fragment
+    text: "The smell of wet rope in that van. Teufelssee, the hot week."
+  - id: M39
+    theme: fragment
+    text: "Blue folder, third drawer. Important enough to write down, apparently, and I no longer know why."
+  - id: M40
+    theme: fragment
+    text: "Something about a yellow door. Vellmar, I think. Or possibly the station."
+
+  # --- People, continued -------------------------------------------------
+  - id: M41
+    theme: people
+    text: "Priyanka Venn left for a job in Vellmar in June 2025. Her leaving card is still unsigned at the bottom of my bag."
+
+  # --- Explicit temporal relations ---------------------------------------
+  - id: M42
+    theme: temporal
+    text: "I gave the Stentor talk before the Kestrel dry run failed, and both of those happened before Priyanka Venn left."
+  - id: M43
+    theme: temporal
+    text: "The driftwood bench was already started before I ever took over Saltmarsh."
+
+  # --- Work, continued ---------------------------------------------------
+  - id: M44
+    theme: work_kestrel
+    text: "Yusra Demirel became my manager in January 2025, after the previous one went on long-term leave. She reads everything and replies in exactly one line."

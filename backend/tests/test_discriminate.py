@@ -1,4 +1,4 @@
-from app.retrieval.discriminate import apply_negative_cues, apply_positive_cue_boost, is_ambiguous
+from app.retrieval.discriminate import apply_negative_cues, apply_positive_cue_boost, is_ambiguous, values_for_field
 from app.retrieval.pipeline import ScoredUnit
 
 
@@ -72,3 +72,31 @@ def test_no_match_leaves_candidate_untouched():
 
     assert apply_negative_cues([a], ["nothing matches this"]) == [a]
     assert apply_positive_cue_boost([a], ["nothing matches this"])[0].fused_score == a.fused_score
+
+
+def test_extraction_junk_is_never_asked_about_or_matched_as_an_attribute():
+    """`values_for_field` reads raw extraction output, so it has to apply the
+    same admission test the graph applies to entity nodes.
+
+    Observed live: gemma4:12b writes "User" into `semantic.people` where the
+    text said "I", and the question selector -- which ranks `people` at full
+    answerability -- asked "Did this involve User?". The user's answer then got
+    recorded as a cue about a thing that does not exist.
+    """
+    semantic = {
+        "people": ["Markus", "User", "Narrator (the author)", "I"],
+        "locations": ["Lake Bled", "2023"],
+    }
+
+    assert values_for_field(semantic, "people") == ["Markus"]
+    # A bare year is temporal information, not a place to ask about.
+    assert values_for_field(semantic, "locations") == ["Lake Bled"]
+
+
+def test_a_parenthetical_gloss_is_stripped_from_an_attribute_value():
+    """The live question read "Did this involve Markus (Data provider/Colleague/
+    Friend)?" -- the extraction model annotating its own output. Cleaning it
+    also lets a plain cue of "Markus" match the candidate."""
+    semantic = {"people": ["Markus (Data provider/Colleague/Friend)"]}
+
+    assert values_for_field(semantic, "people") == ["Markus"]

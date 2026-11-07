@@ -50,16 +50,72 @@ curl -X POST 127.0.0.1:8000/api/recall -d '{"query": "when is my dentist appoint
 
 The actual web UI (`backend/app/templates/` + `backend/app/static/`) is
 published separately to GitHub Pages (see `docs/DEPLOYMENT.md`
-"Publishing the frontend to GitHub Pages") and its JS has this project's
-production backend URL hardcoded at the source level (`BACKEND_URL` in
-`app.js`, see `docs/DECISIONS.md` "Hardcode the backend URL instead of
-asking for it at login") -- it does not point at a local dev server out
-of the box. To exercise the UI against your local backend instead,
-temporarily point `BACKEND_URL` at `http://127.0.0.1:8000`, run
-`python3 scripts/build_frontend.py`, then serve `dist/` with a plain
-static file server (e.g. `python3 -m http.server --directory dist`) --
-the rendered pages reference `/static/...` as an absolute path, so they
-need to be served from a web root, not opened directly as `file://`.
+"Publishing the frontend to GitHub Pages") and has this project's
+production backend URL baked in at build time (`DEFAULT_BACKEND_URL` in
+`core.js`, see `docs/DECISIONS.md` "Hardcode the backend URL instead of
+asking for it at login"), so it does not point at a local dev server out
+of the box.
+
+To exercise the real built UI against your local backend:
+
+```sh
+python3 scripts/build_frontend.py
+python3 -m http.server --directory dist 8099
+```
+
+then, once in the browser console:
+
+```js
+localStorage.setItem("membase.backendUrl", "http://127.0.0.1:8000")
+```
+
+and reload. That override is read once at load and is absent for every
+ordinary visitor, so the deployed default is what a real user always gets --
+and it means you can test the exact bytes you ship rather than a rebuilt
+copy with the URL edited. The pages reference `/static/...` as an absolute
+path, so they must be served from a web root, not opened as `file://`.
+
+One wrinkle when doing this: the dev server sends no CORS headers (nginx owns
+CORS in production -- see `docs/DECISIONS.md` "Move CORS to nginx"), so a
+browser on `:8099` cannot call `:8000` directly. Either point the override at
+a small same-origin `/api/*` proxy in front of `dist/`, or run the browser
+with web security disabled for that session.
+
+### The seven sections
+
+| URL | What it is |
+|---|---|
+| `/app/` | Overview: recent memories, what the store is mostly about, statistics |
+| `/app/recall/` | **Recall** -- the centrepiece. A vague query starts a session; the system explores, shows its candidates and evidence, and asks at most one question at a time |
+| `/app/explorer/` | The associative graph: memories, the entities they are about, and why any two are connected |
+| `/app/timeline/` | Episodes in chronological order, with undated ones shown as undated |
+| `/app/library/` | Browse, inspect, correct and delete stored memories; answer storage-time clarifications |
+| `/app/evaluation/` | Benchmark results comparing the four retrieval strategies. Reads a static artefact; needs no backend |
+| `/app/store/` | Write a new memory, with attachments |
+
+### Seeing it with data in it
+
+An empty store demonstrates nothing. `scripts/seed_demo.py` writes a clearly
+labelled **synthetic** dataset built around one scenario -- three similar lake
+trips that are genuinely hard to tell apart from a vague query, plus the
+supporting memories, distractors and contradictions needed to make
+disambiguation necessary:
+
+```sh
+python3 scripts/seed_demo.py --dry-run    # show what it would store, store nothing
+python3 scripts/seed_demo.py              # several minutes: real model, real pipeline
+```
+
+Then ask Recall:
+
+> I am trying to remember a photograph from a trip a few years ago. I think we
+> were near a lake, possibly in Switzerland or Austria. There were mountains in
+> the background, and I remember taking it with a friend.
+
+It refuses to guess: it shows the candidates it is choosing between and asks
+one discriminating question. Answer it (including correcting your own wrong
+guess about the country) and watch the candidate set narrow, with the evidence
+for each one visible.
 
 To stop Postgres: `scripts/dev-db.sh stop`.
 
@@ -156,8 +212,29 @@ scripts/run-session-eval.sh    # iterative-recall eval set (multi-round, ambigui
 scripts/run-interactive-benchmark.sh  # one-shot vs. LLM-assisted vs. interactive A/B/C comparison
 scripts/sweep-threshold.sh     # retrieval-threshold calibration experiment
 scripts/benchmark-recall-latency.sh   # per-round latency, broken down by LLM call kind
+scripts/run-strategy-benchmark.sh     # the four retrieval strategies compared on one corpus
 python3 scripts/reembed.py --dry-run   # report stale/missing embeddings
+python3 scripts/rebuild_graph.py --dry-run  # report memories missing from the associative graph
 ```
+
+`scripts/run-strategy-benchmark.sh` is the one that answers the project's
+central question -- whether associative and iterative retrieval actually beat
+conventional retrieval. It compares pure vector similarity, hybrid search with
+LLM reformulation, associative multi-hop expansion, and the full adaptive
+session with simulated clarification, over the *same* 44 stored memories and
+40 queries. See `docs/EVALUATION.md` for the metric definitions and the
+caveats, and `/app/evaluation/` for the results rendered.
+
+It caches the seeded corpus (`eval/.corpus_state.json`), which matters more
+than it sounds: seeding runs the real ingestion pipeline, costing ~20-25s of
+model time per memory with nothing else competing for the GPU, and
+considerably more when something is. Without the cache, every iteration on a
+retrieval strategy would pay 20+ minutes before measuring anything.
+
+`scripts/rebuild_graph.py` re-derives the associative graph and episodes from
+stored memories. It makes no LLM calls and is idempotent, which is the whole
+reason the graph is a projection: a bug in the projection logic is fixable
+with a backfill instead of a re-ingest.
 
 ## Known limitations
 

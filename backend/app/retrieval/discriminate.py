@@ -1,6 +1,7 @@
 import re
 import uuid
 
+from app.memory.entities import is_usable_entity_name
 from app.retrieval.pipeline import ScoredUnit
 
 # Heuristic, not a formal Bayesian active-learning framework (spec section
@@ -34,7 +35,19 @@ AMBIGUITY_MIN_RUNNER_UP_SCORE = 0.45
 # enrichment call happened to file it under. See docs/DECISIONS.md.
 _ATTRIBUTE_TEMPLATES = {
     "people": "Did this involve {value}?",
-    "locations": "Did this happen at {value}?",
+    # "Was this in X?" rather than "Did this happen at X?": the values here are
+    # whatever the extraction produced, which is far more often a city or a
+    # country than a venue, and "at Switzerland" was the live result. "in"
+    # reads correctly for a country, a city and a building alike.
+    #
+    # Safe to reword: both eval harnesses derive their reverse-mapping regexes
+    # from this dict at import time (eval/strategy_benchmark.py and
+    # eval/run_interactive_benchmark.py both build _TEMPLATE_PATTERNS from
+    # _ATTRIBUTE_TEMPLATES), so they adapt automatically. What is NOT safe is
+    # two fields sharing a phrasing -- that would make the reverse mapping
+    # ambiguous, which is a silent correctness bug rather than a cosmetic
+    # duplicate.
+    "locations": "Was this in {value}?",
     "organizations": "Was this related to {value}?",
     "topics": "Was this about {value}?",
     "event_date": "Was this around {value}?",
@@ -55,6 +68,27 @@ _ATTRIBUTE_TEMPLATES = {
 _CUE_MATCH_FIELDS = ["people", "organizations", "locations", "aliases", "topics", "relations", "definitions"]
 
 
+def _clean_value(value: str) -> str:
+    """Strip a parenthetical gloss from an extracted attribute value.
+
+    The extraction model annotates its own output: `semantic.people` really
+    does contain entries like `"Markus (Data provider/Colleague/Friend)"`.
+    Those strings are used for two things -- phrasing a question to the user,
+    and matching the user's cues against candidates -- and the gloss hurts
+    both. It produced the live question "Did this involve Markus (Data
+    provider/Colleague/Friend)?", and it meant a cue of "Markus" failed to
+    match a candidate whose stored value carried the annotation.
+
+    Only the display/match form is cleaned; `semantic` itself is untouched, so
+    nothing authoritative or regenerable changes. Mirrors
+    `app/memory/entities.py::display_name_for`, which does the same for entity
+    nodes.
+    """
+    cleaned = re.sub(r"\s*[\(\[][^)\]]*[\)\]]", "", value)
+    cleaned = " ".join(cleaned.split()).strip(" ,;:-")
+    return cleaned or " ".join(value.split())
+
+
 def values_for_field(semantic: dict, field: str) -> list[str]:
     """Extract plain strings worth matching/asking about for one semantic
     field, handling the two fields that aren't flat string lists:
@@ -62,32 +96,52 @@ def values_for_field(semantic: dict, field: str) -> list[str]:
     (list of {term, definition}). An entity's own name is as likely to
     turn up as a relation's subject/object or a definition's term as in
     any of the flat list fields, so callers must not skip these.
+
+    Values come back with any parenthetical gloss removed (see
+    `_clean_value`), deduplicated, and in a stable order.
     """
     if field == "event_date":
         v = semantic.get("event_date")
-        return [v.strip()] if isinstance(v, str) and v.strip() else []
+        return [_clean_value(v)] if isinstance(v, str) and v.strip() else []
+
+    raw_values: list[str] = []
     if field == "relations":
-        out: list[str] = []
         for r in semantic.get("relations") or []:
             if not isinstance(r, dict):
                 continue
             for key in ("subject", "object"):
                 v = r.get(key)
                 if isinstance(v, str) and v.strip():
-                    out.append(v.strip())
-        return out
-    if field == "definitions":
-        out = []
+                    raw_values.append(v)
+    elif field == "definitions":
         for d in semantic.get("definitions") or []:
             if isinstance(d, dict):
                 term = d.get("term")
                 if isinstance(term, str) and term.strip():
-                    out.append(term.strip())
-        return out
-    raw = semantic.get(field)
-    if not isinstance(raw, list):
-        return []
-    return [v.strip() for v in raw if isinstance(v, str) and v.strip()]
+                    raw_values.append(term)
+    else:
+        raw = semantic.get(field)
+        if not isinstance(raw, list):
+            return []
+        raw_values = [v for v in raw if isinstance(v, str) and v.strip()]
+
+    # Cleaning can collapse two spellings onto one value ("Markus" and
+    # "Markus (Colleague)"), so dedupe afterwards -- otherwise a question's
+    # candidate-splitting counts would double-count one attribute.
+    seen: dict[str, None] = {}
+    for value in raw_values:
+        cleaned = _clean_value(value)
+        # Same admission test the graph applies to entity nodes. These values
+        # come straight out of `semantic`, which is raw extraction output, so
+        # without this the selector happily asks about the extraction's own
+        # junk: the live system asked "Did this involve User?", because
+        # gemma4:12b writes "User" into `semantic.people` where the text said
+        # "I". `app/memory/entities.py` already rejects that as a node -- a
+        # question about it is no more meaningful than a graph node for it, and
+        # the user's answer to it gets recorded as a cue either way.
+        if cleaned and is_usable_entity_name(cleaned):
+            seen.setdefault(cleaned, None)
+    return list(seen)
 
 
 def _group_by_capture(ranked: list[ScoredUnit]) -> dict[uuid.UUID, list[ScoredUnit]]:
@@ -188,7 +242,19 @@ def apply_positive_cue_boost(ranked: list[ScoredUnit], positive_cue_texts: list[
     for s in ranked:
         matches = any(_matches_cue(s.unit, c) for c in cues)
         new_score = min(1.0, s.fused_score + POSITIVE_CUE_BOOST) if matches else s.fused_score
-        boosted.append(ScoredUnit(unit=s.unit, vector_score=s.vector_score, fts_score=s.fts_score, fused_score=new_score))
+        boosted.append(
+            ScoredUnit(
+                unit=s.unit,
+                vector_score=s.vector_score,
+                fts_score=s.fts_score,
+                fused_score=new_score,
+                # Keep the pre-boost score so confidence can be judged on how
+                # well the memory itself matched, separately from the user's
+                # corroborating cue. Carried through rather than recomputed,
+                # since the boost is not invertible once clamped at 1.0.
+                prior_fused_score=s.prior_fused_score if s.prior_fused_score is not None else s.fused_score,
+            )
+        )
     return boosted
 
 
@@ -209,41 +275,43 @@ def narrow_to_dominant_group(ranked: list[ScoredUnit]) -> list[ScoredUnit]:
 
 
 def generate_discriminating_question(ranked: list[ScoredUnit], *, already_asked: list[str]) -> str | None:
-    """Pick the semantic attribute that best bisects the current
-    candidate set and phrase one concrete question about it (spec section
-    13/14). Returns None if no attribute distinguishes the remaining
-    candidates without repeating a question already asked -- the caller
-    should treat that as this angle being exhausted, not a reason to ask
-    something generic (spec section 40: a poor question is worse than
-    none).
+    """Pick the semantic attribute that best discriminates between the current
+    candidates and phrase one concrete question about it (spec section 13/14).
+    Returns None if no attribute distinguishes the remaining candidates
+    usefully without repeating a question already asked -- the caller should
+    treat that as this angle being exhausted, not a reason to ask something
+    generic (spec section 40: a poor question is worse than none).
+
+    **Selection criterion, changed:** this used to score each candidate
+    question by how evenly it bisected the candidate set *by count*. It now
+    maximises expected information gain over a plausibility-weighted
+    distribution (`app/retrieval/infogain.py`), which is a strict
+    generalisation -- for equally-scored candidates the maximum-gain split is
+    the even bisection, so this reduces to the old behaviour in that case --
+    and a real improvement when one candidate is much more likely than the
+    others, where an even split by count can be nearly uninformative.
+
+    The question *phrasings* (`_ATTRIBUTE_TEMPLATES`) are deliberately
+    unchanged: eval/run_interactive_benchmark.py's simulated-user oracle
+    reverse-maps a generated question back to its field by matching the
+    template text, so changing the wording here would silently break the
+    benchmark rather than fail loudly.
     """
-    groups = _group_by_capture(ranked)
-    candidates = [max(g, key=lambda s: s.fused_score) for g in groups.values()]
-    if len(candidates) < 2:
-        return None
+    choice = select_question(ranked, already_asked=already_asked)
+    return choice.question if choice is not None else None
 
-    asked = set(already_asked)
-    best_question: str | None = None
-    best_split_quality = -1.0
 
-    for field, template in _ATTRIBUTE_TEMPLATES.items():
-        value_to_candidates: dict[str, list[ScoredUnit]] = {}
-        for s in candidates:
-            semantic = s.unit.semantic or {}
-            for v in values_for_field(semantic, field):
-                value_to_candidates.setdefault(v, []).append(s)
+def select_question(
+    ranked: list[ScoredUnit], *, already_asked: list[str], known_values: list[str] | None = None
+):
+    """Same selection as `generate_discriminating_question`, returning the full
+    `QuestionChoice` (field, value, expected gain, utility, which candidates it
+    separates) instead of just the text -- for the recall session's trail,
+    which has to be able to show *why* this question was asked.
 
-        for value, matched in value_to_candidates.items():
-            if len(matched) == len(candidates):
-                continue  # shared by every remaining candidate -- doesn't discriminate
-            question = template.format(value=value)
-            if question in asked:
-                continue
-            # How close this value's presence/absence comes to bisecting
-            # the candidate set in half (a perfect 50/50 split scores 1.0).
-            split_quality = 1.0 - abs(len(matched) - (len(candidates) - len(matched))) / len(candidates)
-            if split_quality > best_split_quality:
-                best_split_quality = split_quality
-                best_question = question
+    `known_values` are the cue texts the user has already given this session,
+    so the selector never asks about something they just told it.
+    """
+    from app.retrieval.infogain import best_question
 
-    return best_question
+    return best_question(ranked, already_asked=already_asked, known_values=known_values)

@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% set nav_active = "explorer" %}
+{% block title %}membase — Explorer{% endblock %}
+{#
+  Explorer: the associative-memory graph. Memories and the things they are
+  about, drawn in a <canvas> by static/graph-canvas.js, with the data
+  fetching, filters and inspector in static/pages/explorer.js.
+
+  Everything that does not depend on API data lives here as real markup
+  rather than being built by the page script: the controls, the legend, the
+  inspector shell. That keeps the keyboard/screen-reader structure
+  inspectable in one place, and means the page is a readable document
+  before a single byte of graph has arrived.
+
+  The two chip groups ARE built by the script, from /api/graph/stats, so
+  the filters reflect what is actually stored instead of a hardcoded list
+  of kinds that might be empty or might be missing one.
+#}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <p class="eyebrow">Explorer</p>
+    <h1>Entities and associations</h1>
+    <p class="lede">
+      Every memory, every person, place, organization and topic it is about,
+      and the links between them. Links you stated are drawn solid; links the
+      system inferred are dashed — click any one of them to read why it is
+      there.
+    </p>
+  </div>
+
+  <div class="stack">
+    {# ---------------------------------------------------------------- controls #}
+    <div class="card explorer-controls">
+      <form id="explorer-search-form" class="form-inline explorer-search" role="search">
+        <label class="explorer-search-label" for="explorer-search-input">Find an entity</label>
+        <input
+          type="search"
+          id="explorer-search-input"
+          class="input input-grow"
+          placeholder="Markus, Lake Bled, ETH Zurich…"
+          autocomplete="off"
+          aria-describedby="explorer-search-hint"
+          aria-controls="explorer-search-results"
+        />
+        <button type="submit" class="btn btn-secondary">Search</button>
+      </form>
+      <p id="explorer-search-hint" class="field-hint">
+        Searching recentres the graph on that entity’s neighbourhood and opens
+        it in the inspector. This is also the keyboard route into the graph —
+        the canvas itself is pointer-first.
+      </p>
+      {#
+        Results are buttons in a list, not a custom combobox: Tab reaches
+        them, Enter activates them, and there is no roving-focus widget to
+        get subtly wrong.
+      #}
+      <ul id="explorer-search-results" class="explorer-results hidden" aria-label="Entity search results"></ul>
+
+      <div class="explorer-filter-grid">
+        <fieldset class="explorer-filter">
+          <legend class="label">Entity kinds</legend>
+          <div id="explorer-entity-kinds" class="row row-tight explorer-chips"></div>
+          <p id="explorer-entity-kinds-note" class="field-hint"></p>
+        </fieldset>
+
+        <fieldset class="explorer-filter">
+          <legend class="label">Association kinds</legend>
+          <div id="explorer-association-kinds" class="row row-tight explorer-chips"></div>
+          <p class="field-hint">
+            How two memories came to be linked to each other.
+          </p>
+        </fieldset>
+
+        <fieldset class="explorer-filter explorer-filter-narrow">
+          <legend class="label">Reach</legend>
+          <div class="row row-tight">
+            <label class="explorer-hops">
+              <span class="label">Hops</span>
+              <select id="explorer-hops" class="input">
+                <option value="1" selected>1 hop</option>
+                <option value="2">2 hops</option>
+              </select>
+            </label>
+          </div>
+          <p id="explorer-hops-note" class="field-hint"></p>
+        </fieldset>
+      </div>
+
+      <div class="row explorer-actions">
+        <button type="button" id="explorer-back" class="btn btn-secondary btn-sm hidden">
+          ← Back to the full graph
+        </button>
+        <button type="button" id="explorer-reset-view" class="btn btn-ghost btn-sm">Fit to view</button>
+        <span class="spacer"></span>
+        <span id="explorer-counts" class="pill pill-strong"></span>
+      </div>
+    </div>
+
+    {#
+      Truncation and focus notices. `truncated` on GraphOut means a node cap
+      dropped part of the graph; presenting a partial graph as complete is
+      exactly what that flag exists to prevent, so this is not optional
+      chrome.
+    #}
+    <p id="explorer-notice" class="card card-quiet explorer-notice hidden"></p>
+    <p id="explorer-status" class="status hidden"></p>
+
+    {# ------------------------------------------------------------- the graph #}
+    <div class="explorer-layout">
+      <div class="explorer-stage-wrap">
+        <div id="explorer-stage" class="explorer-stage">
+          {#
+            tabindex so the canvas is reachable by keyboard for pan/zoom
+            (arrows, +/-, 0). role="img" with a live-updated aria-label
+            because the pixels themselves say nothing to a screen reader —
+            the inspector and the entity search are the real accessible
+            path to this data.
+          #}
+          <canvas
+            id="explorer-canvas"
+            class="explorer-canvas"
+            tabindex="0"
+            role="img"
+            aria-label="Memory graph"
+          ></canvas>
+          <div id="explorer-tooltip" class="explorer-tooltip hidden" role="presentation"></div>
+          <div id="explorer-empty" class="explorer-empty hidden"></div>
+        </div>
+        <p class="field-hint explorer-hint">
+          Drag the background to pan, scroll to zoom, drag a node to pin it
+          where you drop it (double-click to release). Click a node or a link
+          to inspect it.
+        </p>
+
+        {#
+          Legend. Shape is the primary channel for node kind and line style
+          the primary channel for an edge's origin, exactly as app.css's
+          `.provenance` vocabulary does it — so the distinctions survive
+          greyscale and colour-blindness. The glyphs here match the shapes
+          graph-canvas.js draws.
+        #}
+        <div class="card card-quiet explorer-legend">
+          <p class="eyebrow">Legend</p>
+          <ul class="explorer-legend-list">
+            <li><span class="explorer-glyph explorer-kind-memory" aria-hidden="true">▬</span> memory</li>
+            <li><span class="explorer-glyph explorer-kind-person" aria-hidden="true">●</span> person</li>
+            <li><span class="explorer-glyph explorer-kind-location" aria-hidden="true">▲</span> location</li>
+            <li><span class="explorer-glyph explorer-kind-organization" aria-hidden="true">⬢</span> organization</li>
+            <li><span class="explorer-glyph explorer-kind-topic" aria-hidden="true">◆</span> topic</li>
+            <li><span class="explorer-glyph explorer-kind-concept" aria-hidden="true">○</span> concept</li>
+            <li><span class="explorer-glyph explorer-kind-object" aria-hidden="true">■</span> object</li>
+          </ul>
+          <p class="eyebrow explorer-legend-second">Where a link came from</p>
+          <ul class="explorer-legend-list">
+            <li><span class="explorer-line explorer-line-explicit" aria-hidden="true"></span> you stated it</li>
+            <li><span class="explorer-line explorer-line-extracted" aria-hidden="true"></span> extracted from your words</li>
+            <li><span class="explorer-line explorer-line-inferred" aria-hidden="true"></span> inferred by the system</li>
+          </ul>
+          <p class="field-hint">Node size is how many links it has; line thickness is the link’s weight.</p>
+        </div>
+      </div>
+
+      {#
+        The inspector. Always in the DOM (so it is always in the tab order
+        and announceable), with its own live region, and focused when it
+        opens from the canvas.
+      #}
+      <aside
+        id="explorer-inspector"
+        class="card explorer-inspector"
+        tabindex="-1"
+        aria-labelledby="explorer-inspector-heading"
+        aria-live="polite"
+      >
+        <div class="card-head explorer-inspector-head">
+          <h2 id="explorer-inspector-heading">Inspector</h2>
+          <button type="button" id="explorer-inspector-close" class="btn btn-ghost btn-sm hidden">Clear</button>
+        </div>
+        <div id="explorer-inspector-body" class="stack-tight"></div>
+      </aside>
+    </div>
+  </div>
+</section>
+{% endblock %}

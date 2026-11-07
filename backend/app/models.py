@@ -1,8 +1,20 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, Computed, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Computed,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -291,11 +303,405 @@ class RecallSession(Base):
     final_sources: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     final_chunk_sources: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
+    # --- explainable reconstruction (see docs/ARCHITECTURE.md "Evidence
+    # trail"). All three are snapshots, same discipline as final_sources: a
+    # record of what this session actually did, which must stay readable even
+    # after the underlying memories change.
+    #
+    # One entry per round: which retrieval strategies ran, how many candidates
+    # came from direct matching vs. association expansion, what was ruled out
+    # by the user's own negative cues, which question was asked and its
+    # approximate expected information gain, and the budget in force. This is
+    # what makes "why did I get this result?" answerable after the fact
+    # instead of only while the round is running.
+    strategy_trail: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Per-candidate structured evidence behind the final answer, including
+    # contradicting items and each item's provenance level (original /
+    # extracted / inferred / hypothesis). See app/retrieval/evidence.py.
+    final_evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Calibrated confidence CATEGORY (strong | moderate | weak |
+    # insufficient), never a bare percentage -- nothing in this system
+    # produces a calibrated probability, so showing one would be fabricated
+    # precision. Definition lives in app/retrieval/evidence.py::confidence_for.
+    final_confidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Why the system declined to answer, in plain language, when it did.
+    # Distinct from the fixed abstention message shown to the user: this is
+    # the diagnosable reason (nothing matched / ambiguity unresolved / the
+    # model judged the evidence ungrounded).
+    abstention_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Associative memory graph (see docs/ARCHITECTURE.md "Associative memory
+# graph")
+#
+# This is the queryable graph that `MemoryUnit.related_unit_ids` deliberately
+# was not: typed nodes, typed edges, a weight, and -- the part that makes it
+# usable as *memory* rather than as a pile of inferences -- an `origin` column
+# on every edge recording whether the user said it, an extraction step derived
+# it, or the system merely computed it.
+#
+# `related_unit_ids` is NOT replaced. It stays exactly as it was (an advisory
+# flat list the structurer writes) and is additionally projected into
+# `unit_associations` with origin="inferred". Nothing that reads it today
+# changes behaviour.
+#
+# Every row here is derived data in the authority hierarchy's lowest tier: it
+# is rebuilt from `MemoryUnit.semantic`/`explicit_metadata` by
+# `app/memory/graph.py:project_unit()` and can be dropped and regenerated
+# without losing anything the user said. That is why projection is idempotent
+# (delete-then-rebuild per unit) rather than incremental.
+
+# Edge/link origin, in descending authority -- the same distinction the
+# proposal's "distinguish explicitly established relationships from inferred
+# associations" requires, as a column rather than a heuristic:
+#   "explicit"  -- the user stated it themselves (Capture.explicit_metadata,
+#                  or a clarification answer). Outranks everything below.
+#   "extracted" -- an LLM extraction step read it out of the user's own words
+#                  (MemoryUnit.semantic). Faithful to the text, but derived.
+#   "inferred"  -- nobody stated it; the system computed it (entity
+#                  co-occurrence, the structurer's related-memory judgement).
+ORIGIN_EXPLICIT = "explicit"
+ORIGIN_EXTRACTED = "extracted"
+ORIGIN_INFERRED = "inferred"
+EDGE_ORIGINS = (ORIGIN_EXPLICIT, ORIGIN_EXTRACTED, ORIGIN_INFERRED)
+
+# Entity kinds. Deliberately a small closed set mapped 1:1 onto semantic
+# fields the pipeline already extracts -- not an open-ended ontology, which
+# would need curation this system explicitly does not want.
+ENTITY_KINDS = ("person", "organization", "location", "topic", "concept", "object")
+
+
+class MemoryEntity(Base):
+    """A canonical thing memories are *about* -- a person, organization,
+    location, topic, concept, or (for images) a visible object.
+
+    Entities are the hub nodes that make associative recall possible: two
+    memories that share no wording at all are one hop apart if they mention
+    the same lake. They are resolved deterministically (normalized name +
+    alias folding, see app/memory/entities.py), never by an LLM call, so the
+    graph costs no inference on top of what ingestion already spends.
+
+    An entity is never authoritative about anything. `display_name` is just
+    the first spelling seen; the memory it came from remains the only source
+    of truth, reachable via `unit_entity_links.provenance`.
+    """
+
+    __tablename__ = "memory_entities"
+    __table_args__ = (
+        # One row per (kind, normalized name). The same string can legitimately
+        # be two different entities of different kinds ("Zurich" the location
+        # vs. "Zurich" the insurer), so the kind is part of the identity.
+        UniqueConstraint("kind", "normalized_name", name="uq_memory_entities_kind_name"),
+        CheckConstraint(
+            "kind IN ('person', 'organization', 'location', 'topic', 'concept', 'object')",
+            name="ck_memory_entities_kind",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    # Deterministic normalization (casefold, whitespace collapse, possessive
+    # and punctuation stripping) -- the join key. See app/memory/entities.py.
+    normalized_name: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    # The first surface spelling this entity was seen under, for display only.
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    # Other surface forms folded into this entity, as normalized strings.
+    # Populated from semantic.aliases; used so "ETH" and "ETH Zurich" resolve
+    # to one node instead of two.
+    aliases: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # How many distinct memory units link to this entity. Denormalized from
+    # unit_entity_links purely so the noise filters (which need a
+    # document-frequency figure for every candidate entity) don't have to
+    # aggregate the link table on every projection.
+    mention_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class UnitEntityLink(Base):
+    """A memory unit mentions an entity -- the unit<->entity edge.
+
+    `role` records which semantic field the mention came from, which is what
+    lets the graph explain itself ("connected because both happened at Lake
+    Bled" vs. "both are about hiking") instead of just asserting a link.
+    `origin` records whether the user stated it or an extraction step inferred
+    it, so a user-supplied location can outrank a model-guessed one at
+    retrieval time.
+    """
+
+    __tablename__ = "unit_entity_links"
+    __table_args__ = (
+        # One row per (unit, entity, role): the same entity legitimately
+        # appears under two roles (named in `people` AND as a relation's
+        # subject), and both are worth keeping as separate evidence.
+        UniqueConstraint("unit_id", "entity_id", "role", name="uq_unit_entity_links_unit_entity_role"),
+        CheckConstraint(
+            "origin IN ('explicit', 'extracted', 'inferred')", name="ck_unit_entity_links_origin"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Which semantic field produced this mention: "people" | "organizations" |
+    # "locations" | "topics" | "definition_term" | "relation_subject" |
+    # "relation_object" | "visual_concept".
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default=ORIGIN_EXTRACTED)
+    # Role-derived confidence in this single mention (not a probability --
+    # see app/memory/graph.py's ROLE_WEIGHTS for the fixed table and what each
+    # value means).
+    weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # {"field": str, "excerpt": str, "surface": str, "predicate": str | None}
+    # -- enough to show the user the words this link was derived from.
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EntityRelation(Base):
+    """A subject-predicate-object triple between two entities, asserted by one
+    specific memory unit.
+
+    This is `semantic.relations` finally given somewhere to live where it can
+    be traversed. `unit_id` is mandatory and not nullable: a relation with no
+    memory behind it would be exactly the free-floating "fact" the memory-
+    integrity rules forbid. Deleting the memory deletes the relation.
+    """
+
+    __tablename__ = "entity_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "unit_id",
+            "subject_entity_id",
+            "object_entity_id",
+            "normalized_predicate",
+            name="uq_entity_relations_unit_triple",
+        ),
+        CheckConstraint(
+            "origin IN ('explicit', 'extracted', 'inferred')", name="ck_entity_relations_origin"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    subject_entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    object_entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_entities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The predicate as the extraction produced it ("recommended a paper to"),
+    # kept verbatim for display, plus a normalized form for deduplication.
+    predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default=ORIGIN_EXTRACTED)
+    weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # Temporal attachment: the asserting unit's event date, carried onto the
+    # relation so "who did I meet in 2023" is answerable by edge filtering.
+    # `occurred_on` is NULL whenever the date couldn't be parsed -- never
+    # back-filled with a guess or with created_at (see app/memory/temporal.py).
+    occurred_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # day | month | season | year | unknown -- how precisely occurred_on is
+    # actually known. "unknown" with a NULL date is the honest default.
+    date_precision: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class UnitAssociation(Base):
+    """A weighted edge directly between two memory units.
+
+    Stored once per unordered pair+kind with `source_unit_id < target_unit_id`
+    by UUID ordering (see app/memory/graph.py's `_ordered_pair`), because these
+    associations are symmetric -- "these two memories share a location" reads
+    the same from either end. Traversal queries both columns.
+
+    `explanation` is deterministic, generated text (never an LLM call) so the
+    UI can answer "why are these two connected?" without a round trip.
+    """
+
+    __tablename__ = "unit_associations"
+    __table_args__ = (
+        UniqueConstraint("source_unit_id", "target_unit_id", "kind", name="uq_unit_associations_pair_kind"),
+        CheckConstraint("source_unit_id <> target_unit_id", name="ck_unit_associations_no_self_loop"),
+        CheckConstraint(
+            "origin IN ('explicit', 'extracted', 'inferred')", name="ck_unit_associations_origin"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # "shared_entity"    -- both units mention the same entities (inferred)
+    # "same_capture"     -- siblings from one submission (extracted: the user
+    #                       really did write them together)
+    # "structurer_link"  -- the membase structurer judged them related
+    #                       (inferred, mirrors related_unit_ids)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default=ORIGIN_INFERRED)
+    weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # The entity ids justifying a "shared_entity" edge, so the explanation can
+    # be recomputed and the edge can be filtered by entity kind.
+    shared_entity_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Human-readable, deterministically generated: "Both mention Lake Bled
+    # (location) and hiking (topic)."
+    explanation: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Episodic memory (see docs/ARCHITECTURE.md "Episodes")
+#
+# An episode is a collection of memories belonging to one experience, event, or
+# period -- a holiday, a semester, a meeting, a particular evening. It is the
+# unit people actually recall by ("that trip where..."), as distinct from the
+# `Capture` (one submission) and the `MemoryUnit` (one retrievable fact).
+#
+# Two things this schema is built to express honestly, because the proposal
+# requires both and they are easy to lose:
+#
+# **Uncertainty about dates and boundaries.** `started_on`/`ended_on` are
+# nullable and travel with a `date_precision` and a `boundary_confidence`. An
+# episode whose members carry no usable date has NULL dates and says so,
+# rather than being filed under whenever the memories happened to be typed.
+# Nothing here ever invents a date (see app/memory/temporal.py).
+#
+# **Overlap and multi-membership.** Membership is a separate table with no
+# uniqueness on `unit_id` alone, so one memory can belong to several episodes
+# (a conference talk belongs to both "the conference" and "the Berlin trip")
+# and two episodes can cover overlapping spans without contradiction.
+#
+# Like the graph, episodes are a rebuildable projection: `app/memory/episodes.py`
+# derives them deterministically from member dates and entity overlap, with no
+# LLM call, so they cost nothing per capture and can be regenerated after a
+# clustering change.
+
+
+class Episode(Base):
+    """One experience, event, or period that several memories belong to."""
+
+    __tablename__ = "episodes"
+    __table_args__ = (
+        CheckConstraint(
+            "boundary_confidence IN ('asserted', 'inferred', 'uncertain')",
+            name="ck_episodes_boundary_confidence",
+        ),
+        CheckConstraint("origin IN ('explicit', 'extracted', 'inferred')", name="ck_episodes_origin"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Deterministically composed from the episode's dominant entities and its
+    # date span ("Lake Bled, Markus - July 2023"). Not model-written: see
+    # app/memory/episodes.py for why a generated title was deliberately not
+    # worth an LLM call per episode.
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    # "derived" today. Reserved so a future model-written title can be
+    # distinguished from a composed one rather than silently replacing it.
+    title_source: Mapped[str] = mapped_column(Text, nullable=False, default="derived")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # NULL when no member memory carries a resolvable date. Never back-filled
+    # from created_at -- "I don't know when this was" and "this happened the
+    # day it was written down" are different claims.
+    started_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    ended_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # day | month | season | year | unknown -- the LOOSEST precision among
+    # members, since a span is only as precise as its vaguest endpoint.
+    date_precision: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    # asserted  -- every dated member's date came from the user directly
+    # inferred  -- derived from model-extracted event dates
+    # uncertain -- at least one member has no usable date at all, so the real
+    #              boundaries may extend beyond what is recorded here
+    boundary_confidence: Mapped[str] = mapped_column(Text, nullable=False, default="uncertain")
+
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default="inferred")
+    # {"seed_unit_id": str, "rule": str, ...} -- which memory started this
+    # episode and which clustering rule grouped it.
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    memberships: Mapped[list["EpisodeMembership"]] = relationship(
+        back_populates="episode", cascade="all, delete-orphan"
+    )
+
+
+class EpisodeMembership(Base):
+    """A memory belongs to an episode.
+
+    Deliberately NOT unique on `unit_id`: a memory can legitimately belong to
+    more than one episode, and forcing a single assignment would mean picking
+    one arbitrarily and discarding a real relationship.
+    """
+
+    __tablename__ = "episode_memberships"
+    __table_args__ = (
+        UniqueConstraint("episode_id", "unit_id", name="uq_episode_memberships_episode_unit"),
+        CheckConstraint(
+            "origin IN ('explicit', 'extracted', 'inferred')", name="ck_episode_memberships_origin"
+        ),
+        CheckConstraint(
+            "confidence IN ('certain', 'likely', 'uncertain')", name="ck_episode_memberships_confidence"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default="inferred")
+    # How sure the grouping is: "certain" for memories the user submitted
+    # together, down to "uncertain" for an undated memory grouped purely on
+    # entity overlap.
+    confidence: Mapped[str] = mapped_column(Text, nullable=False, default="uncertain")
+    # {"rule": str, "shared_entity_ids": [...], "explanation": str} -- a
+    # deterministic, human-readable reason this memory is in this episode.
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    episode: Mapped[Episode] = relationship(back_populates="memberships")
 
 

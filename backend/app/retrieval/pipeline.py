@@ -117,7 +117,12 @@ _ANSWER_SYSTEM = (
     "stored memories disagree with each other -- you MUST state that "
     "disagreement explicitly in your answer (e.g. \"You have two stored "
     "memories that conflict: one says X and another says Y.\"), never "
-    "silently pick one side or omit the conflicting one."
+    "silently pick one side or omit the conflicting one. An 'Associated "
+    "memory' block did NOT match the question -- it was reached by following a "
+    "connection from a memory that did. Use it only to interpret or support a "
+    "primary memory; never present it as the answer on its own, and if the "
+    "only relevant evidence is an associated memory, say what it suggests and "
+    "that it is not a direct match rather than answering as if it were."
 )
 
 
@@ -163,6 +168,19 @@ class ScoredUnit:
     vector_score: float | None
     fts_score: float | None
     fused_score: float
+    # The fused score BEFORE a session's positive-cue boost was applied, set
+    # only by apply_positive_cue_boost (None whenever no boost was applied).
+    #
+    # Needed because `fused_score` afterwards mixes two different things: how
+    # well this memory matches the query, and the fact that the user confirmed
+    # a detail it happens to mention. For ranking, mixing them is correct --
+    # that is the point of the boost. For *confidence*, it is not: confidence
+    # should describe how well the memory itself matches, with the user's cue
+    # as corroboration rather than as a better match. Observed live, the
+    # conflation let a memory about a conference talk reach `strong` alongside
+    # the photograph the user was actually looking for, on the strength of
+    # both mentioning the same person.
+    prior_fused_score: float | None = None
 
 
 def _fuse(
@@ -444,12 +462,25 @@ async def generate_answer(
     primary: list[ScoredUnit],
     context: list[MemoryUnit],
     chunks: list[ScoredChunk] | None = None,
+    *,
+    evidence: str | None = None,
 ) -> tuple[str, bool]:
     """Returns (answer_text, grounded). Caller is responsible for
     substituting the fixed abstention message when grounded is False --
     this function never does that itself, so the hard override lives in
-    exactly one place (app/retrieval/agent.py)."""
-    evidence = format_evidence(primary, context, chunks)
+    exactly one place (app/retrieval/agent.py).
+
+    `evidence`, if given, replaces the `format_evidence(primary, context,
+    chunks)` text this would otherwise build -- for the associative engine,
+    whose candidate set carries association provenance that `ScoredUnit`
+    cannot express (see app/retrieval/evidence.py::format_evidence_block).
+    The grounding decision deliberately stays HERE regardless of who formatted
+    the evidence: there must remain exactly one place in the codebase that
+    decides whether an answer is grounded, or the abstention guarantee can be
+    weakened on one path without anyone noticing.
+    """
+    if evidence is None:
+        evidence = format_evidence(primary, context, chunks)
     prompt = f"Question: {query}\n\nEvidence from stored memories:\n{evidence}"
     try:
         result = await llm.generate_structured(prompt, schema=_ANSWER_SCHEMA, system=_ANSWER_SYSTEM)

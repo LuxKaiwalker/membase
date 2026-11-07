@@ -1,27 +1,139 @@
 {% extends "base.html" %}
-{% block title %}membase — Remember{% endblock %}
+{% set nav_active = "recall" %}
+{% block title %}membase — Recall{% endblock %}
 {% block content %}
+{#-
+  Recall is an interactive *session*, not a single request/response: the
+  user starts from a vague cue, the system explores, asks at most one
+  well-chosen question at a time, and shows the evidence behind every
+  candidate it puts forward (see docs/ARCHITECTURE.md "Iterative recall"
+  and app/retrieval/{session,associative,evidence}.py).
+
+  This template is pure structure. Every element id below is the contract
+  with static/pages/recall.js -- nothing here is interpolated from
+  request state (scripts/build_frontend.py renders it once, empty).
+-#}
 <section class="panel">
-  <h1>State what you want to remember</h1>
-  <form id="recall-form">
-    <input id="query" type="text" placeholder="e.g. Who recommended that robotics paper?" required />
-    <button type="submit">Remember</button>
+  <div class="panel-head">
+    <p class="eyebrow">Recall</p>
+    <h1>Start from whatever you remember</h1>
+    <p class="lede">
+      A half-remembered fragment is enough to begin. membase searches what
+      you have stored, explores the connections around what it finds, and
+      asks you one concrete question at a time when several memories are
+      still plausible -- rather than guessing. Everything it puts forward
+      comes with the evidence behind it, and with how it got there.
+    </p>
+  </div>
+
+  {# ---- 1. The focal input. ------------------------------------------ #}
+  <form id="recall-form" class="card recall-ask">
+    <label class="recall-ask-label" for="query">What are you trying to remember?</label>
+    <textarea
+      id="query"
+      class="input recall-ask-input"
+      rows="3"
+      required
+      placeholder="e.g. I am trying to remember a photograph from a trip a few years ago. I think we were near a lake&hellip;"
+    ></textarea>
+    <div class="row recall-ask-actions">
+      <button id="recall-submit" type="submit" class="btn btn-primary btn-lg">Start recalling</button>
+      <button id="recall-new" type="button" class="btn btn-ghost hidden">Clear and start over</button>
+      <span class="field-hint recall-ask-hint">
+        Rounds run against a local model and take tens of seconds.
+      </span>
+    </div>
   </form>
 
   <div id="status" class="status hidden"></div>
 
-  <div id="result" class="card hidden">
-    <h2>Answer</h2>
-    <p id="answer" class="answer"></p>
-
-    <div id="sources-wrap">
-      <h3>Supporting memories</h3>
-      <p class="muted">This is the actual stored data the answer above was grounded in -- not generated text.</p>
-      <ul id="sources"></ul>
+  {# ---- 2. The session. ---------------------------------------------- #}
+  <div id="session" class="stack-loose recall-session hidden">
+    <div class="card recall-head">
+      <p class="eyebrow">Recalling</p>
+      <p id="session-query" class="recall-query"></p>
+      <div id="session-meta" class="row recall-meta"></div>
+      <p id="session-note" class="muted recall-note"></p>
     </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>The recall session</h2>
+        <button id="session-cancel" type="button" class="btn btn-danger btn-sm hidden">Stop this session</button>
+      </div>
+      <ol id="transcript" class="recall-transcript"></ol>
+
+      {# Shown only while status === "needs_user_cue". #}
+      <div id="reply-block" class="recall-reply hidden">
+        <p class="eyebrow">One question at a time</p>
+        <p id="current-question" class="recall-question"></p>
+        <form id="reply-form">
+          <label class="label" for="reply-text">Your reply</label>
+          <textarea
+            id="reply-text"
+            class="input"
+            rows="2"
+            required
+            placeholder="Answer the question, add a different detail, or correct something you said."
+          ></textarea>
+          <div class="row">
+            <button id="reply-submit" type="submit" class="btn btn-primary">Reply and search again</button>
+            <span class="field-hint">
+              Answering, ignoring the question in favour of another detail, and
+              correcting yourself are all valid -- each one is just another cue.
+            </span>
+          </div>
+        </form>
+        <div id="reply-status" class="status hidden"></div>
+      </div>
+    </div>
+
+    {# ---- 3. Candidates and their evidence. ------------------------- #}
+    <div id="candidates-wrap" class="hidden">
+      <div class="panel-head">
+        <h2>Candidate memories, and the evidence for each</h2>
+        <p class="muted" id="candidates-note"></p>
+      </div>
+      <div id="candidates" class="stack"></div>
+    </div>
+
+    {# Attachment chunks that matched -- real stored document text, not
+       generated. #}
+    <div id="chunks-wrap" class="card hidden">
+      <h2>Matching text from attached documents</h2>
+      <ul id="chunks" class="source-list"></ul>
+    </div>
+
+    {# ---- 5. Accumulated cues. --------------------------------------- #}
+    <div id="cues-wrap" class="card hidden">
+      <h2>What you have told me</h2>
+      <p class="muted">
+        Cues extracted from your own turns, with how firmly you stated each
+        one and whether it includes or excludes. These live on this recall
+        session only -- answering here never edits a stored memory.
+      </p>
+      <ul id="cues" class="recall-cue-list"></ul>
+    </div>
+
+    {# ---- 6. System hypotheses. -------------------------------------- #}
+    <div id="hypotheses-wrap" class="card hidden">
+      <h2>Guesses the system made while searching</h2>
+      <p class="muted">
+        Reformulated queries it tried on its own. These are search guesses,
+        not things you said and not facts about your memories -- they are
+        shown so the search can be audited, and they are excluded from
+        scoring.
+      </p>
+      <ul id="hypotheses" class="recall-hypothesis-list"></ul>
+    </div>
+
+    {# ---- 4. The retrieval trail, collapsed by default. --------------- #}
+    <details id="trail" class="card recall-trail hidden">
+      <summary class="recall-trail-summary">
+        How the search went, round by round
+      </summary>
+      <div id="trail-body" class="stack recall-trail-body"></div>
+    </details>
   </div>
 </section>
-
-<script src="/static/app.js"></script>
-<script>membase.initRecallPage();</script>
 {% endblock %}

@@ -30,6 +30,45 @@ async def test_structuring_upgrades_semantics_without_touching_status(db):
     assert unit.embedding is not None
 
 
+async def test_structuring_preserves_visual_concepts(db):
+    """This pass REPLACES `semantic` wholesale, so any field missing from
+    _STRUCTURE_SCHEMA is silently dropped from an already-good first-pass
+    result -- an image's visual concepts, and every "object" entity the
+    association graph built from them, would vanish a few seconds after
+    ingestion. Worse than never extracting them, and invisible without a
+    test like this one."""
+    llm = FakeLLMProvider(enrichment_response={"visual_concepts": ["lake", "mountains"]})
+    capture = await create_capture_and_finish(db, llm, text="That hike last summer.", uploads=[])
+    unit = capture.units[0]
+    assert unit.semantic["visual_concepts"] == ["lake", "mountains"]
+
+    structure_llm = FakeLLMProvider(
+        enrichment_response={"visual_concepts": ["lake", "mountains", "snow"], "related_indices": []}
+    )
+    await finish_structuring(unit.id, llm=structure_llm)
+    db.refresh(unit)
+
+    assert unit.semantic["visual_concepts"] == ["lake", "mountains", "snow"]
+    assert "Visible in image: lake, mountains, snow" in unit.retrieval_text
+
+
+async def test_structure_schema_asks_for_every_semantic_field():
+    """Guards the whole class of bug above, not just visual_concepts: the
+    deep pass's unified schema must cover every field `Semantics` carries,
+    or the one it forgets gets wiped on the second pass."""
+    from app.ingestion.analysis import Semantics, empty_semantics
+    from app.ingestion.structurer import _SEMANTIC_PROPERTIES, _SEMANTIC_REQUIRED
+
+    # enrichment_status is bookkeeping set by our own code, never asked of
+    # the model (see the Semantics docstring in app/ingestion/analysis.py).
+    model_derived = set(Semantics.__annotations__) - {"enrichment_status"}
+    assert model_derived == set(_SEMANTIC_PROPERTIES)
+    assert model_derived == set(_SEMANTIC_REQUIRED)
+    # And empty_semantics() must supply all of them, or a degraded unit
+    # would be missing keys the graph/retrieval layers read.
+    assert set(empty_semantics()) == set(Semantics.__annotations__)
+
+
 async def test_structuring_skips_a_unit_that_is_not_ready(db, fake_llm):
     llm = FakeLLMProvider(enrichment_response={"clarification_question": "What is Flimvex?", "clarification_field": "Flimvex"})
     capture = await create_capture_and_finish(db, llm, text="My Flimvex PIN is 42.", uploads=[])

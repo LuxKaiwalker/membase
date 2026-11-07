@@ -15,3 +15,9 @@ result-*
 # generic, placeholder-filled templates; keep your own real copies here,
 # never committed.
 deploy/local/
+
+# Benchmark artifacts (eval/strategy_benchmark.py): the corpus cache that
+# lets a run skip 15-25 minutes of re-ingestion, and the raw per-query
+# results written for diffing one run against another.
+eval/.corpus_state.json
+eval/strategy_benchmark_results.json
