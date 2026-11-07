@@ -54,7 +54,14 @@ MAX_CLARIFICATION_ROUNDS = 3
 # empty list there, and so contributes no "object" entities to the
 # association graph -- reprocessing is what makes "that photo with a lake
 # and mountains behind it" reach memories captured before the field existed.
-CURRENT_PIPELINE_VERSION = 2
+# 3: the attachment-text budget is now shared max-min fair across
+# attachments (_allocate_part_budgets) instead of split evenly, so a
+# capture whose attachments are unevenly sized no longer wastes the
+# small one's unused share. Only changes anything for captures with 2+
+# attachments of differing lengths; for a single attachment, or parts
+# that all exceed an equal share, the assembled text is byte-identical
+# and reprocessing is a no-op.
+CURRENT_PIPELINE_VERSION = 3
 
 # Marker delimiting an attachment excerpt appended to a unit's
 # retrieval_text by add_attachment() -- used to strip a stale excerpt
@@ -170,6 +177,57 @@ MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS = 1500
 _STRUCTURED_DATA_MARKER = "\n\nStructured data:\n"
 
 
+def _allocate_part_budgets(demands: list[int], total: int) -> list[int]:
+    """Split `total` characters across parts, max-min fair: a part that
+    needs less than an equal share keeps only what it needs and releases
+    the surplus to the parts that want more, repeatedly, until every
+    part still competing wants at least an equal share of what's left.
+
+    An even split (the previous rule, `total // len(parts)`) wastes the
+    difference whenever attachments are unevenly sized -- a 60-char
+    "a blurry photo of a wall" caption next to a long PDF excerpt took
+    the same 750-char share as the PDF and left ~690 chars of the budget
+    unused while the PDF was cut short. Redistribution is pure
+    arithmetic over text the caller already has, so it costs nothing and
+    never grows the prompt past `total`.
+
+    It does NOT help when total demand exceeds the budget: two parts
+    wanting 1299 and 866 chars out of 1500 still get 750 each, because
+    there is no surplus anywhere to move. Fitting that case would mean
+    raising MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS, which trades against
+    the output budget this cap exists to protect -- see docs/TODO.md.
+    """
+    budgets = [0] * len(demands)
+    pending = list(range(len(demands)))
+    pool = total
+    while pending:
+        share = pool // len(pending)
+        if share < 1:
+            break
+        under = [i for i in pending if demands[i] <= share]
+        if not under:
+            # Everyone left wants more than an equal share: split what
+            # remains evenly, handing the integer-division remainder to
+            # the first few so the whole budget is actually used.
+            remainder = pool - share * len(pending)
+            for n, i in enumerate(pending):
+                budgets[i] = share + (1 if n < remainder else 0)
+            pending = []
+            break
+        for i in under:
+            budgets[i] = demands[i]
+            pool -= demands[i]
+        satisfied = set(under)
+        pending = [i for i in pending if i not in satisfied]
+    # Every part gets at least one character. A part allocated zero
+    # disappears from the prompt entirely, and an attachment silently
+    # absent is the exact bug this whole code path exists to prevent --
+    # better to overshoot a 1500-char cap by a few characters on a
+    # capture with hundreds of attachments than to drop one without
+    # saying so.
+    return [max(b, 1) for b in budgets]
+
+
 def _truncate_attachment_part(part: str, budget: int) -> str:
     if len(part) <= budget:
         return part
@@ -193,20 +251,24 @@ def _attachment_text_for_analysis(capture: Capture) -> str:
     *content* remains separately searchable via AttachmentChunk
     regardless of what's included here.
 
-    The budget is split evenly across attachments and each one is
-    truncated on its own boundary -- a flat slice of the whole
-    concatenated blob instead spends the entire budget on the first
-    attachment(s) and silently drops later ones, which previously made
-    the model report a later image's description as "cut off" when it
-    had actually just never been included at all (e.g. a two-photo
+    The budget is shared across attachments (_allocate_part_budgets)
+    and each one is truncated on its own boundary -- a flat slice of the
+    whole concatenated blob instead spends the entire budget on the
+    first attachment(s) and silently drops later ones, which previously
+    made the model report a later image's description as "cut off" when
+    it had actually just never been included at all (e.g. a two-photo
     eyeglasses prescription where the second photo's SPH/CYL/AXS/PSM
     values never made it into the prompt -- see docs/user-todo.md).
     """
     parts = _attachment_parts(capture)
     if not parts:
         return ""
-    budget_per_part = max(MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS // len(parts), 1)
-    return "\n\n".join(_truncate_attachment_part(part, budget_per_part) for part in parts)
+    budgets = _allocate_part_budgets(
+        [len(p) for p in parts], MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS
+    )
+    return "\n\n".join(
+        _truncate_attachment_part(part, budget) for part, budget in zip(parts, budgets)
+    )
 
 
 # --- cheap prior-memory lookup (see docs/DECISIONS.md "Prior memory

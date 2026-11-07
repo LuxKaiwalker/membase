@@ -429,6 +429,26 @@ Full reasoning for every item below is in docs/DECISIONS.md under
 
 ## Known technical gaps
 
+- **`MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS` (1500) is too small for a
+  multi-photo capture, and the right number is unmeasured.** The
+  reported two-photo prescription capture (docs/user-todo.md) wants
+  1299 + 866 = 2165 characters; both images now reach the prompt, but
+  each is cut to 750. Max-min fair redistribution
+  (`_allocate_part_budgets`) stops budget being *wasted* and cannot
+  help here, because neither part has a surplus to release. The second
+  image's values survive only because they print near the top of its
+  caption, and that image produced no `"Structured data:"` block, so
+  the keep-the-structured-block-whole rule has nothing to prioritize
+  for it — a photo described background-first would lose them again.
+  **The experiment this needs:** raising the cap costs input tokens on
+  every clarify/enrich call a capture's units ever make, out of the same
+  context budget the model's own output comes from (the reason the cap
+  exists at all). Sweep the cap over the eval set and read answer
+  quality and call latency, rather than picking a bigger number because
+  it fixes one capture. The other half of the same gap is
+  extraction-side: `_extract_image_structured_data()` returned no block
+  at all for the second photo, and a structured block is both smaller
+  and more robust than the prose it replaces.
 - **Resolved: attachment-chunk evidence is rendered again.** The old recall
   page's `renderSources()` handled only `data.sources` and silently dropped
   `chunk_sources`, so a document excerpt could contribute to an answer without

@@ -2419,6 +2419,36 @@ block whole by shortening the free-text caption first -- the exact
 values are what clarify/enrich actually need; the prose caption is
 comparatively disposable.
 
+**Follow-up: the even split wasted budget.** An equal share is only the
+right division when every attachment wants at least its share. A
+60-char "a blurry photo of a wall" caption next to a long PDF excerpt
+took the same 750-char share as the PDF and left ~690 characters of the
+budget unused while the PDF was cut short. `_allocate_part_budgets()`
+now shares the budget max-min fair: a part needing less than an equal
+share keeps what it needs and releases the surplus to the parts that
+want more, repeatedly, with the integer-division remainder handed out
+rather than dropped. Pure arithmetic over text the caller already has,
+so it costs nothing and never grows the prompt past the cap. Floor of
+one character per part, deliberately allowed to overshoot the cap on a
+capture with more attachments than the cap has characters: a part
+allocated zero disappears from the prompt with no indication it ever
+existed, which is the original bug.
+
+**What redistribution does not fix.** It cannot create budget, only
+stop it being wasted. Measured on the reported capture itself: its two
+images want 1299 and 866 characters against a 1500-char cap, every part
+already wants more than its share, so both still get 750 and the
+assembled text is byte-identical to the even split
+(`test_no_surplus_anywhere_falls_back_to_an_even_split` pins exactly
+this, with those real sizes). That capture's left-eye values survive
+only because they happen to print near the top of the second image's
+caption -- and that image produced no `"Structured data:"` block, so
+the caption-first truncation rule above has nothing to prioritize for
+it. Fitting it whole is a question about the *size* of the cap, which
+trades against the output budget the cap exists to protect, and should
+be measured rather than guessed -- logged in docs/TODO.md instead of
+silently raised here.
+
 **The bigger problem the fix doesn't solve on its own:** a unit already
 stuck on the stale question stays stuck -- fixing the derivation code
 only changes what happens the *next* time a unit is processed, not
