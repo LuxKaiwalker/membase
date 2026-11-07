@@ -246,16 +246,29 @@ def expand_with_associations(
     db: Session,
     candidates: list[Candidate],
     budget: RetrievalBudget,
-    *,
-    started_at: float | None = None,
 ) -> list[Candidate]:
     """Walk the memory graph outward from the strongest candidates.
+
+    Times itself. It used to accept the caller's start time so a round could
+    share one deadline, and that is exactly how the feature got silently
+    switched off: `session.py` passed the time the *round* began, which is
+    before `automatic_search`'s LLM calls, and a round takes 13-57s against a
+    local model against a 10s traversal budget. Every expansion therefore broke
+    on its first neighbour and logged a budget warning, so
+    `expanded_candidates` was 0 in every session while the same graph returned
+    eleven neighbours when queried directly.
+
+    The budget is meant to bound the graph traversal -- pure SQL, normally
+    milliseconds -- so that a pathological corpus cannot hang a round. Letting a
+    caller supply the clock made it possible to bound something else entirely,
+    so the parameter is gone rather than documented.
 
     Returns NEW association-route candidates only; candidates already present
     directly are given an extra evidence item instead (a memory that both
     matched and is associated with another match is better supported, but it
     is still a direct match, not an inferred one).
     """
+    expansion_started = time.monotonic()
     existing = {str(c.unit.id): c for c in candidates}
     seeds = {
         c.unit.id: c.base_score
@@ -282,7 +295,7 @@ def expand_with_associations(
 
     new_candidates: list[Candidate] = []
     for assoc in associated:
-        if started_at is not None and (time.monotonic() - started_at) > budget.deadline_seconds:
+        if (time.monotonic() - expansion_started) > budget.deadline_seconds:
             logger.warning("Association expansion hit its wall-clock budget; returning what was found")
             break
         unit_id = str(assoc.unit.id)

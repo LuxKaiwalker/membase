@@ -1,0 +1,276 @@
+# Query set for the multi-strategy retrieval benchmark
+# (eval/strategy_benchmark.py). Targets eval/memory_corpus.yaml; every
+# `relevant_memories` / `ground_truth_memory` id below is checked against
+# that file at startup and a dangling reference aborts the run.
+#
+# Fields
+# ------
+# category            one of: exact, semantic, indirect_association,
+#                     multi_hop, temporal, ambiguous, vague_episodic,
+#                     unanswerable. Drives the per-category breakdown.
+# relevant_memories   EVERY acceptable correct target. This is the set
+#                     recall@1 / recall@5 are scored against, so for an
+#                     ambiguous pair it contains both members: retrieving
+#                     either one is correct *retrieval*, and choosing
+#                     between them is what answer correctness measures.
+# ground_truth_memory the single best target. Used for exactly one thing:
+#                     grounding the simulated user's replies to whatever
+#                     clarifying question the adaptive strategy actually
+#                     asks (see simulate_reply() in the runner).
+# expect_contains     case-insensitive substring check against the final
+#                     answer, ANY match passes. A deliberately crude proxy
+#                     for correctness -- see docs/EVALUATION.md "Caveats".
+# expect: abstain     unanswerable queries only. No ground truth exists;
+#                     a grounded answer here counts as a FALSE RETRIEVAL.
+
+queries:
+  # --- exact: the query uses the memory's own words / proper nouns -------
+  - id: Q1
+    category: exact
+    question: "What is Project Saltmarsh?"
+    relevant_memories: [M1]
+    ground_truth_memory: M1
+    expect_contains: ["sensor", "wetland", "salinity"]
+  - id: Q2
+    category: exact
+    question: "Who picked Thamesreach Instruments as our hardware supplier?"
+    relevant_memories: [M3]
+    ground_truth_memory: M3
+    expect_contains: ["priyanka"]
+  - id: Q3
+    category: exact
+    question: "When did the Kestrel migration's first dry run fail?"
+    relevant_memories: [M7]
+    ground_truth_memory: M7
+    expect_contains: ["3 february 2025", "february 2025", "february 3"]
+  - id: Q4
+    category: exact
+    question: "How many pots are in the teapot series?"
+    relevant_memories: [M12]
+    ground_truth_memory: M12
+    expect_contains: ["six", "6 pots"]
+  - id: Q5
+    category: exact
+    question: "Who runs the Thursday evening ceramics class?"
+    relevant_memories: [M10]
+    ground_truth_memory: M10
+    expect_contains: ["mireille"]
+
+  # --- semantic: paraphrased, little or no lexical overlap ---------------
+  - id: Q6
+    category: semantic
+    question: "Why did we give up on the tidal-gauge part of the wetland project?"
+    relevant_memories: [M2]
+    ground_truth_memory: M2
+    expect_contains: ["condensation", "corrod"]
+  - id: Q7
+    category: semantic
+    question: "What went wrong the first time we tried to move the old records store?"
+    relevant_memories: [M7]
+    ground_truth_memory: M7
+    expect_contains: ["time zone", "timezone", "timestamp"]
+  - id: Q8
+    category: semantic
+    question: "Why did I change the glaze I use on my pots?"
+    relevant_memories: [M15]
+    ground_truth_memory: M15
+    expect_contains: ["pinhol", "celadon", "cone-10"]
+  - id: Q9
+    category: semantic
+    question: "What made me give up the climbing sessions?"
+    relevant_memories: [M31]
+    ground_truth_memory: M31
+    expect_contains: ["shoulder", "impingement"]
+  - id: Q10
+    category: semantic
+    question: "Which of my suppliers can I no longer get any help from?"
+    relevant_memories: [M4]
+    ground_truth_memory: M4
+    expect_contains: ["thamesreach"]
+
+  # --- indirect_association: the fact lives in a memory linked to the one
+  #     the query actually matches, not in the matched memory itself ------
+  - id: Q11
+    category: indirect_association
+    question: "Whose van was it that smelled of wet rope?"
+    relevant_memories: [M37, M38]
+    ground_truth_memory: M37
+    expect_contains: ["brendan"]
+  - id: Q12
+    category: indirect_association
+    question: "What do I know about Hoshi Nakamura's family?"
+    relevant_memories: [M16, M17]
+    ground_truth_memory: M16
+    expect_contains: ["fenwick", "cousin"]
+  - id: Q13
+    category: indirect_association
+    question: "Is there anything connecting my woodworking to the wetland project at work?"
+    relevant_memories: [M19, M1, M43]
+    ground_truth_memory: M19
+    expect_contains: ["cape bruny"]
+  - id: Q14
+    category: indirect_association
+    question: "Which of my work problems did I end up presenting in public?"
+    relevant_memories: [M25, M5]
+    ground_truth_memory: M25
+    expect_contains: ["power", "drain", "saltmarsh"]
+  - id: Q15
+    category: indirect_association
+    question: "Which people in my notes have a connection to Cape Bruny?"
+    relevant_memories: [M1, M17, M19, M27, M30]
+    ground_truth_memory: M17
+    expect_contains: ["fenwick", "priyanka"]
+
+  # --- multi_hop: memory A names an entity, memory B holds the answer,
+  #     and B shares no wording with the query ---------------------------
+  - id: Q16
+    category: multi_hop
+    question: "What happened to the person who taught me to centre clay?"
+    relevant_memories: [M10, M11]
+    ground_truth_memory: M11
+    expect_contains: ["wrist", "stepladder", "broke"]
+  - id: Q17
+    category: multi_hop
+    question: "Can I still get support for the hardware in the Saltmarsh field deployment?"
+    relevant_memories: [M3, M4]
+    ground_truth_memory: M4
+    expect_contains: ["out of business", "bounce", "no longer", "thamesreach"]
+  - id: Q18
+    category: multi_hop
+    question: "What is the man I bought my lathe from doing now?"
+    relevant_memories: [M16, M17]
+    ground_truth_memory: M17
+    expect_contains: ["kayak"]
+  - id: Q19
+    category: multi_hop
+    question: "What is my relationship to the person accountable for the records-store migration?"
+    relevant_memories: [M6, M44]
+    ground_truth_memory: M44
+    expect_contains: ["manager"]
+
+  # --- temporal ----------------------------------------------------------
+  - id: Q20
+    category: temporal
+    question: "What went wrong in February 2025?"
+    relevant_memories: [M7]
+    ground_truth_memory: M7
+    expect_contains: ["dry run", "time zone", "timestamp"]
+  - id: Q21
+    category: temporal
+    question: "Did I start the driftwood bench before or after I took over Saltmarsh?"
+    relevant_memories: [M43, M19, M1]
+    ground_truth_memory: M43
+    expect_contains: ["before"]
+  - id: Q22
+    category: temporal
+    question: "What happened in the spring that disrupted my pottery class?"
+    relevant_memories: [M11]
+    ground_truth_memory: M11
+    expect_contains: ["wrist", "stepladder", "open studio"]
+  - id: Q23
+    category: temporal
+    question: "When did my manager change?"
+    relevant_memories: [M44]
+    ground_truth_memory: M44
+    expect_contains: ["january 2025", "january"]
+  - id: Q24
+    category: temporal
+    question: "What were the last two things to happen before Priyanka Venn left?"
+    relevant_memories: [M42, M41]
+    ground_truth_memory: M42
+    expect_contains: ["dry run", "stentor", "talk"]
+
+  # --- ambiguous: a clarifying question genuinely resolves it ------------
+  - id: Q25
+    category: ambiguous
+    question: "Who did I argue with about rewriting the migration from scratch?"
+    relevant_memories: [M8, M9]
+    ground_truth_memory: M8
+    expect_contains: ["priyanka"]
+  - id: Q26
+    category: ambiguous
+    question: "Which colleague did I fall out with over the Kestrel rewrite question?"
+    relevant_memories: [M8, M9]
+    ground_truth_memory: M9
+    expect_contains: ["yusra"]
+  - id: Q27
+    category: ambiguous
+    question: "Where was I when I sketched the teapot handle on a napkin?"
+    relevant_memories: [M13, M14]
+    ground_truth_memory: M13
+    expect_contains: ["vellmar", "station"]
+  - id: Q28
+    category: ambiguous
+    question: "Which year did Tobias and I camp in the overflow field at the Halvard Festival?"
+    relevant_memories: [M23, M24]
+    ground_truth_memory: M23
+    expect_contains: ["2022"]
+  - id: Q29
+    category: ambiguous
+    question: "How old is the boiler in the Ossian Street flat?"
+    relevant_memories: [M34, M35]
+    ground_truth_memory: M34
+    expect_contains: ["2019", "1998"]
+
+  # --- vague_episodic: a feeling or fragment, not a fact ----------------
+  - id: Q30
+    category: vague_episodic
+    question: "There was a cold afternoon and a decision I did not win. What was that?"
+    relevant_memories: [M2, M8, M9]
+    ground_truth_memory: M2
+    expect_contains: ["tidal-gauge", "tidal gauge", "budget", "condensation"]
+  - id: Q31
+    category: vague_episodic
+    question: "What was the thing I measured carefully for two months before telling anyone?"
+    relevant_memories: [M5]
+    ground_truth_memory: M5
+    expect_contains: ["drain", "saltmarsh", "cells"]
+  - id: Q32
+    category: vague_episodic
+    question: "I remember standing still and watching something for a long minute. What was it?"
+    relevant_memories: [M27]
+    ground_truth_memory: M27
+    expect_contains: ["kestrel"]
+  - id: Q33
+    category: vague_episodic
+    question: "What was the swim where the water looked wrong?"
+    relevant_memories: [M36]
+    ground_truth_memory: M36
+    expect_contains: ["teufelssee", "black"]
+  - id: Q34
+    category: vague_episodic
+    question: "There is an exercise I keep not doing. Which one is it?"
+    relevant_memories: [M32]
+    ground_truth_memory: M32
+    expect_contains: ["band"]
+  - id: Q35
+    category: vague_episodic
+    question: "What was the question I could not answer in front of a room of people?"
+    relevant_memories: [M25]
+    ground_truth_memory: M25
+    expect_contains: ["stentor", "second row", "power", "drain"]
+
+  # --- unanswerable: no stored memory answers these. A grounded answer
+  #     here is a false retrieval, not a success. Q36/Q37/Q40 are the hard
+  #     variety (a related memory EXISTS but does not contain the answer);
+  #     Q38/Q39 are the easy variety (nothing related is stored at all).
+  - id: Q36
+    category: unanswerable
+    question: "Who told me to measure from the shoulder, not the end?"
+    expect: abstain
+  - id: Q37
+    category: unanswerable
+    question: "What is in the blue folder in the third drawer?"
+    expect: abstain
+  - id: Q38
+    category: unanswerable
+    question: "What was my grandmother's maiden name?"
+    expect: abstain
+  - id: Q39
+    category: unanswerable
+    question: "How much was the deposit on the Ossian Street flat?"
+    expect: abstain
+  - id: Q40
+    category: unanswerable
+    question: "Which building had the yellow door?"
+    expect: abstain

@@ -798,3 +798,56 @@ async def test_the_strategy_trail_accumulates_one_entry_per_round(db, monkeypatc
         assert entry["question"]["question"] in session.asked_questions
         assert "expected_gain_bits_approx" in entry["question"]
     assert json.loads(json.dumps(session.strategy_trail)) == session.strategy_trail
+
+
+async def test_a_session_round_actually_expands_through_the_graph(db, monkeypatch):
+    """The end-to-end property that was silently broken for the entire product
+    path: a round with ambiguous direct candidates and a real association must
+    put an association-route candidate in front of the user.
+
+    It was not broken in `expand_with_associations` itself -- every unit test
+    of that function passed throughout. It was broken at the *call site*:
+    `session.py` handed it the time the round began, which is before
+    `automatic_search`'s LLM calls, so a 13-57s round always blew the 10s
+    traversal budget and the loop broke on its first neighbour. Every session
+    reported `expanded_candidates: 0` while the same graph returned eleven
+    neighbours when queried directly.
+
+    This test asserts the behaviour at the session boundary, which is where the
+    defect lived, rather than at the function boundary, which was fine.
+    """
+    seed = _ready_unit(
+        db,
+        text="Took this photo on the hike above Lake Bled with Markus.",
+        semantic={"people": ["Markus"], "locations": ["Lake Bled"]},
+    )
+    rival = _ready_unit(
+        db,
+        text="A weekend at Lake Thun with Nadia.",
+        semantic={"people": ["Nadia"], "locations": ["Lake Thun"]},
+    )
+    # Shares no query wording -- reachable ONLY by association from the seed.
+    neighbour = _ready_unit(
+        db,
+        text="Markus is doing a doctorate in glaciology at ETH Zurich.",
+        semantic={"people": ["Markus"], "organizations": ["ETH Zurich"]},
+    )
+    _associate(db, seed, neighbour, weight=0.8, explanation="Both mention Markus (person).")
+
+    # Two close candidates from different captures, so `should_expand` says yes.
+    _patch_rounds(monkeypatch, [_search_result([_scored(seed, 0.62), _scored(rival, 0.60)])])
+    llm = FakeLLMProvider(answer_response={"answer": "The Lake Bled photo.", "grounded": True})
+
+    session = await start_session(db, llm, "a photo near a lake with mountains")
+
+    entry = session.strategy_trail[-1]
+    assert "association_expansion" in entry["strategies"]
+    assert entry["expansion_skipped_reason"] is None
+    assert entry["expanded_candidates"] >= 1, "the graph walk contributed nothing"
+
+    routes = {c["unit_id"]: c["route"] for c in session.final_evidence}
+    assert routes.get(str(neighbour.id)) == ROUTE_ASSOCIATION
+    reached = next(c for c in session.final_evidence if c["unit_id"] == str(neighbour.id))
+    # And it arrives explainable, not just present.
+    assert reached["association_why"]
+    assert reached["confidence"] in {CONFIDENCE_WEAK, CONFIDENCE_INSUFFICIENT}

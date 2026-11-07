@@ -4,6 +4,18 @@
 
 ### Known gaps, flagged rather than silently left
 
+- **Multi-hop association is still UNMEASURED.** The first full benchmark run
+  was made with a defect that disabled graph expansion almost everywhere (the
+  10-second traversal budget was given a clock started before
+  `automatic_search`'s LLM calls, and a round takes 13-57 seconds), so
+  `expanded_candidates` was 0 for most or all queries. The defect is fixed in
+  both `app/retrieval/session.py` and `eval/strategy_benchmark.py`, and
+  `expand_with_associations` now times itself so a caller cannot make the
+  mistake again — but the comparison has to be re-run before anything can be
+  said about whether association helps. The recorded `associative` numbers
+  measure evidence collection and re-ranking, not association. See
+  docs/REPORT.md §2.
+
 - **Entity resolution is exact-match plus conservative alias folding, not
   fuzzy.** `is_alias_of` (`app/memory/entities.py`) folds an alias only when
   one name's words contain the other's as a contiguous whole-word run, so

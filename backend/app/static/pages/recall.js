@@ -344,13 +344,18 @@
         // app/retrieval/session.py's _ask), where it describes the leading
         // candidate rather than an answer -- so it must not be labelled as
         // confidence in an answer that does not exist yet.
+        // Only a session that actually produced an answer has confidence
+        // *in an answer*; every other status that carries a confidence
+        // (a pending question, a cancelled or exhausted session) is
+        // describing the leading candidate so far.
+        const answered = session.status === "success";
         parts.push(
           `<span class="recall-meta-confidence">${confidenceMeter(session.confidence)}</span>`,
           pill(
-            session.status === "needs_user_cue" ? "confidence so far" : "confidence in the answer",
-            session.status === "needs_user_cue"
-              ? "How well-supported the leading candidate is at this point -- no answer has been given yet"
-              : ""
+            answered ? "confidence in the answer" : "confidence so far",
+            answered
+              ? ""
+              : "How well-supported the leading candidate is at this point -- no answer has been given"
           )
         );
       }
@@ -392,7 +397,20 @@
     // ----------------------------------------------------------------
 
     function renderTranscript() {
-      const messages = session.messages || [];
+      const all = session.messages || [];
+      // The question still awaiting an answer is rendered by the reply
+      // block immediately below, where it belongs with the field that
+      // answers it. Leaving it in the transcript too would print the same
+      // sentence twice, a few lines apart. Once answered it reappears here
+      // in its proper place in the record (the reply block is gone by
+      // then), so nothing is lost.
+      const pendingQuestionTrails =
+        session.status === "needs_user_cue" &&
+        session.current_question &&
+        all.length > 0 &&
+        all[all.length - 1].role === "system" &&
+        all[all.length - 1].text === session.current_question;
+      const messages = pendingQuestionTrails ? all.slice(0, -1) : all;
       transcriptEl.innerHTML = "";
 
       messages.forEach((message, index) => {
@@ -717,7 +735,9 @@
           : `${candidates.length} candidate${candidates.length === 1 ? " was" : "s were"} considered`) +
         (leads
           ? `, of which ${leads} ${leads === 1 ? "is a lead reached" : "are leads reached"} by inference rather than a match.`
-          : ", all of them reached by matching your query rather than by inference.") +
+          : candidates.length === 1
+            ? ", reached by matching your query rather than by inference."
+            : ", all of them reached by matching your query rather than by inference.") +
         " The memory text below is stored data, not generated;" +
         (pending
           ? " nothing here has been put forward as an answer yet."
@@ -987,6 +1007,7 @@
       hide(replyStatus);
       transcriptEl.innerHTML = "";
       candidatesEl.innerHTML = "";
+      trailEl.open = false;
       queryInput.value = "";
       replyInput.value = "";
       setInFlight(false);
@@ -1010,6 +1031,10 @@
       // session's spinner.
       session = null;
       hide(sessionEl);
+      // Collapsed by default is per session, not just per page load: the
+      // trail belongs to the search that produced it, so a new search
+      // starts with the audit view folded away again.
+      trailEl.open = false;
       startSession(query);
     });
 

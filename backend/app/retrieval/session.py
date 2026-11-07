@@ -302,7 +302,7 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
         expand, skip_reason = should_expand(candidates)
         if expand:
             trace.strategies.append("association_expansion")
-            expanded = expand_with_associations(db, candidates, budget, started_at=round_started)
+            expanded = expand_with_associations(db, candidates, budget)
             candidates.extend(expanded)
             trace.expanded_candidates = len(expanded)
         else:

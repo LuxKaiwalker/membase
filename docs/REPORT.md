@@ -160,11 +160,31 @@ Full definitions and caveats in `docs/EVALUATION.md`.
 | `associative` | **0.486** | **0.829** | 0.600 | 0.40 | **0.029** | 0 | 5.1 | 14.7 |
 | `adaptive` | 0.371 | 0.800 | **0.629** | 0.40 | 0.229 | 1.28 | 11.4 | 30.4 |
 
-**What this supports.** Associative multi-hop retrieval is a large, real
-improvement in recall@5 — 0.829 against 0.571 for conventional vector
-similarity and 0.629 for hybrid search with LLM reformulation. It also has the
-best recall@1 and by far the lowest abstention rate on answerable queries
-(0.029). That is the project's central claim, and on this corpus it holds.
+**⚠ The `associative` row does not measure what its name says.** This run was
+made with a defect that disabled graph expansion almost everywhere: the
+expansion budget (10 s, intended to bound a pure-SQL graph walk) was handed a
+clock started *before* `automatic_search`'s LLM calls, and a round against a
+local model takes 13–57 s. The traversal therefore ran and then immediately
+discarded its results on the first neighbour. The same defect was present in
+the benchmark harness and in the product path, so **`expanded_candidates` was
+0 for most or all queries in the table above.**
+
+Which means the `associative` row measures the *other* differences in that
+mode — structured evidence collection, evidence-based re-ranking, and the
+evidence block format — and not multi-hop association. The 0.829 recall@5 is a
+real measurement of a real configuration; it is simply not evidence for the
+claim "multi-hop association helps", which remains **unmeasured**. Both the
+harness and `session.py` are fixed (`expand_with_associations` now times
+itself, and the parameter that made the mistake possible is gone), and the
+comparison needs re-running before anything can be concluded about
+association. That is a genuinely annoying result to report and it is the
+honest one.
+
+**What the table does support.** Evidence collection and evidence-based
+re-ranking are worth a lot on their own: 0.829 recall@5 against 0.571 for
+conventional vector similarity and 0.629 for hybrid search with LLM
+reformulation, with the best recall@1 and by far the lowest abstention rate on
+answerable queries (0.029).
 
 **What this does not support, and must be said.** Adaptive iterative recall,
 with clarification, has the *best answer correctness* (0.629) but the *worst
@@ -181,7 +201,9 @@ things and better at convincing itself it has found something. Any reading of
 the recall column that ignores this one is wrong, which is why the Evaluation
 page refuses to compute a combined score.
 
-**Caveats that matter.** Single run (`repeat: 1`) — on a 40-query set with a
+**Caveats that matter.** The expansion defect above, first and loudest — the
+headline strategy was not doing the thing it is named after. Single run
+(`repeat: 1`) — on a 40-query set with a
 non-deterministic local model, one or two flips are plausible with no code
 change at all, so treat the ordering as a hypothesis rather than a measurement.
 Only 5 unanswerable queries, so false-retrieval rate has 0.2 granularity.
