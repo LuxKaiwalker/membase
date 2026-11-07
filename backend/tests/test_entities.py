@@ -151,3 +151,12 @@ def test_visual_concept_admission_is_stricter_than_general_entity_admission():
     the one field where it describes the attachment rather than the content."""
     assert is_usable_entity_name("minimalist illustration")
     assert not is_usable_visual_concept("minimalist illustration")
+
+
+def test_a_bare_colour_statement_is_not_a_visual_concept_but_a_coloured_thing_is():
+    """"blue-gray color" describes the picture; "dark blue water" names water in
+    it. The filter has to separate those, not reject every mention of colour."""
+    assert not is_usable_visual_concept("blue-gray color")
+    assert not is_usable_visual_concept("dark gray tone")
+    assert is_usable_visual_concept("dark blue water")
+    assert is_usable_visual_concept("snow-capped peaks")

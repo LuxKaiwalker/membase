@@ -174,6 +174,10 @@ _MEDIUM_WORDS = {
     "painting", "paintings", "render", "rendering", "graphic", "graphics",
     "artwork", "sketch", "diagram", "screenshot", "style", "styled", "aesthetic",
     "palette", "composition", "foreground", "background", "closeup", "close-up",
+    # A bare colour statement ("blue-gray color", "dark gray tone") describes
+    # the picture, not a thing in it. Note this rejects only the colour
+    # *statement*: "dark blue water" survives, because it names water.
+    "color", "colour", "colors", "colours", "tone", "tones", "shade", "hue",
 }
 # Style qualifiers that only ever modify a medium word.
 _STYLE_WORDS = {

@@ -46,7 +46,11 @@ from sqlalchemy.engine import make_url  # noqa: E402
 
 from app.config import get_settings  # noqa: E402
 from app.db import get_sessionmaker  # noqa: E402
-from app.memory.graph import project_unit, remove_unit_from_graph  # noqa: E402
+from app.memory.graph import (  # noqa: E402
+    project_unit,
+    prune_orphan_entities,
+    remove_unit_from_graph,
+)
 from app.models import (  # noqa: E402
     EntityRelation,
     MemoryEntity,
@@ -239,6 +243,26 @@ def main() -> int:
             pruned += 1
         db.commit()
         print(f"  pruned {pruned} non-ready unit(s) from the graph")
+
+        # Global orphan sweep. `project_unit` prunes entities a memory stops
+        # mentioning, but only among the ones THAT unit previously linked --
+        # it cannot see an entity whose last link was already gone before this
+        # run started. Those exist whenever the admission rules tighten: after
+        # the visual-concept filter landed, "minimalist illustration" had zero
+        # links yet still carried `mention_count: 3`, sized a node in the
+        # explorer and appeared on the overview as something the store was
+        # "mostly about". A full-table sweep is only affordable here, in the
+        # backfill, which is exactly why it lives behind --prune.
+        orphans = list(
+            db.execute(
+                select(MemoryEntity.id)
+                .outerjoin(UnitEntityLink, UnitEntityLink.entity_id == MemoryEntity.id)
+                .where(UnitEntityLink.id.is_(None))
+            ).scalars()
+        )
+        orphaned_entities = prune_orphan_entities(db, orphans)
+        db.commit()
+        print(f"  pruned {orphaned_entities} entity/entities nothing mentions any more")
 
     db.commit()
     # These are sums of per-unit ProjectionResults, so an association can be
