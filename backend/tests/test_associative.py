@@ -851,3 +851,51 @@ async def test_a_session_round_actually_expands_through_the_graph(db, monkeypatc
     # And it arrives explainable, not just present.
     assert reached["association_why"]
     assert reached["confidence"] in {CONFIDENCE_WEAK, CONFIDENCE_INSUFFICIENT}
+
+
+def test_an_association_lead_can_never_displace_a_direct_match_in_the_budget(db):
+    """The budget must be route-aware, and the reason is not tidiness.
+
+    `is_ambiguous` and `narrow_to_dominant_group` are computed over the direct
+    candidates that survive `apply_budget`. A plain score-sorted truncation let
+    association leads push a direct candidate out as soon as expansion produced
+    enough of them -- which removed an origin-capture group, made the round look
+    unambiguous, and sent the session straight to a confident WRONG answer
+    instead of the clarifying question it should have asked. Observed live the
+    moment expansion started working.
+    """
+    budget = RetrievalBudget(max_total_candidates=4)
+    # Leads score higher than the weakest direct match, so a naive sort-and-cut
+    # would keep them and drop it.
+    directs = [
+        _candidate(_ready_unit(db, text=f"direct {i}"), score)
+        for i, score in enumerate([0.62, 0.60, 0.58, 0.20])
+    ]
+    leads = [
+        _candidate(_ready_unit(db, text=f"lead {i}"), score, route=ROUTE_ASSOCIATION)
+        for i, score in enumerate([0.54, 0.53, 0.52])
+    ]
+
+    kept = apply_budget(sorted(directs + leads, key=lambda c: -c.score), budget)
+
+    assert len(kept) == 4
+    # Every direct candidate survives, including the weak one.
+    assert {c.unit_id for c in kept} == {c.unit_id for c in directs}
+    assert not [c for c in kept if c.route == ROUTE_ASSOCIATION]
+
+
+def test_leads_fill_the_budget_only_after_every_direct_match_is_kept(db):
+    budget = RetrievalBudget(max_total_candidates=4)
+    directs = [_candidate(_ready_unit(db, text=f"direct {i}"), 0.6 - i * 0.01) for i in range(2)]
+    leads = [
+        _candidate(_ready_unit(db, text=f"lead {i}"), 0.5 - i * 0.01, route=ROUTE_ASSOCIATION)
+        for i in range(5)
+    ]
+
+    kept = apply_budget(sorted(directs + leads, key=lambda c: -c.score), budget)
+
+    assert len(kept) == 4
+    assert len([c for c in kept if c.route != ROUTE_ASSOCIATION]) == 2
+    assert len([c for c in kept if c.route == ROUTE_ASSOCIATION]) == 2
+    # And the strongest leads are the ones that made it in.
+    assert [c.score for c in kept if c.route == ROUTE_ASSOCIATION] == [0.5, 0.49]

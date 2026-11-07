@@ -1,6 +1,7 @@
 import re
 import uuid
 
+from app.memory.entities import is_usable_entity_name
 from app.retrieval.pipeline import ScoredUnit
 
 # Heuristic, not a formal Bayesian active-learning framework (spec section
@@ -130,7 +131,15 @@ def values_for_field(semantic: dict, field: str) -> list[str]:
     seen: dict[str, None] = {}
     for value in raw_values:
         cleaned = _clean_value(value)
-        if cleaned:
+        # Same admission test the graph applies to entity nodes. These values
+        # come straight out of `semantic`, which is raw extraction output, so
+        # without this the selector happily asks about the extraction's own
+        # junk: the live system asked "Did this involve User?", because
+        # gemma4:12b writes "User" into `semantic.people` where the text said
+        # "I". `app/memory/entities.py` already rejects that as a node -- a
+        # question about it is no more meaningful than a graph node for it, and
+        # the user's answer to it gets recorded as a cue either way.
+        if cleaned and is_usable_entity_name(cleaned):
             seen.setdefault(cleaned, None)
     return list(seen)
 

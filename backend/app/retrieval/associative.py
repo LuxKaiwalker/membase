@@ -578,4 +578,29 @@ def rerank(candidates: list[Candidate]) -> list[Candidate]:
 
 
 def apply_budget(candidates: list[Candidate], budget: RetrievalBudget) -> list[Candidate]:
-    return candidates[: budget.max_total_candidates]
+    """Trim to the prompt budget without ever dropping a direct match for a lead.
+
+    Route-aware on purpose. A plain `candidates[:max_total]` over the merged,
+    score-sorted list lets an association-route candidate displace a
+    directly-matched one as soon as expansion produces enough leads -- and that
+    is not a cosmetic reordering, because `is_ambiguous` and
+    `narrow_to_dominant_group` are computed over the *direct* candidates that
+    survive this call.
+
+    Observed for real the moment expansion started working: 5 direct + 8
+    expanded against a cap of 12 dropped one direct candidate, which removed
+    the second origin-capture group, which made the round look unambiguous. The
+    session then skipped its clarifying question and answered confidently with
+    the wrong trip. A lead that exists only because something else matched must
+    never be able to silence the question about what actually matched.
+    """
+    direct = [c for c in candidates if c.route != ROUTE_ASSOCIATION]
+    associated = [c for c in candidates if c.route == ROUTE_ASSOCIATION]
+    kept = direct[: budget.max_total_candidates]
+    remaining = budget.max_total_candidates - len(kept)
+    if remaining > 0:
+        kept += associated[:remaining]
+    # Restore the merged score ordering for display; the selection above is
+    # what the budget decides, the order is not.
+    kept.sort(key=lambda c: (-c.score, c.route == ROUTE_ASSOCIATION, c.unit_id))
+    return kept
