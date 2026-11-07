@@ -370,6 +370,29 @@ out the memories the denials exclude, and raises the Lake Bled photograph to
 associations, each with a deterministic explanation of *why*), its episode, and
 the photograph itself.
 
+**The demonstration does not always take that path, and the reason is worth
+understanding rather than tuning away.** The query hedges — "I think",
+"possibly in Switzerland or Austria" — but the system treats those terms with
+the same weight as a stated fact. The Lake Thun memory is in Switzerland and
+literally says "photographed the mountains", so on some corpus states it
+dominates clearly enough that there is no ambiguity left to resolve, and the
+session answers in round one with Lake Thun rather than asking.
+
+That answer is *defensible* retrieval: it is the best match for the words the
+user actually used, the user's own recollection of the country is what is
+wrong, and the system reports `moderate` rather than `strong` and surfaces the
+contradiction it found by association — "You may be confusing the location
+because you have noted that Lake Bled in Slovenia looks very similar to the
+Alps around Interlaken." It is not a confident falsehood.
+
+But it is not what a memory system for *imperfect* recall should do with a
+hedged clue. "Possibly in Switzerland" is evidence that the user does not know
+where it was, and the system reads it as evidence that it was in Switzerland.
+Detecting hedged query terms and discounting them is a real design gap, logged
+in docs/TODO.md; it was not attempted here because it changes what the system
+treats as a constraint, which deserves its own evaluation rather than being
+slipped in to make a demonstration land more reliably.
+
 `/app/explorer/` shows the same structure as a graph; `/app/timeline/` shows it
 chronologically, with undated memories labelled rather than placed somewhere
 invented; `/app/evaluation/` shows whether any of it actually beats

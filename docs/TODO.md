@@ -4,6 +4,26 @@
 
 ### Known gaps, flagged rather than silently left
 
+- **A hedged clue is treated as a hard constraint.** "I think it was possibly
+  in Switzerland or Austria" is, to a human reader, the user saying they do not
+  know where it was. Retrieval reads it as the words "Switzerland" and
+  "Austria" and scores memories accordingly -- so a memory that actually is in
+  Switzerland can dominate clearly enough to suppress the clarifying question,
+  and the system answers from the user's own mistaken premise. The answer stays
+  honest (it reports `moderate`, not `strong`, and surfaces the contradicting
+  memory it found by association), but this is the opposite of what a system
+  for *imperfect* recall should do with an expression of uncertainty.
+
+  Not attempted this phase because it changes what the retrieval layer treats
+  as a constraint, which deserves its own measurement rather than being added
+  to make the demonstration land more reliably. Open questions: whether hedging
+  is detected lexically ("I think", "maybe", "possibly", "or") or by asking the
+  extraction step to mark which parts of a query the user is unsure about;
+  whether a hedged term should be down-weighted in scoring or merely barred
+  from *suppressing* ambiguity; and how it interacts with
+  `apply_positive_cue_boost`, where a cue the user marked `uncertain` currently
+  gets exactly the same boost as one they were certain about.
+
 - **Multi-hop association is still UNMEASURED.** The first full benchmark run
   was made with a defect that disabled graph expansion almost everywhere (the
   10-second traversal budget was given a clock started before
