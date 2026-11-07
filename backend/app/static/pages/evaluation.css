@@ -1,0 +1,514 @@
+/* ==========================================================================
+   Page: Evaluation (/app/evaluation/)
+   --------------------------------------------------------------------------
+   Composes app.css tokens and primitives only -- nothing here defines a
+   token, hardcodes a colour, or redefines a primitive
+   (.card/.panel/.badge/.chip/.pill/.stack/.row/.grid/.scroll-x).
+
+   Two things this page needs that the design system has no primitive for,
+   and which are page-specific rather than shared vocabulary:
+
+     1. Data tables. app.css styles no <table> at all, because this is the
+        only data-table view in the app. They live inside .scroll-x so a
+        ten-column comparison scrolls in its own box and <body> never gains
+        a horizontal scrollbar (app.css section 2 states that rule).
+
+     2. Meters. A bar whose width is an inline percentage -- no charting
+        library, no SVG, no CDN, per the repo's zero-dependency rule. Two
+        fills, deliberately distinguishable: higher-is-better metrics use
+        the accent, lower-is-better ones use the warning token. That is the
+        whole point of the colour difference -- false retrieval must not be
+        readable as a win, so it must not look like recall.
+
+   Restraint still applies: the bars are a reading aid for comparing four
+   values, not a dashboard. No fills at size, no gradients as decoration.
+   ========================================================================== */
+
+/* -- Panels --------------------------------------------------------------- */
+
+.ev-panel { padding: var(--space-5); }
+
+/* app.css gives `.card + .card` a top margin; the root here is a
+   .stack-loose, so the gap is already owned by the flex container. */
+.ev-panel + .ev-panel { margin-top: 0; }
+
+.ev-panel .card-head {
+  align-items: flex-start;
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.ev-panel-title > .eyebrow { margin-bottom: var(--space-1); }
+.ev-panel-title > h2 { margin: 0; }
+
+.ev-panel-note {
+  max-width: var(--layout-reading);
+  margin-bottom: var(--space-4);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+/* -- Provenance ----------------------------------------------------------- */
+
+.ev-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.ev-meta-row {
+  display: grid;
+  grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+}
+
+.ev-meta-row dt {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.ev-meta-row dd {
+  margin: 0;
+  max-width: var(--layout-reading);
+  overflow-wrap: anywhere;
+}
+
+/* A condition that can quietly invalidate the run (a limited corpus, an
+   empty graph, degraded enrichment). Warning-toned because it is a
+   "do not trust these numbers yet" signal, not an error. */
+.ev-flags {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-4) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ev-flag {
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--warning);
+  background: var(--warning-wash);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* -- The noise-floor notice ----------------------------------------------- */
+
+.ev-noise p { max-width: var(--layout-reading); }
+
+/* The single sentence a reader must not skip. Given an edge rather than a
+   fill: it is a rule for reading the page, not an alarm. */
+.ev-rule {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--radius-sm);
+  background: var(--accent-wash);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+/* -- Bars ----------------------------------------------------------------- */
+
+/* Two equal-weight columns: higher-is-better and lower-is-better. Equal
+   weight is the requirement, not a layout preference. */
+.ev-bar-grid { grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
+
+.ev-bar-panel { padding: var(--space-4); }
+.ev-bar-panel + .ev-bar-panel { margin-top: 0; }
+
+.ev-bar-note {
+  margin-bottom: var(--space-4);
+  line-height: var(--leading-normal);
+}
+
+.ev-bar-metric + .ev-bar-metric {
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--hairline);
+}
+
+.ev-bar-metric-title {
+  margin: 0 0 var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.ev-bars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.ev-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 8.5rem) minmax(3rem, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.ev-bar-label {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ev-bar-track {
+  position: relative;
+  display: block;
+  height: 0.55rem;
+  border-radius: var(--radius-pill);
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.ev-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: var(--radius-pill);
+}
+
+.ev-bar-fill-up { background: var(--accent-edge); }
+
+/* Lower-is-better. A different hue from the accent on purpose: at a glance,
+   a long bar here must not read the way a long recall bar does. */
+.ev-bar-fill-down { background: var(--warning); }
+
+/* The observed min-max across repeats, drawn on the same track as two tick
+   marks at the lowest and highest run. Deliberately unfilled: a shaded band
+   would sit on top of the fill and make the mean unreadable, and the mean is
+   the figure the row is reporting. Only present when there is more than one
+   run and the runs disagreed. */
+.ev-bar-range {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--text-secondary);
+  border-right: 1px solid var(--text-secondary);
+}
+
+.ev-bar-value {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-self: end;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ev-bar-spread {
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+}
+
+/* -- Tables --------------------------------------------------------------- */
+
+/* .scroll-x is a flex item of the card's block flow; without min-width: 0 a
+   wide table would stretch its container instead of scrolling inside it. */
+.ev-scroll {
+  min-width: 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+
+.ev-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.ev-table th,
+.ev-table td {
+  padding: var(--space-3);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.ev-table tbody tr:last-child th,
+.ev-table tbody tr:last-child td { border-bottom: 0; }
+
+.ev-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.ev-table .ev-row-head-col,
+.ev-table .ev-row-head {
+  min-width: 14rem;
+  max-width: 22rem;
+  background: var(--surface-raised);
+  font-weight: var(--weight-medium);
+  white-space: normal;
+}
+
+.ev-table thead .ev-row-head-col { background: var(--surface-sunken); }
+
+.ev-strategy-name,
+.ev-cat-name {
+  display: inline-block;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.ev-strategy-note,
+.ev-cat-note {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+}
+
+.ev-col-label { display: block; }
+
+/* The direction marker in a column header. Not decoration: without it a
+   reader can mistake a high false-retrieval rate for a good score. */
+.ev-dir {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ev-dir-up { color: var(--accent); }
+.ev-dir-down { color: var(--warning); }
+.ev-dir-cost { color: var(--text-muted); }
+
+.ev-num {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Carries the same hue as the column header's direction marker, so a cell
+   read in isolation still says which way is good. */
+.ev-dir-cell-down { color: var(--warning); }
+
+.ev-na { color: var(--text-muted); }
+
+.ev-spread {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-regular);
+}
+
+/* -- Per-category cells --------------------------------------------------- */
+
+.ev-cat-cell { min-width: 7.5rem; }
+
+.ev-cat-value {
+  display: block;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--weight-medium);
+}
+
+.ev-cat-track { margin: var(--space-1) 0; }
+
+.ev-cat-secondary {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+/* -- Metric and caveat definition lists ----------------------------------- */
+
+.ev-defs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: var(--space-5) 0 0;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--hairline);
+}
+
+.ev-def {
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+}
+
+.ev-def dt {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.ev-def dd {
+  margin: 0;
+  max-width: var(--layout-reading);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+.ev-caveats .ev-defs {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* -- Win sets ------------------------------------------------------------- */
+
+.ev-pick {
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.ev-pick-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* app.css gives every <select> width: 100%, which is right inside a form
+   column and wrong for two side-by-side pickers. Width only. */
+.ev-pick-field select {
+  width: auto;
+  min-width: 12rem;
+}
+
+.ev-win-grid { grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
+
+.ev-win-panel { padding: var(--space-4); }
+.ev-win-panel + .ev-win-panel { margin-top: 0; }
+
+.ev-wins {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ev-win-item + .ev-win-item {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--hairline);
+}
+
+.ev-win-head { margin-bottom: var(--space-1); }
+
+.ev-win-id {
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+}
+
+/* A query that flipped in some runs but not all. Warning-toned because it
+   is noise rather than a result -- the panel note says so once, so the
+   marker does not have to repeat the sentence on every row. */
+.ev-win-flips-partial {
+  color: var(--warning);
+  background: var(--warning-wash);
+}
+
+.ev-win-question {
+  margin: 0;
+  max-width: var(--layout-reading);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.ev-win-empty { margin: 0; }
+
+.ev-win-detail { margin-top: var(--space-2); }
+
+.ev-win-detail > summary {
+  color: var(--accent);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.ev-win-detail > summary:hover { color: var(--accent-strong); }
+
+.ev-win-answer {
+  margin-top: var(--space-2);
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--hairline);
+}
+
+.ev-win-answer > .eyebrow { margin-bottom: var(--space-1); }
+
+.ev-win-answer-text {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+}
+
+/* -- Empty state ---------------------------------------------------------- */
+
+.ev-empty { padding: var(--space-5); }
+.ev-empty p { max-width: var(--layout-reading); }
+
+/* Wider than the prose measure around it: these are commands to copy, and
+   the trailing `# ...` comments read badly once a line wraps. `.derived`
+   already wraps rather than overflowing, so this cannot push the page wide. */
+.ev-command {
+  margin: var(--space-3) 0;
+  color: var(--text-secondary);
+}
+
+/* -- Narrow viewports ----------------------------------------------------- */
+
+@media (max-width: 44rem) {
+  .ev-panel,
+  .ev-empty { padding: var(--space-4); }
+
+  .ev-meta-row,
+  .ev-def {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+
+  /* The label column is the first thing to go: at this width the strategy
+     name needs the room more than the bar's left gutter does. */
+  .ev-bar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  /* Explicit rows, not auto-flow: the label and its figure belong on the
+     same line, with the bar beneath them spanning the full width. */
+  .ev-bar-label { grid-column: 1; grid-row: 1; }
+  .ev-bar-value { grid-column: 2; grid-row: 1; flex-direction: row; gap: var(--space-2); align-items: baseline; }
+  .ev-bar-track { grid-column: 1 / -1; grid-row: 2; }
+
+  .ev-pick { gap: var(--space-3); }
+  .ev-pick-field { flex: 1 1 100%; }
+  .ev-pick-field select { width: 100%; min-width: 0; }
+
+  /* Sticky headers inside a short scroll box buy nothing on a small
+     screen and can cover the first row while the box scrolls. */
+  .ev-table thead th { position: static; }
+}

@@ -912,3 +912,86 @@ async def test_deleting_a_capture_cascades_every_graph_row_away(db):
     # Entity rows themselves are not user content and have no FK to units;
     # they are expected to survive as empty, unreferenced nodes.
     assert _count(db, MemoryEntity.id) > 0
+
+
+def test_an_entity_a_unit_stops_mentioning_loses_its_count_and_is_pruned(db):
+    """Re-projection must clean up after itself in both directions.
+
+    `mention_count` drives the overview's "what your memory is mostly about"
+    panel and the explorer's node sizing, and an entity row has no foreign key
+    to anything so it survives every cascade. Observed for real after a filter
+    change: an entity with zero remaining links still advertised 3 mentions.
+    """
+    unit = _ready_unit(
+        db,
+        text="Hiking with Anna at Lake Bled.",
+        semantic={"people": ["Anna"], "locations": ["Lake Bled"]},
+    )
+    project_unit(db, unit)
+    db.commit()
+
+    anna = db.execute(
+        select(MemoryEntity).where(MemoryEntity.normalized_name == "anna")
+    ).scalar_one()
+    assert anna.mention_count == 1
+
+    # The memory is corrected and no longer mentions Anna at all.
+    unit.semantic = {"people": [], "locations": ["Lake Bled"]}
+    db.commit()
+    project_unit(db, unit)
+    db.commit()
+
+    # Nothing references Anna now, so the node is gone rather than lingering
+    # with a stale count.
+    assert (
+        db.execute(select(MemoryEntity).where(MemoryEntity.normalized_name == "anna")).scalar_one_or_none()
+        is None
+    )
+    bled = db.execute(
+        select(MemoryEntity).where(MemoryEntity.normalized_name == "lake bled")
+    ).scalar_one()
+    assert bled.mention_count == 1
+
+
+def test_an_entity_still_named_by_another_memory_is_not_pruned(db):
+    """Pruning is per-entity, not per-unit: one memory dropping a mention must
+    not delete an entity another memory still names."""
+    keeper = _ready_unit(db, text="Anna sent a paper.", semantic={"people": ["Anna"]})
+    dropper = _ready_unit(db, text="Anna was at the lake.", semantic={"people": ["Anna"]})
+    project_unit(db, keeper)
+    project_unit(db, dropper)
+    db.commit()
+    assert db.execute(
+        select(MemoryEntity).where(MemoryEntity.normalized_name == "anna")
+    ).scalar_one().mention_count == 2
+
+    dropper.semantic = {"people": []}
+    db.commit()
+    project_unit(db, dropper)
+    db.commit()
+
+    anna = db.execute(
+        select(MemoryEntity).where(MemoryEntity.normalized_name == "anna")
+    ).scalar_one()
+    assert anna.mention_count == 1
+
+
+def test_a_visual_concept_describing_the_medium_never_becomes_a_node(db):
+    """The style/medium filter has to hold at the projection boundary, not only
+    in the predicate -- these land as kind `object`, which IS an episode
+    anchor, so they were grouping memories by how their pictures were drawn."""
+    unit = _ready_unit(
+        db,
+        text="A photo of the lake.",
+        semantic={"visual_concepts": ["snow-capped peaks", "minimalist illustration", "flat-style 2D illustration"]},
+    )
+    project_unit(db, unit)
+    db.commit()
+
+    names = {
+        e.normalized_name
+        for e in db.execute(select(MemoryEntity).where(MemoryEntity.kind == "object")).scalars()
+    }
+    assert "snow-capped peaks" in names
+    assert "minimalist illustration" not in names
+    assert "flat-style 2d illustration" not in names

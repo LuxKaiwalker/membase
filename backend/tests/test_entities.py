@@ -3,6 +3,7 @@ from app.memory.entities import (
     is_usable_entity_name,
     normalize_name,
     valid_kind,
+    is_usable_visual_concept,
 )
 
 # Entity resolution is a normalization function, not an LLM call (see the
@@ -115,3 +116,38 @@ def test_valid_kind_accepts_only_the_closed_set():
     # has to be rejected before it reaches an INSERT.
     assert valid_kind("animal") is False
     assert valid_kind("") is False
+
+
+def test_a_visual_concept_describing_the_medium_is_not_usable():
+    """An image's medium and rendering style are facts about the FILE, not about
+    anything in the memory.
+
+    They are shared by every image produced the same way, and because they land
+    as kind `object` -- which IS an episode anchor -- they actively grouped
+    unrelated memories: observed live, an episode membership was justified by
+    two pictures sharing "flat-style 2D illustration" and "minimalist
+    illustration", i.e. by having been drawn in the same style.
+    """
+    for rejected in (
+        "flat-style 2D illustration",
+        "minimalist illustration",
+        "geometric style",
+        "photograph",
+        "a stylized drawing",
+        "background",
+        "colour palette",
+    ):
+        assert not is_usable_visual_concept(rejected), rejected
+
+
+def test_a_visual_concept_naming_something_visible_is_usable():
+    for accepted in ("snow-capped peaks", "wooden dock", "lake", "mountain range", "pine trees"):
+        assert is_usable_visual_concept(accepted), accepted
+
+
+def test_visual_concept_admission_is_stricter_than_general_entity_admission():
+    """The two checks are deliberately different: "illustration" is a perfectly
+    good entity name in a memory about an illustrator, and is only rejected in
+    the one field where it describes the attachment rather than the content."""
+    assert is_usable_entity_name("minimalist illustration")
+    assert not is_usable_visual_concept("minimalist illustration")

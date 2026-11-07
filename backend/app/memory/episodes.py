@@ -194,12 +194,22 @@ def _compose_summary(units: list[MemoryUnit], span: tuple) -> str:
     noun = "memory" if count == 1 else "memories"
     if started is None:
         return f"{count} {noun}, with no recorded date."
-    if ended is not None and ended != started:
+    start_text = describe(started, precision)
+    end_text = describe(ended, precision) if ended is not None else start_text
+    # Compare the RENDERED endpoints, not the raw dates. Two dates a month
+    # apart both render as "2021" at year precision, and the range form then
+    # read "from 2021 to 2021" -- a span the episode cannot actually claim to
+    # know, stated twice. `_span_display` in app/api/episodes.py already
+    # collapses this; the summary has to agree with it.
+    if ended is not None and end_text != start_text:
         return (
-            f"{count} {noun} from {describe(started, precision)} to {describe(ended, precision)}"
+            f"{count} {noun} from {start_text} to {end_text}"
             + (" (boundaries approximate)." if confidence == BOUNDARY_UNCERTAIN else ".")
         )
-    return f"{count} {noun} from {describe(started, precision)}."
+    return (
+        f"{count} {noun} from {start_text}"
+        + (" (boundaries approximate)." if confidence == BOUNDARY_UNCERTAIN else ".")
+    )
 
 
 def _compute_span(units: list[MemoryUnit]) -> tuple[dt.date | None, dt.date | None, str, str]:
@@ -564,12 +574,24 @@ def overlapping_episodes(db: Session, episode: Episode, *, limit: int = 8) -> li
 
 
 def anchor_counts(db: Session, episode_id: uuid.UUID) -> Counter:
-    """Anchor-entity frequency within one episode, for display."""
+    """Anchor-entity frequency within one episode, for display.
+
+    Grouped by normalized name, not by display name. Entity identity is
+    (kind, normalized_name), so the same string can legitimately exist as two
+    entities of different kinds -- and grouping on the display name then listed
+    both spellings, producing anchors like `["Markus", "The department", "the
+    department"]`. For a reader they are one thing; the first-seen
+    capitalisation wins.
+    """
     rows = db.execute(
-        select(MemoryEntity.display_name, func.count(UnitEntityLink.id))
+        select(
+            MemoryEntity.normalized_name,
+            func.min(MemoryEntity.display_name),
+            func.count(UnitEntityLink.id),
+        )
         .join(UnitEntityLink, UnitEntityLink.entity_id == MemoryEntity.id)
         .join(EpisodeMembership, EpisodeMembership.unit_id == UnitEntityLink.unit_id)
         .where(EpisodeMembership.episode_id == episode_id, MemoryEntity.kind.in_(ANCHOR_KINDS))
-        .group_by(MemoryEntity.display_name)
+        .group_by(MemoryEntity.normalized_name)
     ).all()
-    return Counter({row[0]: int(row[1]) for row in rows})
+    return Counter({row[1]: int(row[2]) for row in rows})

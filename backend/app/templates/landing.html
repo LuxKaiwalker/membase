@@ -89,12 +89,12 @@
       <p>
         A unit with a genuinely ambiguous term or date may hold one
         question before it becomes searchable — answer it, skip it, or
-        discard that unit from the Browse tab. Answering never changes
+        discard that unit from the Library tab. Answering never changes
         your original words; it just adds to what the unit knows about
         itself.
       </p>
       <p>
-        Deleting a capture (Browse tab) is the only way a memory goes away
+        Deleting a capture (Library tab) is the only way a memory goes away
         — there's no automatic expiry or relevance-based forgetting.
       </p>
       <p class="muted small">
@@ -133,11 +133,11 @@
 
   <script>
     (() => {
-      // Kept in sync with backend/app/static/app.js's CREDENTIALS_KEY /
+      // Kept in sync with backend/app/static/core.js's CREDENTIALS_KEY /
       // setCredentials -- the app pages read the exact same localStorage
       // key, so signing in here is immediately picked up over there with
       // no separate "verify" call (nginx checks credentials on the first
-      // real API request, same as app.js's own login overlay does).
+      // real API request, same as core.js's own login overlay does).
       const CREDENTIALS_KEY = "membase.basicAuth";
 
       const form = document.getElementById("landing-login-form");
@@ -157,7 +157,7 @@
           localStorage.setItem(CREDENTIALS_KEY, btoa(`${usernameInput.value}:${passwordInput.value}`));
         } catch {
           // Not persisted across the navigation below -- the app page's
-          // own login overlay will just ask again, same as app.js does
+          // own login overlay will just ask again, same as core.js does
           // when localStorage is unavailable.
         }
         window.location.href = "/app/";

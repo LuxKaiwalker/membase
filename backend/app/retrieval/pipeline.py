@@ -168,6 +168,19 @@ class ScoredUnit:
     vector_score: float | None
     fts_score: float | None
     fused_score: float
+    # The fused score BEFORE a session's positive-cue boost was applied, set
+    # only by apply_positive_cue_boost (None whenever no boost was applied).
+    #
+    # Needed because `fused_score` afterwards mixes two different things: how
+    # well this memory matches the query, and the fact that the user confirmed
+    # a detail it happens to mention. For ranking, mixing them is correct --
+    # that is the point of the boost. For *confidence*, it is not: confidence
+    # should describe how well the memory itself matches, with the user's cue
+    # as corroboration rather than as a better match. Observed live, the
+    # conflation let a memory about a conference talk reach `strong` alongside
+    # the photograph the user was actually looking for, on the strength of
+    # both mentioning the same person.
+    prior_fused_score: float | None = None
 
 
 def _fuse(

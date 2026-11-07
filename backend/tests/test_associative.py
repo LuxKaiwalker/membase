@@ -22,10 +22,12 @@ from app.retrieval.agent import (
     HIGH_CONFIDENCE_MARGIN,
     AutomaticSearchResult,
 )
+from app.retrieval.discriminate import POSITIVE_CUE_BOOST, apply_positive_cue_boost
 from app.retrieval.associative import (
     ASSOCIATION_SCORE_CEILING,
     CUE_MATCH_BONUS,
     MAX_EVIDENCE_BONUS,
+    SHARED_ENTITY_BONUS,
     TEMPORAL_MISMATCH_PENALTY,
     RetrievalBudget,
     apply_budget,
@@ -491,17 +493,34 @@ def test_every_collected_evidence_item_carries_a_known_provenance_level(db):
 
 
 def test_a_cue_match_raises_a_candidates_score_above_an_identical_rival(db):
-    cued = _candidate(_ready_unit(db, text="Anna recommended a paper."), 0.50)
-    plain = _candidate(_ready_unit(db, text="Markus recommended a book."), 0.50)
-    _add_items(cued, KIND_CUE_MATCH, 1, provenance=PROVENANCE_ORIGINAL)
+    """A confirmed cue does lift a candidate over an otherwise-identical rival
+    -- but the lift is applied by `apply_positive_cue_boost`, upstream of
+    re-ranking, not by `rerank`. Asserted at the layer that actually does it,
+    so the test cannot pass while the behaviour has silently moved.
+    """
+    cued_unit = _ready_unit(db, text="Anna recommended a paper.", semantic={"people": ["Anna"]})
+    plain_unit = _ready_unit(db, text="Markus recommended a book.", semantic={"people": ["Markus"]})
+    ranked = [_scored(cued_unit, 0.50), _scored(plain_unit, 0.50)]
 
-    ordered = rerank([plain, cued])
+    boosted = apply_positive_cue_boost(ranked, ["Anna"])
+    by_id = {str(s.unit.id): s for s in boosted}
 
-    assert ordered[0] is cued
-    assert cued.score == 0.50 + CUE_MATCH_BONUS
-    assert plain.score == 0.50
-    # Relevance itself is never rewritten by re-ranking.
-    assert cued.base_score == 0.50
+    cued = by_id[str(cued_unit.id)]
+    plain = by_id[str(plain_unit.id)]
+    assert cued.fused_score > plain.fused_score
+    assert cued.fused_score == 0.50 + POSITIVE_CUE_BOOST
+    assert plain.fused_score == 0.50
+    # The pre-boost score is kept, so confidence can still be judged on how
+    # well the memory itself matched rather than on the user's corroboration.
+    assert cued.prior_fused_score == 0.50
+    assert plain.prior_fused_score == 0.50
+
+    # And re-ranking does not add the same signal a second time.
+    candidates = build_direct_candidates(boosted)
+    for candidate in candidates:
+        _add_items(candidate, KIND_CUE_MATCH, 1, provenance=PROVENANCE_ORIGINAL)
+    rerank(candidates)
+    assert {c.score for c in candidates} == {0.50 + POSITIVE_CUE_BOOST, 0.50}
 
 
 def test_a_temporal_mismatch_lowers_a_candidates_score(db):
@@ -515,18 +534,40 @@ def test_a_temporal_mismatch_lowers_a_candidates_score(db):
 
 def test_many_weak_supporting_items_cannot_overtake_a_decisively_better_match(db):
     """The evidence bonus refines an ordering; it does not override it. Without
-    the cap, ten cue matches would be worth 1.2 and a badly-matching memory
-    could win on accumulated bonuses alone."""
+    the cap, ten shared-entity matches would be worth 0.6 and a badly-matching
+    memory could win on accumulated bonuses alone."""
     padded = _candidate(_ready_unit(db, text="Anna recommended a paper."), 0.50)
     better = _candidate(_ready_unit(db, text="Markus recommended a book."), 0.80)
-    _add_items(padded, KIND_CUE_MATCH, 10, provenance=PROVENANCE_ORIGINAL)
+    _add_items(padded, KIND_SHARED_ENTITY, 10)
 
     ordered = rerank([padded, better])
 
     assert padded.score == 0.50 + MAX_EVIDENCE_BONUS
-    assert 10 * CUE_MATCH_BONUS > MAX_EVIDENCE_BONUS  # the cap really bound here
+    assert 10 * SHARED_ENTITY_BONUS > MAX_EVIDENCE_BONUS  # the cap really bound here
     assert ordered[0] is better
     assert better.score > padded.score
+
+
+def test_a_confirmed_cue_does_not_add_to_the_score_because_it_is_priced_in_upstream(db):
+    """A cue match is worth 0 in `rerank` on purpose.
+
+    `apply_positive_cue_boost` has already added POSITIVE_CUE_BOOST (0.3) to
+    the candidate's fused score for exactly this signal. Rewarding it again
+    here -- and a third time via the shared-entity item that the same cue
+    produces -- counted one signal three times, which was observed live
+    pinning a memory that merely shared a person with the query to the score
+    ceiling. The evidence item is still recorded, because it belongs in the
+    explanation.
+    """
+    candidate = _candidate(_ready_unit(db, text="Anna recommended a paper."), 0.50)
+    _add_items(candidate, KIND_CUE_MATCH, 3, provenance=PROVENANCE_ORIGINAL)
+
+    rerank([candidate])
+
+    assert CUE_MATCH_BONUS == 0.0
+    assert candidate.score == 0.50
+    # Shown, not scored.
+    assert len([e for e in candidate.evidence if e.kind == KIND_CUE_MATCH]) == 3
 
 
 def test_an_association_candidate_can_never_exceed_the_association_ceiling(db):

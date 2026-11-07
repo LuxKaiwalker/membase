@@ -236,7 +236,19 @@ def confidence_for(candidate: Candidate) -> str:
     """
     contradicted = candidate.has_kind(KIND_CONTRADICTION)
     degraded = candidate.has_kind(KIND_DEGRADED)
-    direct_score = candidate.direct.fused_score if candidate.direct else 0.0
+    # Judge on the memory's OWN match quality, not on the score after a
+    # session's positive-cue boost. A user confirming a detail this memory
+    # mentions is corroboration; it does not make the memory a better match
+    # for the question, and treating it as one let an unrelated memory that
+    # merely named the same person reach `strong` (see ScoredUnit's
+    # `prior_fused_score`). Ranking still uses the boosted score -- only the
+    # confidence category is held to the stricter measure.
+    direct_score = 0.0
+    if candidate.direct is not None:
+        direct = candidate.direct
+        direct_score = (
+            direct.prior_fused_score if direct.prior_fused_score is not None else direct.fused_score
+        )
 
     if candidate.route == ROUTE_ASSOCIATION:
         strength = getattr(candidate.association, "strength", 0.0) or 0.0

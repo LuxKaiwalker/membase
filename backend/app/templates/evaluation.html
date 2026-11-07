@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% set nav_active = "evaluation" %}
+{% block title %}membase — Evaluation{% endblock %}
+{#
+  Static-data page, unlike every other section under /app/.
+
+  There is no evaluation endpoint to call: the backend is API-only, and
+  these numbers are produced offline by eval/strategy_benchmark.py (an
+  isolated membase_eval database, 20+ minutes a run) which writes
+  eval/strategy_benchmark_results.json. scripts/build_frontend.py
+  publishes that artefact as static/evaluation-results.json when it
+  exists, and static/pages/evaluation.js renders it into
+  #evaluation-root. So this page is a reader for a published measurement,
+  not a client for a service -- see docs/EVALUATION.md.
+
+  Everything below is fixed copy. Any count, date or metric belongs in
+  the script, read out of the artefact, so that nothing on the page can
+  claim a number the results file does not actually carry.
+#}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <p class="eyebrow">Evaluation</p>
+    <h1>Does associative or iterative recall actually beat conventional retrieval?</h1>
+    <p class="lede">
+      Four retrieval strategies, run read-only against one shared corpus of
+      stored memories with one shared query set, so the question has an
+      answer with numbers behind it &mdash; including the answer &ldquo;no&rdquo;.
+      Read the trade-offs rather than a ranking: a strategy buys recall with
+      false retrieval and latency, and this page deliberately computes no
+      single score that would hide that.
+    </p>
+  </div>
+
+  <div id="evaluation-root" class="stack stack-loose"></div>
+</section>
+{% endblock %}

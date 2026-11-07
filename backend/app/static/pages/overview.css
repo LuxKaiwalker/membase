@@ -1,0 +1,265 @@
+/* ==========================================================================
+   Page: Overview (/app/)
+   --------------------------------------------------------------------------
+   Composes app.css tokens and primitives only -- nothing here defines a
+   token or redefines a primitive (.card/.btn/.pill/.badge/.row/.stack).
+
+   The restraint is deliberate and is the design: these are counts of a
+   personal memory store, not metrics. No stat tile grid, no hero numerals,
+   no accent fills at size. A count sits at normal body size next to the
+   sentence that says what it counts, which is the only thing that makes it
+   readable as "sixteen memories" rather than as a dashboard figure.
+   ========================================================================== */
+
+.ov-actions {
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+/* -- Panels --------------------------------------------------------------- */
+
+.ov-panel { padding: var(--space-5); }
+
+/* app.css gives `.card + .card` a top margin; the root here is a
+   .stack-loose, so the gap is already owned by the flex container. */
+.ov-panel + .ov-panel { margin-top: 0; }
+
+.ov-panel .card-head {
+  align-items: flex-start;
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.ov-panel-title > .eyebrow { margin-bottom: var(--space-1); }
+.ov-panel-title > h2 { margin: 0; }
+
+.ov-panel-note {
+  margin-top: calc(-1 * var(--space-2));
+  margin-bottom: var(--space-4);
+  max-width: var(--layout-reading);
+}
+
+.ov-more {
+  margin: var(--space-4) 0 0;
+  max-width: var(--layout-reading);
+}
+
+/* -- Recent memories ------------------------------------------------------ */
+
+.ov-captures {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-capture + .ov-capture {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--hairline);
+}
+
+.ov-capture-when {
+  margin: 0 0 var(--space-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-capture-text {
+  margin: 0 0 var(--space-2);
+  max-width: var(--layout-reading);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ov-capture-files { margin: var(--space-2) 0 0; }
+
+/* -- Memory statistics ---------------------------------------------------- */
+
+.ov-stats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin: 0;
+}
+
+.ov-stat {
+  display: grid;
+  grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+}
+
+.ov-stat dt {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.ov-stat dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+}
+
+/* Normal body size, semibold, tabular. Not a KPI. */
+.ov-stat-value {
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-stat-note { max-width: var(--layout-reading); }
+
+.ov-kinds { flex-basis: 100%; }
+
+.ov-kind-name { color: var(--text-secondary); }
+
+/* -- Mostly about --------------------------------------------------------- */
+
+.ov-entities {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The name column is sized to the longest name rather than to 1fr, so the
+   kind and the bar sit next to the name instead of being pushed to the far
+   side of a column of empty space. */
+.ov-entity {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto minmax(3rem, 10rem) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.ov-entity-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ov-entity-kind { justify-self: start; }
+
+/* A bar whose length compares this entity's mentions to the most-mentioned
+   one in this list -- and nothing else. Quiet on purpose: it is a reading
+   aid for the ordering, not a score. */
+.ov-entity-bar {
+  height: 0.3rem;
+  border-radius: var(--radius-pill);
+  background:
+    linear-gradient(
+      to right,
+      var(--accent-edge) 0 var(--ov-share, 0%),
+      var(--hairline) var(--ov-share, 0%) 100%
+    );
+}
+
+/* Sits right after the bar rather than against the panel edge: a count
+   stranded across a gutter of whitespace stops reading as that row's. */
+.ov-entity-count {
+  justify-self: start;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* -- Recent episodes ------------------------------------------------------ */
+
+.ov-episodes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-episode {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.ov-episode-title {
+  min-width: 0;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ov-episode-when {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* "date unknown" must not read like a date. */
+.ov-episode-when-unknown {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* -- Retrieval sessions (the panel with no endpoint) ---------------------- */
+
+.ov-sessions-note {
+  max-width: var(--layout-reading);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* -- Fresh store ---------------------------------------------------------- */
+
+.ov-empty { max-width: var(--layout-reading); }
+.ov-empty h2 { margin-bottom: var(--space-3); }
+.ov-empty-actions { margin-top: var(--space-4); }
+
+/* -- Narrow viewports ----------------------------------------------------- */
+
+@media (max-width: 44rem) {
+  .ov-panel { padding: var(--space-4); }
+
+  .ov-stat {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+
+  /* The bar is the first thing to go: on a narrow screen the count and the
+     ordering already carry it, and the row becomes a wrapping line instead
+     of a grid that would squeeze the name. */
+  .ov-entity {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  .ov-entity-bar { display: none; }
+
+  .ov-entity-name { white-space: normal; overflow: visible; }
+
+  /* Same reason as .ov-entity above: a one-column grid would stretch the
+     inline-flex .pill into a full-width bar. */
+  .ov-episode {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  .ov-episode-title {
+    flex-basis: 100%;
+    white-space: normal;
+    overflow: visible;
+  }
+}

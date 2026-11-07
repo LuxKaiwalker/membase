@@ -474,12 +474,13 @@ canonical"):** `RecallSession` is no longer a parallel, optional path --
 multi-turn session would (same ambiguity narrowing, same grounding
 decision), reporting the outcome in the flat one-shot response shape.
 There are no longer two independent retrieval algorithms. What's
-*still* one-shot-only is the frontend: `app/static/app.js`'s
-`initRecallPage()` only calls `POST /api/recall` and has no UI for a
-session id, cues, or a follow-up question -- a prior benchmark found
-the fully interactive UI underperforming a one-shot answer on a
-deliberately ambiguous synthetic corpus (see docs/DECISIONS.md), and
-that UI decision hasn't been revisited. `run_agent()` (below, now an
+*was* one-shot-only is the frontend. That is no longer true: the Recall
+page (`app/static/pages/recall.js`) now drives the session endpoints
+directly -- cues, the discriminating question, the candidate set, and the
+evidence trail. The earlier benchmark that found interactive recall
+underperforming (docs/DECISIONS.md) predates both the `relations`/
+`definitions` fix to `app/retrieval/discriminate.py` and the associative
+engine; `eval/strategy_benchmark.py` is the harness that re-measures it. `run_agent()` (below, now an
 internal primitive) is kept only for callers that explicitly want a
 one-shot search-and-answer with no persisted session row and no
 ambiguity narrowing -- the eval harness and latency benchmarks.
@@ -1022,7 +1023,7 @@ This app has no authentication code of its own -- see docs/DECISIONS.md
 "Retire app-level auth for nginx Basic Auth". Access control is HTTP
 Basic Auth enforced entirely by the nginx reverse proxy in front of the
 backend (`deploy/nginx-membase.conf`); this app trusts whatever request
-already reached it. The frontend's login overlay (`app/static/app.js`'s
+already reached it. The frontend's login overlay (`app/static/core.js`'s
 `initAuth()`) collects a username/password once, stores them in
 `localStorage`, and attaches `Authorization: Basic
 <base64(user:pass)>` to every API request itself -- there's no

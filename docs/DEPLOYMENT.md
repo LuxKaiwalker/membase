@@ -108,7 +108,7 @@ no per-device revocation anymore). The app itself no longer has any
 its own on login attempts -- nginx owns all of that now (see "nginx +
 Cloudflare Tunnel" below).
 
-The frontend's login overlay (`app/static/app.js`'s `initAuth()`)
+The frontend's login overlay (`app/static/core.js`'s `initAuth()`)
 still exists, but its job changed: it collects a username/password
 once, stores them in this browser's `localStorage`, and attaches
 `Authorization: Basic <base64(user:pass)>` to every API request
@@ -270,8 +270,11 @@ that touches the frontend's own inputs (the templates,
 `backend/app/static/`, or the build script itself): runs
 `scripts/build_frontend.py` into `dist/` (`index.html` for `/` -- the
 landing page -- `app/index.html` for `/app/`, `app/recall/index.html`
-for `/app/recall/`, `app/captures/index.html` for `/app/captures/`,
-`static/app.js`/`app.css`/`landing.css` copied verbatim, a `.nojekyll`
+for `/app/recall/`, `app/library/index.html` for `/app/library/`, and one
+directory per section (overview, explorer, timeline, library, evaluation,
+store) -- see `scripts/build_frontend.py`'s `PAGES` dict, which is the
+route registry. `static/core.js`, `static/pages/*.js`, `static/pages/*.css`,
+`app.css` and `landing.css` are copied verbatim, plus a `.nojekyll`
 marker so GitHub's Jekyll processor leaves the plain HTML alone, and the
 repo-root `CNAME` copied in), then
 publishes `dist/` via `actions/upload-pages-artifact` +
@@ -373,7 +376,7 @@ of relying on the browser's native Basic Auth prompt or a cookie.
   is sent explicitly by your own JS, not ambient browser-attached
   cookie authority); works well if you ever want a non-browser client
   (a phone shortcut, a CLI) to talk to the same API.
-- **Cons:** `app/static/app.js` needs to read the token from somewhere
+- **Cons:** `app/static/core.js` needs to read the token from somewhere
   and attach it to every request (one `fetchWithTimeout()` call site to
   touch, but it's a real code change, not zero-touch like Option A);
   the token has to live *somewhere* client-side (localStorage is the

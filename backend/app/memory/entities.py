@@ -155,6 +155,58 @@ def is_usable_entity_name(name: str) -> bool:
     return True
 
 
+# Words describing the MEDIUM or RENDERING STYLE of an image rather than
+# anything in it. A vision caption routinely volunteers these, and
+# `semantic.visual_concepts` carries them through: the demonstration corpus
+# produced "flat-style 2D illustration", "minimalist illustration" and
+# "geometric style" alongside the genuinely useful "snow-capped peaks".
+#
+# As entities they are actively harmful, not merely noisy. They are shared by
+# every image produced the same way, so they behave like the generic entities
+# the document-frequency ceiling exists to suppress -- except they are of kind
+# `object`, which IS an episode anchor. Observed live: an episode grouped two
+# memories because they shared "flat-style 2D illustration" and "minimalist
+# illustration", i.e. because the pictures were drawn in the same style. That
+# is a fact about the files, not about the experience.
+_MEDIUM_WORDS = {
+    "illustration", "illustrations", "photograph", "photographs", "photo",
+    "photos", "picture", "pictures", "image", "images", "drawing", "drawings",
+    "painting", "paintings", "render", "rendering", "graphic", "graphics",
+    "artwork", "sketch", "diagram", "screenshot", "style", "styled", "aesthetic",
+    "palette", "composition", "foreground", "background", "closeup", "close-up",
+}
+# Style qualifiers that only ever modify a medium word.
+_STYLE_WORDS = {
+    "flat", "flat-style", "minimalist", "minimal", "geometric", "stylized",
+    "stylised", "abstract", "cartoon", "cartoonish", "2d", "3d", "vector",
+    "monochrome", "grayscale", "greyscale", "low-poly", "pixelated",
+}
+
+
+def is_usable_visual_concept(name: str) -> bool:
+    """Would this visible-thing description make a meaningful entity?
+
+    Stricter than `is_usable_entity_name`: additionally rejects descriptions of
+    the image's medium or rendering style (see `_MEDIUM_WORDS`). A concept is
+    rejected when ANY of its words is a medium word, or when every word is a
+    style qualifier -- so "snow-capped peaks" and "wooden dock" survive while
+    "minimalist illustration", "flat-style 2D illustration" and "geometric
+    style" do not.
+
+    Rejecting on any medium word is deliberately blunt. "photograph of a lake"
+    loses the lake, which is a real cost -- but the lake almost always also
+    appears as its own concept in the same list, and a wrongly-kept medium term
+    pollutes the graph for every image in the store while a wrongly-dropped
+    compound costs one redundant node.
+    """
+    if not is_usable_entity_name(name):
+        return False
+    words = set(normalize_name(name).split())
+    if words & _MEDIUM_WORDS:
+        return False
+    return not words.issubset(_STYLE_WORDS)
+
+
 def is_alias_of(alias: str, entity_name: str) -> bool:
     """Is `alias` a surface variant of `entity_name`, conservatively?
 

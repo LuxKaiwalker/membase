@@ -381,6 +381,21 @@ these are the reasons not to over-read the numbers this produces.
   undercount documented for the threshold sweep.
 - **`mean iterations` for two strategies is inferred, not measured.** See
   the definition above.
+- **Association expansion is occasionally truncated by its own wall-clock
+  budget, and that is production behaviour, not a benchmark artefact.**
+  `RetrievalBudget.deadline_seconds` is 10s and describes itself as a
+  ceiling on "the non-LLM work in one round", but
+  `app/retrieval/session.py::_run_round` passes `started_at=round_started` —
+  a timestamp taken *before* `automatic_search`'s LLM calls. So whenever the
+  search loop needed a reformulation round, the clock is already past 10s and
+  `expand_with_associations` returns only what it had found before the first
+  deadline check. The benchmark passes `started_at` the same way on purpose,
+  so `associative` and `adaptive` are affected identically and the measured
+  difference between them stays "clarification". Observed in the `--limit 8`
+  run: the budget warning fired on 2 of 8 answerable queries, while the other
+  6 expanded 1–5 association candidates normally. On a busier machine (slower
+  LLM calls) the suppressed fraction will be higher, which means **a run on a
+  contended box systematically understates what association contributes.**
 - **recall@k is a lower bound for `adaptive` on some queries.** A session
   still in `needs_user_cue` after the 5-turn simulated cap has snapshotted
   neither `final_evidence` nor `final_sources` — `RecallSession` only records

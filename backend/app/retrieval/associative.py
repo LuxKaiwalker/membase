@@ -105,7 +105,17 @@ class RetrievalBudget:
 # Re-ranking adjustments. Deliberately small relative to the retrieval score
 # itself: these refine an ordering, they do not override it. A candidate that
 # matched the query badly should not win on accumulated bonuses.
-CUE_MATCH_BONUS = 0.12
+#
+# CUE_MATCH_BONUS is deliberately ZERO. A confirmed cue is already priced into
+# the candidate's score upstream, by `apply_positive_cue_boost`
+# (POSITIVE_CUE_BOOST = 0.3, which is large on purpose -- see
+# app/retrieval/discriminate.py). Adding a second reward here, plus a third via
+# SHARED_ENTITY_BONUS when the cue also names one of the candidate's entities,
+# counted one signal three times -- observed live, where it pinned an unrelated
+# memory to the score ceiling for sharing a single person with the query. The
+# cue-match evidence item is still produced and still shown: it belongs in the
+# explanation, it just must not be paid for twice.
+CUE_MATCH_BONUS = 0.0
 SHARED_ENTITY_BONUS = 0.06
 TEMPORAL_MATCH_BONUS = 0.08
 TEMPORAL_MISMATCH_PENALTY = 0.10
@@ -425,7 +435,14 @@ def collect_evidence(
                             f"It is about {entity.display_name} ({entity.kind}), which "
                             f"{'your query' if in_query else 'something you told me'} named."
                         ),
-                        weight=0.8,
+                        # Only an entity named by the QUERY adds to the score.
+                        # One named by a cue is the same signal
+                        # `apply_positive_cue_boost` already rewarded upstream,
+                        # so scoring it here too would double-count it. The
+                        # item is still recorded either way, because "it is
+                        # about Markus, who you mentioned" is worth telling the
+                        # user regardless of whether it moves the ranking.
+                        weight=0.8 if in_query else 0.0,
                         source_unit_id=candidate.unit_id,
                         entity_id=str(entity.id),
                     )

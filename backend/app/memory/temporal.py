@@ -71,6 +71,38 @@ _SEASONS = {
     "winter": (1, 15),
 }
 
+# Phrases that say outright the date is NOT known. These have to short-circuit
+# the whole parser, because the loosest pattern below (`_YEAR_RE`, a bare
+# four-digit year) will happily find a year inside a sentence whose entire
+# point is that there isn't one.
+#
+# Found for real, not hypothesised: the live model produced
+#   "Not specified in the primary memory (though related memories suggest a
+#    timeframe between 2021 and 2023)."
+# as a unit's `event_date`. `_YEAR_RE` matched "2021", so the memory was
+# reported as year-precision 2021 and placed on the timeline accordingly --
+# the module deriving a date from a string that explicitly disclaims one,
+# which is precisely the one thing it promises never to do.
+_NO_DATE_PHRASES = (
+    "not specified",
+    "unspecified",
+    "not stated",
+    "not mentioned",
+    "not given",
+    "not provided",
+    "not known",
+    "not clear",
+    "unclear",
+    "unknown",
+    "no date",
+    "no specific date",
+    "cannot be determined",
+    "can't be determined",
+    "could not be determined",
+    "no explicit date",
+    "not determinable",
+)
+
 _ISO_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _ISO_MONTH_RE = re.compile(r"\b(\d{4})-(\d{1,2})\b")
 _YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
@@ -117,6 +149,14 @@ def parse_event_date(raw: str | None) -> tuple[dt.date | None, str]:
         return None, PRECISION_UNKNOWN
     text = raw.strip()
     if not text:
+        return None, PRECISION_UNKNOWN
+
+    # A string that says the date is unknown is unknown, whatever digits it
+    # happens to contain. Checked before every pattern, including the exact
+    # ones: a model that writes "date not specified (the ISO 2023-04-01 refers
+    # to a related memory)" is still telling us it does not know.
+    lowered = text.casefold()
+    if any(phrase in lowered for phrase in _NO_DATE_PHRASES):
         return None, PRECISION_UNKNOWN
 
     # Tightest precision first: a string containing a full ISO date is treated

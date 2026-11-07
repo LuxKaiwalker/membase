@@ -38,6 +38,7 @@ from app.memory.entities import (
     display_name_for,
     is_alias_of,
     is_usable_entity_name,
+    is_usable_visual_concept,
     normalize_name,
 )
 from app.memory.temporal import parse_event_date
@@ -335,7 +336,11 @@ def mentions_for(semantic: dict, explicit_metadata: dict | None = None) -> list[
     # which is what makes "a lake with mountains behind it" a retrievable
     # association rather than only a string inside a caption.
     for value in semantic.get("visual_concepts") or []:
-        if isinstance(value, str):
+        # Stricter admission than every other field: a visual concept has to
+        # name something *in* the picture, not the picture's medium or style
+        # (see app/memory/entities.py::is_usable_visual_concept for the real
+        # episode-clustering damage those caused).
+        if isinstance(value, str) and is_usable_visual_concept(value):
             add(established_kind(value, "object"), value, "visual_concepts")
 
     # Relation endpoints last, so they can resolve against definitions and
@@ -786,6 +791,46 @@ def _refresh_mention_counts(db: Session, entity_ids: list[uuid.UUID]) -> None:
         entity.mention_count = counts.get(entity.id, 0)
 
 
+def prune_orphan_entities(db: Session, entity_ids: list[uuid.UUID]) -> int:
+    """Delete entities among `entity_ids` that nothing references any more.
+
+    An entity row has no foreign key to anything, so it survives every cascade
+    -- which means a re-projection that stops producing some mention leaves the
+    node behind forever. Observed for real after tightening the visual-concept
+    filter: "minimalist illustration" had zero remaining links yet still
+    appeared, with a stale `mention_count` of 3, in the Overview's "what your
+    memory is mostly about" panel and as a sizeable node in the explorer.
+
+    Relations are checked as well as links: a relation keeps an entity
+    meaningful even when no link points at it, and deleting one would cascade
+    the relation away with it.
+    """
+    if not entity_ids:
+        return 0
+    linked = set(
+        db.execute(
+            select(UnitEntityLink.entity_id).where(UnitEntityLink.entity_id.in_(entity_ids)).distinct()
+        ).scalars()
+    )
+    in_relations = set(
+        db.execute(
+            select(EntityRelation.subject_entity_id)
+            .where(EntityRelation.subject_entity_id.in_(entity_ids))
+            .union(
+                select(EntityRelation.object_entity_id).where(
+                    EntityRelation.object_entity_id.in_(entity_ids)
+                )
+            )
+        ).scalars()
+    )
+    orphans = [eid for eid in entity_ids if eid not in linked and eid not in in_relations]
+    if not orphans:
+        return 0
+    db.execute(delete(MemoryEntity).where(MemoryEntity.id.in_(orphans)))
+    db.flush()
+    return len(orphans)
+
+
 def project_unit(db: Session, unit: MemoryUnit) -> ProjectionResult:
     """Rebuild one unit's entire graph footprint from its current semantics.
 
@@ -798,8 +843,21 @@ def project_unit(db: Session, unit: MemoryUnit) -> ProjectionResult:
     retrieval (see docs/ARCHITECTURE.md "Status gate"), and a graph node for
     it would be a backdoor around that gate.
     """
+    # Entities this unit linked to BEFORE the rebuild. Needed because
+    # `_refresh_mention_counts` can only refresh what it is given, and an
+    # entity this unit *stops* mentioning would otherwise keep a stale count
+    # forever -- which is what `mention_count` drives on the overview page and
+    # in the explorer's node sizing.
+    previously_linked = set(
+        db.execute(
+            select(UnitEntityLink.entity_id).where(UnitEntityLink.unit_id == unit.id)
+        ).scalars()
+    )
+
     remove_unit_from_graph(db, unit.id)
     if unit.status != "ready":
+        _refresh_mention_counts(db, list(previously_linked))
+        prune_orphan_entities(db, list(previously_linked))
         return ProjectionResult()
 
     mentions = mentions_for(unit.semantic, unit.explicit_metadata)
@@ -807,7 +865,12 @@ def project_unit(db: Session, unit: MemoryUnit) -> ProjectionResult:
     relations = _project_relations(db, unit)
     associations = _project_shared_entity_associations(db, unit, links)
     associations += _project_structural_associations(db, unit)
-    _refresh_mention_counts(db, list(links))
+    touched = previously_linked | set(links)
+    _refresh_mention_counts(db, list(touched))
+    # An entity nothing mentions any more is not something the system knows.
+    # Scoped to the entities this unit touched, so this stays a cheap targeted
+    # cleanup rather than a full-table scan on every projection.
+    prune_orphan_entities(db, list(previously_linked - set(links)))
 
     # Episode assignment runs last, inside the same projection, because it
     # depends on the entity links written above -- a memory's anchor entities

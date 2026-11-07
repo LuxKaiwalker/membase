@@ -34,7 +34,19 @@ AMBIGUITY_MIN_RUNNER_UP_SCORE = 0.45
 # enrichment call happened to file it under. See docs/DECISIONS.md.
 _ATTRIBUTE_TEMPLATES = {
     "people": "Did this involve {value}?",
-    "locations": "Did this happen at {value}?",
+    # "Was this in X?" rather than "Did this happen at X?": the values here are
+    # whatever the extraction produced, which is far more often a city or a
+    # country than a venue, and "at Switzerland" was the live result. "in"
+    # reads correctly for a country, a city and a building alike.
+    #
+    # Safe to reword: both eval harnesses derive their reverse-mapping regexes
+    # from this dict at import time (eval/strategy_benchmark.py and
+    # eval/run_interactive_benchmark.py both build _TEMPLATE_PATTERNS from
+    # _ATTRIBUTE_TEMPLATES), so they adapt automatically. What is NOT safe is
+    # two fields sharing a phrasing -- that would make the reverse mapping
+    # ambiguous, which is a silent correctness bug rather than a cosmetic
+    # duplicate.
+    "locations": "Was this in {value}?",
     "organizations": "Was this related to {value}?",
     "topics": "Was this about {value}?",
     "event_date": "Was this around {value}?",
@@ -221,7 +233,19 @@ def apply_positive_cue_boost(ranked: list[ScoredUnit], positive_cue_texts: list[
     for s in ranked:
         matches = any(_matches_cue(s.unit, c) for c in cues)
         new_score = min(1.0, s.fused_score + POSITIVE_CUE_BOOST) if matches else s.fused_score
-        boosted.append(ScoredUnit(unit=s.unit, vector_score=s.vector_score, fts_score=s.fts_score, fused_score=new_score))
+        boosted.append(
+            ScoredUnit(
+                unit=s.unit,
+                vector_score=s.vector_score,
+                fts_score=s.fts_score,
+                fused_score=new_score,
+                # Keep the pre-boost score so confidence can be judged on how
+                # well the memory itself matched, separately from the user's
+                # corroborating cue. Carried through rather than recomputed,
+                # since the boost is not invertible once clamped at 1.0.
+                prior_fused_score=s.prior_fused_score if s.prior_fused_score is not None else s.fused_score,
+            )
+        )
     return boosted
 
 

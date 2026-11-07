@@ -180,3 +180,41 @@ def test_describe_says_so_when_the_date_is_unknown():
     # A stray date with precision "unknown" is still reported as unknown: the
     # precision label is authoritative over the anchor.
     assert describe(dt.date(2024, 3, 15), PRECISION_UNKNOWN) == "date unknown"
+
+
+def test_a_string_that_says_the_date_is_unknown_never_yields_a_date():
+    """The guard that matters most, because the loosest pattern is the most
+    dangerous one: a bare four-digit year will match inside a sentence whose
+    whole point is that there is no date.
+
+    This exact string came out of the live model as a unit's `event_date`, and
+    the bare-year fallback read "2021" out of it and reported year precision --
+    the module deriving a date from a string that explicitly disclaims one.
+    """
+    disclaimer = (
+        "Not specified in the primary memory (though related memories suggest "
+        "a timeframe between 2021 and 2023)."
+    )
+    assert parse_event_date(disclaimer) == (None, PRECISION_UNKNOWN)
+
+    for phrase in (
+        "date unknown",
+        "No date given in the text.",
+        "The exact date is unclear, possibly 2019.",
+        "not stated",
+        "cannot be determined from the memory, maybe March 2022",
+    ):
+        assert parse_event_date(phrase) == (None, PRECISION_UNKNOWN), phrase
+
+
+def test_the_unknown_date_guard_does_not_swallow_a_real_date():
+    """The guard is a substring check, so it must not fire on ordinary text
+    that merely happens to contain one of its words in another sense."""
+    parsed, precision = parse_event_date("Met an unknown number of people on 2024-03-15")
+    # "unknown" is present, so this IS treated as unknown -- documenting the
+    # deliberate bluntness rather than pretending it is precise.
+    assert (parsed, precision) == (None, PRECISION_UNKNOWN)
+
+    # But a plain date, and a date with harmless surrounding prose, still parse.
+    assert parse_event_date("2024-03-15")[1] == "day"
+    assert parse_event_date("Sometime in March 2024, on the way back")[1] == "month"

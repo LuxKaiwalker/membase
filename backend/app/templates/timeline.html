@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% set nav_active = "timeline" %}
+{% block title %}membase — Timeline{% endblock %}
+{#
+  Timeline (/app/timeline/). Everything dynamic is rendered by
+  static/pages/timeline.js into #timeline-root; the controls, the reading
+  key and the three feedback slots below are static markup so that no
+  user/API text ever reaches them unescaped.
+
+  The copy here is load-bearing, not decoration: this page's whole job is
+  to show when things happened WITHOUT overstating how precisely that is
+  known (see backend/app/memory/temporal.py).
+#}
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <p class="eyebrow">Timeline</p>
+    <h1>Memory in time</h1>
+    <p class="lede">
+      Episodes in order, newest first. A date is shown only as precisely as
+      it is actually known, and memories whose date isn't known at all are
+      listed at the end rather than filed under a day that was guessed for
+      them.
+    </p>
+  </div>
+
+  {#
+    A real key, not a legend for decoration: the three boundary states and
+    the precision labels below are the difference between "you told me this
+    happened in July 2023" and "a model read a date out of your note".
+    Collapsed by default so it does not crowd the timeline itself.
+  #}
+  <details class="card card-quiet tl-key">
+    <summary>How to read this timeline</summary>
+    <div class="stack stack-tight tl-key-body">
+      <dl class="tl-key-list">
+        <dt><span class="provenance prov-original">dates stated</span></dt>
+        <dd>You wrote the dates yourself. The span is your own claim.</dd>
+
+        <dt><span class="provenance prov-extracted">dates extracted</span></dt>
+        <dd>
+          Every memory here has a date, but those dates were read out of your
+          notes rather than entered as dates. The span follows from them.
+        </dd>
+
+        <dt><span class="provenance prov-inferred">span open</span></dt>
+        <dd>
+          At least one memory in the episode has no date at all, so the real
+          episode may extend past the dates shown. The span covers only the
+          memories that do have one.
+        </dd>
+      </dl>
+      <p class="muted">
+        <strong>Precision.</strong> "July 2023" means the month is known and
+        the day is not; "2021" means only the year is. Nothing on this page
+        shows a day, month or season that isn't actually recorded — and an
+        episode with no resolvable date is shown as undated, never placed at
+        a position chosen for it.
+      </p>
+      <p class="muted">
+        <strong>Titles are composed, not written.</strong> An episode's title
+        is built from its most frequent people, places and organizations plus
+        its date span. It is a label, not a summary of what happened.
+      </p>
+      <p class="muted">
+        <strong>The connector between two episodes is scaled</strong> to the
+        time between them, so a long gap reads as a gap. Gaps are computed
+        from each span's representative anchor date and reported at the
+        coarser of the two precisions.
+      </p>
+    </div>
+  </details>
+
+  <form id="tl-controls" class="form-inline tl-controls" role="search">
+    <label class="tl-search-field">
+      <span class="label">Filter the loaded episodes</span>
+      <input
+        type="search"
+        id="tl-search"
+        class="input"
+        placeholder="Title, person, place..."
+        autocomplete="off"
+      />
+    </label>
+    <button type="button" id="tl-undated-toggle" class="chip" aria-pressed="true">
+      Include undated
+    </button>
+    <label class="tl-page-size-field">
+      <span class="label">Per page</span>
+      <select id="tl-page-size">
+        <option value="5">5</option>
+        <option value="10">10</option>
+        <option value="25" selected>25</option>
+        <option value="50">50</option>
+      </select>
+    </label>
+  </form>
+
+  <p id="tl-counts" class="muted tl-counts hidden"></p>
+  <p id="status" class="status hidden"></p>
+
+  <div id="timeline-root" class="tl-rail"></div>
+
+  <nav id="tl-pager" class="row tl-pager hidden" aria-label="Timeline pages">
+    <button type="button" id="tl-newer" class="btn btn-secondary btn-sm">Newer</button>
+    <span id="tl-page-label" class="muted"></span>
+    <button type="button" id="tl-older" class="btn btn-secondary btn-sm">Older</button>
+  </nav>
+</section>
+{% endblock %}
