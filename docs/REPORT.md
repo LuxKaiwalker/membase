@@ -155,55 +155,56 @@ Full definitions and caveats in `docs/EVALUATION.md`.
 
 | strategy | recall@1 | recall@5 | correctness | false retrieval ↓ | abstention ↓ | questions | LLM calls | wall s |
 |---|---|---|---|---|---|---|---|---|
-| `vector` | 0.400 | 0.571 | 0.314 | **0.00** | 0.429 | 0 | 2.0 | 5.7 |
-| `semantic_rerank` | 0.457 | 0.629 | 0.486 | 0.80 | 0.114 | 0 | 5.6 | 12.0 |
-| `associative` | **0.486** | **0.829** | 0.600 | 0.40 | **0.029** | 0 | 5.1 | 14.7 |
-| `adaptive` | 0.371 | 0.800 | **0.629** | 0.40 | 0.229 | 1.28 | 11.4 | 30.4 |
+| `vector` | 0.829 | 0.886 | 0.771 | **0.40** | 0.171 | 0 | 1.95 | 8.8 |
+| `semantic_rerank` | 0.800 | 0.857 | **0.857** | 0.60 | **0.143** | 0 | 3.27 | 11.7 |
+| `associative` | 0.829 | **0.943** | **0.857** | 0.60 | **0.143** | 0 | 3.30 | 13.7 |
+| `adaptive` | **0.857** | 0.857 | 0.714 | 0.80 | 0.229 | 0.68 | 6.75 | 20.8 |
 
-**⚠ The `associative` row does not measure what its name says.** This run was
-made with a defect that disabled graph expansion almost everywhere: the
-expansion budget (10 s, intended to bound a pure-SQL graph walk) was handed a
-clock started *before* `automatic_search`'s LLM calls, and a round against a
-local model takes 13–57 s. The traversal therefore ran and then immediately
-discarded its results on the first neighbour. The same defect was present in
-the benchmark harness and in the product path, so **`expanded_candidates` was
-0 for most or all queries in the table above.**
+44 memories → 57 ready units; 528 entities, 580 entity links, 247 association
+edges; `degraded_units: 0`. **Expansion verified live this time**: 30 of the 38
+queries that reached it expanded, mean 5.1 added candidates, max 8. An earlier
+run of this table was made with the expansion defect described in §4 and is not
+comparable — it also used a differently-seeded corpus — so it has been
+discarded rather than reported alongside.
 
-Which means the `associative` row measures the *other* differences in that
-mode — structured evidence collection, evidence-based re-ranking, and the
-evidence block format — and not multi-hop association. The 0.829 recall@5 is a
-real measurement of a real configuration; it is simply not evidence for the
-claim "multi-hop association helps", which remains **unmeasured**. Both the
-harness and `session.py` are fixed (`expand_with_associations` now times
-itself, and the parameter that made the mistake possible is gone), and the
-comparison needs re-running before anything can be concluded about
-association. That is a genuinely annoying result to report and it is the
-honest one.
+**Associative retrieval has the best recall@5, 0.943 against 0.886 for
+conventional vector similarity and 0.857 for hybrid search with LLM
+reformulation** — and it gets there without giving anything up: identical
+recall@1 to vector, identical correctness and abstention to
+`semantic_rerank`, for 0.03 more LLM calls and two more seconds. That is the
+shape of result the feature was built for.
 
-**What the table does support.** Evidence collection and evidence-based
-re-ranking are worth a lot on their own: 0.829 recall@5 against 0.571 for
-conventional vector similarity and 0.629 for hybrid search with LLM
-reformulation, with the best recall@1 and by far the lowest abstention rate on
-answerable queries (0.029).
+It is also a **small** margin, and it has to be read as one. 0.943 vs 0.886 on
+35 answerable queries is 33 against 31 — two queries. Both are queries where
+expansion contributed 8 candidates, and one (`Q12`,
+*"What do I know about Hoshi Nakamura's family?"*) is tagged
+`indirect_association`, which is exactly the category multi-hop exists for. So
+the direction is right and the mechanism is visible in the per-query data. But
+with `repeat: 1` against a non-deterministic local model, two queries is inside
+the range a re-run could move on its own. **Suggestive, not established** —
+`--repeat 3` is the next measurement, and it is cheap now that the corpus is
+cached.
 
-**What this does not support, and must be said.** Adaptive iterative recall,
-with clarification, has the *best answer correctness* (0.629) but the *worst
-recall@1* (0.371 — below plain vector search), at 2× the LLM calls and ~30 s
-per query. Clarification improves the answer while making the top-ranked
-memory less reliable. That is a genuine trade-off, not a win.
+**Clarification is a net negative on this corpus, and that is the surprise.**
+`adaptive` takes the best recall@1 (0.857) and then posts the *worst*
+correctness (0.714, below even plain vector search) and the *worst* false
+retrieval (0.80), for double the LLM calls and double the latency. Asking the
+user a question put the right memory on top more often and produced a worse
+answer from it. The pairwise win-sets say the same thing from the other
+direction: `associative` beat `adaptive` on 8 queries while `adaptive` beat
+`associative` on 2.
 
-**The uncomfortable number.** False retrieval rate — the share of deliberately
-unanswerable queries a strategy answers anyway — is *worst for the more capable
-strategies*. Pure vector search never does it (0.00), because it abstains on
-43% of answerable queries too. `semantic_rerank` answers 4 of 5 unanswerable
-queries. Reformulation and association both make the system better at finding
-things and better at convincing itself it has found something. Any reading of
-the recall column that ignores this one is wrong, which is why the Evaluation
-page refuses to compute a combined score.
+**The uncomfortable number.** False retrieval — the share of deliberately
+unanswerable queries a strategy answers anyway — is bad for everything here
+(0.40 to 0.80) and worst for the most capable strategy. Being better at
+finding things and being better at convincing yourself you have found
+something are not separable by any mechanism currently in this system. Any
+reading of the recall column that ignores this one is wrong, which is why the
+Evaluation page refuses to compute a combined score. Note the granularity: 5
+unanswerable queries means this metric moves in steps of 0.2, so 0.40 vs 0.60
+is two queries.
 
-**Caveats that matter.** The expansion defect above, first and loudest — the
-headline strategy was not doing the thing it is named after. Single run
-(`repeat: 1`) — on a 40-query set with a
+**Caveats that matter.** Single run (`repeat: 1`) — on a 40-query set with a
 non-deterministic local model, one or two flips are plausible with no code
 change at all, so treat the ordering as a hypothesis rather than a measurement.
 Only 5 unanswerable queries, so false-retrieval rate has 0.2 granularity.

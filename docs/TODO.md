@@ -24,18 +24,23 @@
   `apply_positive_cue_boost`, where a cue the user marked `uncertain` currently
   gets exactly the same boost as one they were certain about.
 
-- **Multi-hop association is still UNMEASURED.** The first full benchmark run
-  was made with a defect that disabled graph expansion almost everywhere (the
-  10-second traversal budget was given a clock started before
-  `automatic_search`'s LLM calls, and a round takes 13-57 seconds), so
-  `expanded_candidates` was 0 for most or all queries. The defect is fixed in
-  both `app/retrieval/session.py` and `eval/strategy_benchmark.py`, and
-  `expand_with_associations` now times itself so a caller cannot make the
-  mistake again — but the comparison has to be re-run before anything can be
-  said about whether association helps. The recorded `associative` numbers
-  measure evidence collection and re-ranking, not association. See
-  docs/REPORT.md §2.
-
+- **Association now measured once, suggestively.** With the expansion defect
+  fixed, `associative` posts the best recall@5 (0.943 vs 0.886 for vector) with
+  expansion verified live on 30 of 38 queries. But the margin is two queries on
+  a 35-query answerable set at `repeat: 1`, which is inside what a re-run could
+  move on its own. `--repeat 3` is the obvious next measurement and is cheap
+  now the corpus is cached; until then the result is a direction, not a
+  finding. See docs/REPORT.md §2.
+- **Clarification measured as a net negative, and not yet explained.**
+  `adaptive` takes the best recall@1 and the worst correctness and worst false
+  retrieval, losing 8 pairwise queries to `associative` and winning 2. Putting
+  the right memory on top more often while producing a worse answer from it is
+  not a result the current design predicts, and nothing here diagnoses it. The
+  per-query trail data needed to do so is in
+  `eval/strategy_benchmark_results.json`; the likely suspects are the
+  simulated user (answering from post-ingestion semantic fields, so its cues
+  may be more confident than a real person's) and `POSITIVE_CUE_BOOST` at 0.3
+  reshaping the candidate set after each round.
 - **Entity resolution is exact-match plus conservative alias folding, not
   fuzzy.** `is_alias_of` (`app/memory/entities.py`) folds an alias only when
   one name's words contain the other's as a contiguous whole-word run, so
