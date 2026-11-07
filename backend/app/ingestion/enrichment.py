@@ -82,7 +82,15 @@ _RETRIEVAL_AIDS_SYSTEM = (
     "(from the text itself or a prior clarification) -- never guess a "
     "definition you're not confident of; leave it out instead.\n"
     "- relations: subject-predicate-object triples capturing who/what did "
-    "what (e.g. {subject: 'I', predicate: 'met', object: 'Anna'}).\n\n"
+    "what (e.g. {subject: 'I', predicate: 'met', object: 'Anna'}).\n"
+    "- visual_concepts: when the attached content below describes an IMAGE "
+    "(a block labeled 'Image N:'), list the concrete things actually "
+    "VISIBLE in it -- objects, scenery, setting -- as short noun phrases "
+    "(e.g. 'lake', 'mountains', 'snow', 'whiteboard'). These are how "
+    "someone later finds a photograph by what is in it rather than by its "
+    "filename, so prefer the plain everyday word for each thing. Leave it "
+    "[] when there is no image, or when nothing concrete is described as "
+    "visible; never invent something the description doesn't mention.\n\n"
     "If the attached content below contains a 'Structured data:' block of "
     "label/value pairs (e.g. from a form, table, or a photographed "
     "prescription/measurement), promote EACH pair into its own `relations` "
@@ -118,8 +126,14 @@ _RETRIEVAL_AIDS_SCHEMA = {
                 "required": ["subject", "predicate", "object"],
             },
         },
+        # Deliberately asked for HERE rather than in a fourth sub-call: this
+        # call's prompt already carries the full attachment text, i.e. the
+        # caption _describe_image() produced, so the visible contents of a
+        # photograph cost nothing extra to extract. See the `visual_concepts`
+        # comment in app/ingestion/analysis.py's Semantics.
+        "visual_concepts": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["aliases", "topics", "definitions", "relations"],
+    "required": ["aliases", "topics", "definitions", "relations", "visual_concepts"],
 }
 
 
@@ -165,7 +179,7 @@ async def enrich_unit(
         schema=_ENTITIES_SCHEMA, system=_ENTITIES_SYSTEM,
     )
     aids = await _call(
-        llm, header + "Extract aliases, topics, definitions, and relations.",
+        llm, header + "Extract aliases, topics, definitions, relations, and visual concepts.",
         schema=_RETRIEVAL_AIDS_SCHEMA, system=_RETRIEVAL_AIDS_SYSTEM,
     )
 
@@ -186,5 +200,6 @@ async def enrich_unit(
         topics=_as_str_list(aids.get("topics")),
         definitions=_as_definitions(aids.get("definitions")),
         relations=_as_relations(aids.get("relations")),
+        visual_concepts=_as_str_list(aids.get("visual_concepts")),
         enrichment_status="ok",
     )

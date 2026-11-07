@@ -22,6 +22,8 @@ _TRUNCATE_TABLES = (
     "unit_entity_links",
     "entity_relations",
     "unit_associations",
+    "episodes",
+    "episode_memberships",
 )
 
 

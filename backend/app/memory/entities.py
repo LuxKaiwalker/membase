@@ -188,12 +188,23 @@ def is_alias_of(alias: str, entity_name: str) -> bool:
 
 
 def display_name_for(name: str) -> str:
-    """The surface form to show. Whitespace-normalized but otherwise exactly as
-    the user's memory spelled it -- capitalization included, since
-    'ETH' vs 'eth' is information the normalization step deliberately discards
-    for matching but should not discard for display.
+    """The surface form to show: capitalization preserved, gloss removed.
+
+    Capitalization survives because 'ETH' vs 'eth' is information the
+    normalization step deliberately discards for matching but should not
+    discard for display.
+
+    A parenthesised tail is dropped, matching `normalize_name`. The gloss is
+    the extraction model annotating itself, not part of any name -- live output
+    included entities literally called "Slovenia (Implicit location of Lake
+    Bled)" and "Mountains behind Lake Bled (Julian Alps region)", which read as
+    machine debris wherever they surface. Keeping it here while
+    `normalize_name` strips it also meant two spellings of one entity could
+    display differently depending on which memory created the row first.
     """
-    return _WS_RE.sub(" ", unicodedata.normalize("NFKC", name or "").strip())
+    text = _WS_RE.sub(" ", unicodedata.normalize("NFKC", name or "").strip())
+    without_gloss = _WS_RE.sub(" ", _PARENTHETICAL_RE.sub("", text)).strip()
+    return without_gloss or text
 
 
 def valid_kind(kind: str) -> bool:

@@ -159,6 +159,19 @@ def resolve_entity(
         )
         db.add(entity)
         db.flush()
+    else:
+        # Heal a display name that still carries a parenthetical gloss. These
+        # exist for real -- the live model emitted entities literally named
+        # "Slovenia (Implicit location of Lake Bled)" -- and `display_name` is
+        # otherwise only ever written at creation, so a row stored before
+        # `display_name_for` stripped glosses would keep the machine debris
+        # forever and surface it in episode titles and association
+        # explanations. One-way and idempotent (the cleaned form has no gloss
+        # to strip), so this cannot flap between spellings the way "always
+        # take the latest surface" would.
+        cleaned = display_name_for(entity.display_name)
+        if cleaned and cleaned != entity.display_name:
+            entity.display_name = cleaned
 
     if aliases:
         normalized_aliases = {
@@ -269,13 +282,29 @@ def mentions_for(semantic: dict, explicit_metadata: dict | None = None) -> list[
             )
         )
 
-    # Typed fields first: these are the only ones that carry a kind of their
-    # own, so they establish the kind every untyped mention below resolves
-    # against.
-    for field_name in ("people", "organizations", "locations", "topics"):
+    # Specifically-typed fields first: a person, organization, or location is
+    # a definite kind, and these establish the kind every later mention of the
+    # same name resolves against.
+    for field_name in ("people", "organizations", "locations"):
         for value in semantic.get(field_name) or []:
             if isinstance(value, str):
                 add(FIELD_TO_KIND[field_name], value, field_name)
+
+    # `topics` is the generic bucket, so it resolves against the specific
+    # kinds above rather than establishing its own. The live model routinely
+    # lists the same string in both -- "Switzerland" as a `locations` entry
+    # AND a `topics` entry, "ETH Zurich" as an `organizations` entry AND a
+    # `topics` entry -- which without this produced two nodes for one real
+    # thing and split the association weight between memories that mention it.
+    # A name that is also a named entity should BE that entity.
+    def _established(value: str) -> str | None:
+        return next(
+            (m.kind for m in mentions if normalize_name(m.surface) == normalize_name(value)), None
+        )
+
+    for value in semantic.get("topics") or []:
+        if isinstance(value, str):
+            add(_established(value) or "topic", value, "topics")
 
     # Everything after this point is untyped: a definition term, a visual
     # concept, and a relation endpoint are all just strings. Each reuses the
@@ -335,7 +364,13 @@ def mentions_for(semantic: dict, explicit_metadata: dict | None = None) -> list[
 
 def remove_unit_from_graph(db: Session, unit_id: uuid.UUID) -> None:
     """Delete everything projection wrote for one unit, including associations
-    where it is the *target* rather than the source. Does not commit."""
+    where it is the *target* rather than the source, and its episode
+    memberships. Does not commit."""
+    # Local import: app/memory/episodes.py imports nothing from this module,
+    # but keeping the dependency one-directional at module load time avoids
+    # making the two mutually importable as they grow.
+    from app.memory.episodes import remove_unit_from_episodes
+
     db.execute(delete(UnitEntityLink).where(UnitEntityLink.unit_id == unit_id))
     db.execute(delete(EntityRelation).where(EntityRelation.unit_id == unit_id))
     db.execute(
@@ -343,6 +378,7 @@ def remove_unit_from_graph(db: Session, unit_id: uuid.UUID) -> None:
             (UnitAssociation.source_unit_id == unit_id) | (UnitAssociation.target_unit_id == unit_id)
         )
     )
+    remove_unit_from_episodes(db, unit_id)
 
 
 def _entity_document_frequency(db: Session, entity_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
@@ -365,19 +401,30 @@ def _ready_unit_count(db: Session) -> int:
 
 
 def entity_specificity(document_frequency: int, total_units: int) -> float:
-    """How much sharing this entity tells you, in [0, 1].
+    """How much sharing this entity tells you, in (0, 1].
 
-    Inverse-document-frequency, normalized: an entity in one memory out of 200
-    scores near 1.0; one in half of them scores near 0. This is what stops a
-    recurring entity (your own city, your employer) from making every memory
-    an associate of every other -- the single most likely way an automatic
-    graph degenerates into uselessness.
+    Smoothed inverse document frequency: `log(1 + N/df) / log(1 + N)`. An
+    entity in 1 memory out of 200 scores ~1.0; one in half of them ~0.2. This
+    is what stops a recurring entity (your own city, your employer) from
+    making every memory an associate of every other -- the most likely way an
+    automatically-built graph degenerates into uselessness.
+
+    The `1 +` smoothing is not cosmetic. Plain IDF (`log(N/df)/log(N)`) is
+    exactly **zero** when an entity appears in every ready memory, and on a
+    small corpus that is the normal case, not an edge case: with two stored
+    memories that both mention the same person, df == N == 2, specificity is
+    0, and the single most informative connection in the store produces no
+    edge at all. Caught by running the real model over a four-memory corpus --
+    the two memories sharing "Markus" were left unconnected while a much
+    weaker pair sharing "Switzerland" got an edge, purely because the latter
+    happened to be projected when a third memory existed. Smoothing keeps the
+    ordering (more common is still less specific) while never collapsing a
+    genuine shared entity to no signal.
     """
     if total_units <= 1 or document_frequency <= 0:
         return 1.0
-    if document_frequency >= total_units:
-        return 0.0
-    return max(0.0, min(1.0, math.log(total_units / document_frequency) / math.log(total_units)))
+    df = min(document_frequency, total_units)
+    return max(0.0, min(1.0, math.log1p(total_units / df) / math.log1p(total_units)))
 
 
 @dataclass
@@ -394,6 +441,12 @@ class ProjectionResult:
     # the extraction produced nothing nameable, which is a different problem
     # from projection failing.
     skipped_entities: list[str] = field(default_factory=list)
+    # Which episode this memory ended up in, and by which clustering rule --
+    # see app/memory/episodes.py. None when the unit was not ready (and so was
+    # removed from the graph rather than projected into it).
+    episode_id: str | None = None
+    episode_rule: str | None = None
+    episode_created: bool = False
 
 
 def _link_mentions(
@@ -756,11 +809,24 @@ def project_unit(db: Session, unit: MemoryUnit) -> ProjectionResult:
     associations += _project_structural_associations(db, unit)
     _refresh_mention_counts(db, list(links))
 
+    # Episode assignment runs last, inside the same projection, because it
+    # depends on the entity links written above -- a memory's anchor entities
+    # are what let it join an existing episode. Bundling it here also means
+    # every caller of projection (the pipeline's four commit points and
+    # scripts/rebuild_graph.py) maintains episodes for free, with no second
+    # backfill path to keep in sync.
+    from app.memory.episodes import assign_episode
+
+    episode = assign_episode(db, unit)
+
     return ProjectionResult(
         entity_links=links_written,
         relations=relations,
         associations=associations,
         skipped_entities=skipped,
+        episode_id=str(episode.episode_id) if episode else None,
+        episode_rule=episode.rule if episode else None,
+        episode_created=bool(episode and episode.created),
     )
 
 

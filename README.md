@@ -55,6 +55,32 @@ The broader motivation is to make information safely offloadable to machines, al
 - **Contradiction surfacing:** when two stored memories disagree, that
   disagreement is flagged for the user rather than resolved
   automatically or hidden.
+- **Associative memory graph:** memories are automatically connected
+  through the people, places, organizations, concepts and visible objects
+  they are about. Two notes that share no wording at all are one hop
+  apart if they name the same lake, which is what lets recall reach a
+  memory the query could never have matched directly. The graph is built
+  from what extraction already produced, so it costs no additional model
+  calls, and every edge records whether the user stated the connection,
+  a model extracted it, or the system merely computed it.
+- **Associative, adaptive recall:** a clear query is answered directly.
+  A vague one triggers graph exploration, evidence collection across
+  candidates, and — only when it would actually help — one clarifying
+  question chosen to maximise expected information gain rather than just
+  asking for more detail.
+- **Episodic memory:** memories are grouped into the experiences they
+  belong to (a trip, a semester, an evening) and browsable
+  chronologically. Dates and episode boundaries carry their own
+  uncertainty: a memory with no recorded date is shown as undated rather
+  than filed under the day it was typed.
+- **Inspectable results:** every substantial result can be unfolded into
+  the memory it came from, the associations that led there, the evidence
+  for and against it, which clarifications were incorporated, and a
+  confidence *category* — never an invented percentage.
+- **Reproducible evaluation:** a synthetic benchmark corpus and a runner
+  that compares conventional vector retrieval, semantic retrieval with
+  reranking, associative multi-hop retrieval, and adaptive iterative
+  retrieval on the identical stored memories. See `docs/EVALUATION.md`.
 
 ## Architecture
 

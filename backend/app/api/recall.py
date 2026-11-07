@@ -55,12 +55,26 @@ async def recall(
     except RecallSessionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if session.status != STATUS_SUCCESS:
-        return RecallResponse(answer=ABSTENTION_MESSAGE, abstained=True, sources=[], chunk_sources=[])
+        return RecallResponse(
+            answer=ABSTENTION_MESSAGE,
+            abstained=True,
+            sources=[],
+            chunk_sources=[],
+            # Surfaced even here, where there is no session to continue: an
+            # abstention that cannot say why it abstained is indistinguishable
+            # from a bug. `session.current_question` is deliberately NOT
+            # returned -- a one-shot caller has no way to answer it, so
+            # offering one would be a dead end.
+            confidence=session.final_confidence,
+            abstention_reason=session.abstention_reason,
+        )
     return RecallResponse(
         answer=session.final_answer or "",
         abstained=False,
         sources=[SourceOut(**s) for s in session.final_sources],
         chunk_sources=[ChunkSourceOut(**c) for c in session.final_chunk_sources],
+        confidence=session.final_confidence,
+        evidence=session.final_evidence,
     )
 
 
@@ -85,6 +99,15 @@ def _session_out(session: RecallSession) -> RecallSessionOut:
         final_answer=session.final_answer,
         sources=session.final_sources,
         chunk_sources=session.final_chunk_sources,
+        # The inspectable reconstruction (see docs/ARCHITECTURE.md "Evidence
+        # trail"). Returned on every session read, not behind a separate
+        # endpoint: the point is that a result arrives together with why it
+        # arrived, rather than requiring a second deliberate request to find
+        # out whether it should be trusted.
+        strategy_trail=session.strategy_trail,
+        evidence=session.final_evidence,
+        confidence=session.final_confidence,
+        abstention_reason=session.abstention_reason,
         created_at=session.created_at,
         updated_at=session.updated_at,
     )

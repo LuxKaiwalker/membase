@@ -603,6 +603,220 @@ does (verified: start a session, restart the dev server, `GET
 /api/recall/sessions/{id}` returns identical state, `POST .../messages`
 continues it to completion).
 
+## Associative memory graph
+
+Retrieval levels 1-5 above all work by *matching*: a query is compared against
+each memory's own text or embedding. Level 6 needs something they cannot
+provide -- a way to reach a memory that shares no wording with the query at
+all, only a connection to something that does. That is what this graph is for.
+
+`MemoryUnit.related_unit_ids` (the structurer's advisory id list) was
+explicitly "NOT a knowledge graph" and is unchanged; it is now additionally
+*projected into* the graph below. Nothing that read it before behaves
+differently.
+
+```
+memory_entities        one canonical thing memories are about
+   ^                   (person | organization | location | topic |
+   |                    concept | object)
+   | unit_entity_links  which memory mentions it, in which semantic field
+   |                    (role), and whether the user said it or a model
+   |                    extracted it (origin)
+   |
+memory_units  <--- unit_associations ---> memory_units
+   |                weighted edge between two memories
+   |
+entity_relations       subject -predicate-> object, asserted by ONE unit
+```
+
+**Entities are the hub nodes.** Two memories that share no phrasing are one hop
+apart if they name the same lake. This is the whole mechanism: without entity
+nodes, "the photo from that trip near a lake" cannot reach a memory about
+Markus's doctorate, and with them it is a two-hop walk.
+
+**Construction costs zero extra LLM calls.** Every edge is derived from fields
+ingestion already produced -- `semantic.people/organizations/locations/topics/
+aliases/definitions/relations/visual_concepts/event_date` plus the user's own
+`explicit_metadata`. Entity resolution is a normalization function
+(`app/memory/entities.py`), not a model call. See docs/DECISIONS.md "The
+associative memory graph" for why that constraint shaped the design.
+
+**It is a projection, not primary data.** `app/memory/graph.py:project_unit()`
+rebuilds one memory's entire graph footprint from its current semantics,
+idempotently (delete-then-rebuild). That property is what lets it be called
+from four different pipeline commit points without any change tracking, and
+what makes a bug in it fixable with `scripts/rebuild_graph.py` instead of
+requiring re-ingestion -- which at ~20-25s of model time per memory would
+otherwise make every projection bug permanent in practice.
+
+### The authority distinction, as a column
+
+Every link, relation, and association carries an `origin`:
+
+```
+explicit   the user stated it themselves (Capture.explicit_metadata, a
+           clarification answer). Outranks everything below.
+extracted  an LLM extraction step read it out of the user's own words
+           (MemoryUnit.semantic), or it is a fact about how they submitted
+           them (two units from one capture).
+inferred   nobody stated it; the system computed it (entity co-occurrence,
+           a structurer judgement).
+```
+
+This is the same authority hierarchy the storage side already enforces, carried
+into the graph, and it is why the UI can render an inferred association
+differently from something the user asserted. It is a column, not a heuristic
+applied at display time.
+
+### Keeping the graph from degenerating
+
+The failure mode of an automatically-built memory graph is not missing edges --
+it is a graph where everything connects to everything, which carries the same
+information as no graph at all while costing more to query. Four defences,
+each addressing a different cause:
+
+1. **Unusable names never become nodes.** Pronouns, self-reference
+   ("Narrator", "User", "User (Owner of the AHV number)" -- all observed from
+   the live model where the text said "I"), bare quantities, and resolvable
+   dates are filtered at resolution time. The store's owner appears in every
+   first-person memory, so a node for them would be the highest-degree node in
+   the graph by a wide margin.
+2. **Specificity weighting.** A shared entity contributes
+   `log(1 + N/df) / log(1 + N)` -- an entity in 1 memory of 200 counts for
+   ~1.0, one in half of them for ~0.2. Smoothed deliberately: plain IDF is
+   exactly zero when an entity appears in every memory, which on a small
+   corpus is the normal case rather than an edge case.
+3. **A document-frequency ceiling**, gated on an absolute corpus size and
+   mention count so it cannot bind on a small store (see docs/DECISIONS.md --
+   the first version of this silently disabled associations entirely until the
+   corpus grew).
+4. **A hard fan-out cap per memory**, which also bounds the worst case of a
+   2-hop traversal to the square of a known constant.
+
+### Traversal
+
+`neighbors(db, seed_scores, max_hops=2)` walks outward from scored seeds as two
+batched `WHERE unit_id IN (...)` queries rather than a recursive CTE -- cheaper
+at this corpus size and far easier to bound. A neighbour's strength is
+`seed_score * edge_weight * HOP_DECAY**hop`, best path wins, and only
+`status='ready'` units come back, so the searchability gate holds through the
+graph exactly as it does through `hybrid_search`.
+
+Each returned associate carries the `path` that produced it, and a `why` string
+composed deterministically from the edges' own explanations ("Both mention Lake
+Bled (location)."). No LLM call is needed to answer "why is this here?".
+
+### API
+
+`app/api/graph.py` is read-only -- there is no endpoint to create, edit, or
+delete an edge. The requirement "do not turn this into a manually maintained
+knowledge graph" is enforced by the absence of a way to, not by convention.
+The user changes the graph by correcting a memory
+(`POST /api/memory-units/{id}/correct`); projection follows.
+
+## Episodes
+
+An episode is the collection of memories belonging to one experience, event, or
+period -- what people actually recall by ("that trip where we hiked to the
+lake"), as distinct from a `Capture` (one submission) or a `MemoryUnit` (one
+retrievable fact).
+
+Derived deterministically by `app/memory/episodes.py`, with no LLM call,
+including titles. Three clustering rules in descending confidence:
+
+```
+1. same capture         -> origin=extracted, confidence=certain
+   The user wrote these together. Nothing is guessed.
+2. compatible date AND  -> origin=inferred,  confidence=likely
+   >=1 shared anchor entity
+3. >=2 shared anchors,  -> origin=inferred,  confidence=uncertain
+   no usable date
+otherwise               -> seeds a new single-member episode
+```
+
+**Why both time and entity overlap are required.** Time alone groups everything
+that happened in one month, which is a calendar, not a memory. Entities alone
+group every memory mentioning a recurring person into one undated blob. The
+conjunction is what makes a cluster correspond to something a person would
+recognise as one experience. `topic` entities are excluded from the anchor set
+for the same reason: "hiking" is shared by every hike ever recorded.
+
+**Uncertainty is represented, not smoothed away.** `started_on`/`ended_on` are
+nullable and travel with a `date_precision` (day | month | season | year |
+unknown) and a `boundary_confidence`:
+
+```
+asserted   every dated member's date came from the user directly
+inferred   derived from model-extracted event dates
+uncertain  at least one member has no usable date, so the real boundaries
+           may extend past what is recorded
+```
+
+An episode whose members carry no resolvable date has NULL dates and says so.
+It is **never** back-filled from `created_at` -- "I don't know when this was"
+and "this happened the day it was written down" are different claims, and a
+timeline that conflates them is worse than one that admits the gap. The same
+rule governs `app/memory/temporal.py`, which returns `(None, "unknown")` for
+anything it cannot confidently resolve, including a date that does not exist.
+
+**Overlap and multi-membership are allowed.** `episode_memberships` has no
+uniqueness on `unit_id` alone, so a conference talk can belong to both "the
+conference" and "the Berlin trip", and two episodes can cover overlapping spans
+without contradiction.
+
+Clustering is greedy and order-dependent by design: a memory joins the oldest
+compatible episode rather than the globally optimal one. Global clustering
+would mean recomputing every episode on every new memory; re-running projection
+over the corpus converges, so the greedy result is a cheap approximation that
+can be corrected rather than a permanent mistake.
+
+`app/api/episodes.py` is read-only for the same reason the graph API is.
+
+## Evidence trail (explainable reconstruction)
+
+Every substantial retrieval result is accompanied by the record of how it was
+produced. Two requirements drive this and they are the same one seen from two
+sides: re-ranking has to combine more than one signal, which means those
+signals must exist as separable things; and the user has to be able to inspect
+why a result came back, including what argued against it. So both the ranking
+and the explanation are computed from one list of typed evidence items --
+there is no second, display-only explanation that could drift from what
+actually drove the ranking.
+
+**Four provenance levels**, carried per evidence item rather than per candidate,
+because one candidate routinely mixes them:
+
+```
+original    the user's own text: authoritative_content, a clarification
+            answer, user-supplied metadata
+extracted   an LLM step read it out of those words: semantic fields,
+            entity mentions, relations
+inferred    nobody stated it; the system computed it: an association, a
+            temporal adjacency
+hypothesis  a reformulated query the system tried while searching. Never
+            evidence for an answer -- displayed and audited, excluded from
+            scoring.
+```
+
+**Confidence is a category, never a percentage**: `strong` | `moderate` |
+`weak` | `insufficient`, defined by an explicit rule table in
+`app/retrieval/evidence.py:confidence_for`. Nothing in this system produces a
+calibrated probability -- the fused retrieval score is a rank signal whose
+absolute value depends on the corpus, and the association weights are a
+documented heuristic -- so "73% confident" would be fabricated precision. The
+rules that matter: a contradicting stored memory caps confidence at `moderate`
+whatever the scores say; incomplete enrichment caps it at `moderate`; and a
+candidate reached *only* by association never exceeds `weak`, because it was
+not matched, it was suggested by something that was.
+
+`RecallSession.strategy_trail` records one entry per round: strategies run,
+direct vs. expanded candidate counts, what the user's own negative cues ruled
+out, the question asked with its approximate expected information gain, the
+budget in force, and elapsed time. `final_evidence` holds the per-candidate
+evidence, and `abstention_reason` records a diagnosable reason distinct from
+the fixed abstention message shown to the user.
+
+
 ## Failure model
 
 Four independent layers of tolerance, from most to least routine:

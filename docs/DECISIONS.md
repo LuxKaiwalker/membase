@@ -2492,3 +2492,310 @@ status in `ready`/`awaiting_clarification`, oldest first).
 traffic -- `--delay` is a manual throttle, not an active coordination
 mechanism. Acceptable for a single-user personal deployment; would need
 revisiting before running this against a shared/multi-tenant instance.
+
+---
+
+# The artificial memory engine (graph, episodes, evidence trail)
+
+## The associative memory graph
+
+**Decision:** Four new typed tables (`memory_entities`, `unit_entity_links`,
+`entity_relations`, `unit_associations`) built as a deterministic, LLM-free,
+idempotent *projection* over `MemoryUnit.semantic` and
+`Capture.explicit_metadata`. `MemoryUnit.related_unit_ids` is left exactly as
+it was and additionally projected in.
+
+**Reason:** Retrieval levels 1-5 all work by matching a query against each
+memory's own text. The thing they structurally cannot do is reach a memory that
+shares no wording with the query at all -- which is the entire premise of this
+product ("finding a photograph based on an approximate description of the
+circumstances"). Entity hub nodes are what make that a two-hop walk instead of
+an impossibility.
+
+**Why four tables rather than one polymorphic edge table:** a single
+`edges(source_kind, source_id, target_kind, target_id)` table cannot have
+foreign keys, so nothing stops an edge pointing at a deleted memory, and every
+query needs a discriminator predicate. Four narrow tables each get real FKs
+with `ON DELETE CASCADE` and real indexes. The unified node/edge view the
+explorer wants is assembled in `app/memory/graph.py:subgraph()`, which is
+presentation, not storage.
+
+**Why zero additional LLM calls was a hard requirement, not a nice-to-have:**
+ingestion already costs ~6 generation calls plus an embed per capture, ~20-25s
+of model time (measured, see "Benchmark: fast pipeline vs. structurer
+wall-clock time"). This GPU has 11GB VRAM and `gemma4:12b` alone occupies
+~8.7GB, so there is no headroom for a second model and no appetite for more
+calls on the one we have. Building the graph from fields the pipeline already
+extracted means it is free, deterministic, unit-testable without a model, and
+-- the part that matters most in practice -- *rebuildable*. A projection bug is
+fixable with `scripts/rebuild_graph.py`; if the graph had been extracted by its
+own LLM pass, fixing one would mean re-ingesting the corpus.
+
+**Why `origin` is a column:** the requirement is to "distinguish explicitly
+established relationships from inferred associations". Doing that at display
+time means re-deriving it from whatever fields happen to be present, which
+drifts. As a column (`explicit` > `extracted` > `inferred`) it is the storage
+side's existing authority hierarchy carried into the graph, and retrieval can
+trust a user-stated location over a model-guessed one without re-inspecting
+anything.
+
+**Why the API is read-only:** the brief says "do not turn this into a manually
+maintained knowledge graph". A write endpoint would make that a matter of
+discipline; having no write endpoint makes it structural. A hand-edited edge
+would also be the one row a re-projection silently destroys.
+
+### Four defects found by running the real model, not by reasoning
+
+A fake-LLM test suite cannot find any of these, and all four were live bugs:
+
+1. **Alias cross-contamination.** Projection folded a memory's whole
+   `semantic.aliases` list into *every* entity it mentioned. That field
+   describes the memory ("other names/terms this same thing could be called"),
+   not one entity in it -- so the location "Switzerland" ended up carrying the
+   aliases "avs number" and "markus glaciology student", and the location
+   "Zurich" carrying "markus". Since `_find_entity` looks entities up *by
+   alias*, this actively corrupted resolution: a later mention of "Markus"
+   could resolve to a city. Fixed by gating on `is_alias_of`, a conservative
+   whole-word-containment test that folds "ETH" into "ETH Zurich" and nothing
+   else. It therefore misses real aliases with no shared wording ("ETH Zurich"
+   vs "Swiss Federal Institute of Technology") -- an accepted trade, since
+   wrongly merging two entities is unrecoverable and failing to merge one is
+   not.
+
+2. **The noise filter disabled the feature on small corpora.** The
+   document-frequency ceiling is a *fraction* (0.5). With three stored
+   memories, an entity in two of them is at 0.67 and was excluded -- so the
+   single most informative entity in the store (a person named in two
+   memories) generated no association at all, and the whole feature did
+   nothing until the corpus grew large. Compounded by plain IDF being exactly
+   **zero** when `df == N`, which on a small store is the normal case. Fixed
+   twice over: the ceiling now also requires an absolute corpus size and
+   mention count before it may exclude anything, and specificity is smoothed
+   to `log(1 + N/df) / log(1 + N)`, which never collapses a genuine shared
+   entity to no signal while keeping the ordering.
+
+3. **The store's owner became a graph node.** Where the text said "I", the
+   model emitted entities named "Narrator", "Narrator (User)", "User", "User
+   (Owner of the AHV number)", and "User within the Swiss social security
+   framework". The owner appears in essentially every first-person memory, so
+   that node would have been the highest-degree node in the graph by a wide
+   margin -- connecting everything to everything and making association
+   weights meaningless. Fixed by a first-token self-reference filter (which
+   catches the qualified forms a whole-string match misses) plus stripping
+   parenthetical glosses during normalization.
+
+4. **One real thing fragmented into several nodes by role.** "Lake Bled"
+   arrived as both a `locations` entry and a `definitions` term, producing a
+   location node and a separate concept node for the same lake and halving the
+   association weight between memories mentioning it. Same for "Switzerland"
+   and "ETH Zurich" appearing in both a specific field and `topics`. Fixed by
+   resolving untyped mentions (definitions, visual concepts, relation
+   endpoints) and generic `topics` against the kind a specifically-typed field
+   already established for that name.
+
+**Also found: a graph bug could fail an ingestion.** A constraint violation
+during projection's flush left the whole session in a pending-rollback state,
+so `process_capture_fully`'s own next statement failed and an otherwise
+perfectly-ingested capture was marked `processing_status="failed"`. A
+try/except is not sufficient for this; projection now runs inside a SAVEPOINT
+(`db.begin_nested()`), which confines the damage and leaves the caller's
+transaction usable. The graph is an index -- a bug in it must never cost a
+memory.
+
+---
+
+## Episodes: deterministic clustering, and no model-written titles
+
+**Decision:** `episodes` + `episode_memberships`, derived by three
+deterministic rules (same capture / compatible date AND shared anchor entity /
+two shared anchors without a date). Titles are composed from dominant entities
+and the date span. No LLM call anywhere in the module.
+
+**Reason, and the trade-off taken honestly:** a model-written title ("The
+morning we hiked above Lake Bled") reads better than a composed one ("Lake
+Bled, Markus — July 2023"). But it costs one generation call per episode and
+has to be re-run every time membership changes, which is an unbounded cost
+against a codebase rule that every LLM-driven loop be bounded for a stated
+reason. `Episode.title_source` records that the title is derived, so a
+model-written one can be added later and told apart rather than silently
+replacing it. Logged in docs/TODO.md as a deliberate deferral.
+
+**Why both time and entity overlap are required for rule 2:** time alone groups
+everything that happened in one month, which is a calendar rather than a
+memory. Entities alone group every memory mentioning a recurring person into
+one undated blob. `topic` entities are excluded from the anchor set entirely --
+"hiking" is shared by every hike ever recorded, so it would merge unrelated
+trips years apart.
+
+**Why undated episodes keep NULL dates:** the alternative is back-filling from
+`created_at`, which makes "I don't know when this happened" indistinguishable
+from "this happened the day it was written down". A user cannot tell those
+apart after the fact, so the timeline reports the gap instead. Same rule drives
+`app/memory/temporal.py`, which returns `(None, "unknown")` for anything it
+cannot confidently resolve -- including, after a bug found in review, a
+*complete* date that does not exist ("2024-02-31"), which previously fell
+through to a looser pattern and was reported as month precision. Deriving a
+date from garbage is exactly what the module promises not to do.
+
+**Why clustering is greedy:** a memory joins the oldest compatible episode, not
+the globally optimal one. Global clustering means recomputing every episode on
+every new memory. Re-running projection over the corpus converges, so the
+greedy result is a cheap approximation that can be corrected rather than a
+permanent mistake.
+
+---
+
+## Expected information gain, not even bisection, for clarifying questions
+
+**Decision:** `generate_discriminating_question` keeps its signature and its
+question phrasings, but the selection criterion is now the mutual information
+between the user's yes/no answer and which memory they meant, computed over a
+plausibility distribution derived from retrieval scores
+(`app/retrieval/infogain.py`).
+
+**Reason:** the previous rule picked the attribute value that best *bisected
+the candidate set by count*. That is correct only when every candidate is
+equally plausible. When one candidate is much more likely than the rest -- the
+common case -- an even split by count can be close to worthless, because the
+likely candidate lands on one side and the answer confirms what was already
+believed. Maximising expected information gain is a strict generalisation: with
+a uniform distribution the maximum-gain split *is* the even bisection, so the
+old behaviour is the special case this reduces to.
+
+**Why the phrasings were deliberately not touched:**
+`eval/run_interactive_benchmark.py`'s simulated-user oracle reverse-maps a
+generated question back to the semantic field it came from by matching the
+template text. Changing the wording would have broken the benchmark silently
+rather than loudly.
+
+**What the gain number is and is not:** the distribution comes from normalised
+fused retrieval scores, which are a rank signal, not calibrated probabilities
+(see "Improve ambiguity detection"). So the gain is a principled *ordering* of
+candidate questions, not a trustworthy measurement in bits. It is reported in
+the session trail under a key explicitly named `expected_gain_bits_approx`.
+
+---
+
+## Associative retrieval as a stage, and why an inferred lead cannot win
+
+**Decision:** `app/retrieval/associative.py` runs after `automatic_search`,
+takes its ranked output as seeds, walks the graph, and returns a richer
+candidate set. `hybrid_search` and `automatic_search` keep their exact
+contracts. Expansion is **adaptive**: `should_expand` declines to walk the graph
+when direct search already produced a dominant, evidentially-complete winner,
+using the same three-signal test as the agent's existing sufficiency
+short-circuit.
+
+**Reason:** the brief asks that "simple queries should be answered directly,
+while ambiguous queries should trigger deeper exploration". Making that a
+deterministic gate rather than a model judgement means a clear query costs
+exactly what it did before this feature existed, and the reason exploration was
+skipped is recorded in the trail rather than being invisible.
+
+**Why association-route candidates are capped at `weak` confidence and at a
+hard score ceiling:** a memory reached only by inference was not matched -- it
+was suggested by something that was. Three independent mechanisms keep that
+distinction from eroding: `confidence_for` caps it at `weak`; `rerank` clamps
+its final score below the moderate-direct-match threshold so no amount of
+accumulated supporting evidence lets it outrank a genuine match; and the answer
+prompt labels its evidence block "Associated memory" with an explicit
+instruction not to present it as the answer on its own. Any one of these alone
+could be weakened by a later change without the others noticing.
+
+**Why `RetrievalBudget` is threaded through rather than read from module
+globals:** `eval/threshold_sweep.py` has to monkeypatch
+`retrieval_pipeline.VECTOR_SIM_THRESHOLD` and restore it afterwards to compare
+settings. Passing the budget as a value means the benchmark can compare budgets
+without patching the module it is measuring.
+
+---
+
+## Confidence as a category, never a percentage
+
+**Decision:** four buckets (`strong` | `moderate` | `weak` | `insufficient`)
+defined by an explicit rule table in `app/retrieval/evidence.py`, with no
+numeric confidence shown to the user.
+
+**Reason:** the brief says not to "use arbitrary numerical confidence scores
+without a defined interpretation". Nothing in this system produces a calibrated
+probability: the fused retrieval score is a rank signal whose absolute value
+depends on the corpus, and the association weights are a documented heuristic.
+"73% confident" would therefore be fabricated precision -- the same class of
+error as inventing a date. The rule table *is* the definition; there is no
+separate prose description of it that could disagree with the code.
+
+Three rules in it are worth stating because they are not obvious: a
+contradicting stored memory caps confidence at `moderate` whatever the scores
+say (a high retrieval score is not evidence the *other* memory is wrong);
+semantics that never finished enriching also cap at `moderate` (the memory is
+real, but the representation it was matched against is incomplete); and two
+close candidates from *different* origin captures downgrade the overall answer
+even when each looks strong alone, because the system does not actually know
+which one was meant.
+
+---
+
+## Audio ingestion: transcription through the existing model, and four traps
+
+**Decision:** Audio files are accepted, stored, and transcribed by `gemma4:12b`
+through the **existing** `images` field on Ollama's `/api/chat` message. No new
+model, no new dependency, no change to `app/llm/ollama_provider.py`. The
+transcript lands in `Attachment.extracted_text`, so it flows into
+`searchable_text` and chunking exactly as PDF text already does.
+
+**Reason:** this GPU has 11GB VRAM and `gemma4:12b` alone occupies ~8.7GB (see
+CLAUDE.md "Environment facts"), so adding Whisper or any second model was never
+available. The model advertises an `audio` capability, so the question was
+purely whether Ollama 0.40.3 would actually route audio to it.
+
+**Established empirically against the live model, not assumed** (real `curl`
+posts, speech synthesised with espeak-ng + ffmpeg, both already in the nix
+store):
+
+1. **Audio must go in the `images` field.** A base64 WAV in
+   `message["images"]` returns HTTP 200 with a real transcript
+   (`prompt_eval_count` 164, i.e. the media really was tokenised). This is why
+   no provider change was needed -- the existing image path already carries
+   audio.
+
+2. **A separate `audio` field is NOT supported and fails SILENTLY.** Posting
+   `message["audio"]` also returns **HTTP 200**, but `prompt_eval_count`
+   collapses from 164 to 36 -- zero media tokens -- and the model replies
+   "NO SPEECH". The media is discarded with no error of any kind. This is the
+   dangerous one: it looks like the more obvious API shape, it does not fail,
+   and anyone "correcting" the code to use it would get confident, fully
+   hallucinated transcripts of audio the model never heard. Recorded here
+   specifically so that change does not get made.
+
+3. **Only WAV, MP3 and FLAC decode.** OGG (both Opus and Vorbis), M4A/AAC and
+   WebM all return HTTP 400 "Failed to load image or audio file". Those
+   formats are still accepted and stored -- the original is never lost, same
+   rule as every other attachment -- but skipped for transcription rather than
+   making a call that is guaranteed to fail.
+
+4. **libmagic's mime names differ from the canonical ones.** The repo sniffs
+   real types from bytes, and it reports `audio/x-wav`, `audio/x-m4a` and
+   `video/webm` -- not `audio/wav`, `audio/mp4`, `audio/webm`. Accepting only
+   the canonical spellings would have rejected every real WAV upload. Both
+   spellings are accepted.
+
+**Also found: non-speech audio confabulates.** A pure 440 Hz sine tone produced
+a fluent invented paragraph rather than reporting silence. The transcription
+prompt therefore asks for a `NO_SPEECH` sentinel and the code matches it
+loosely (the live model answers "NO SPEECH" with a space when asked for
+`NO_SPEECH`), so a recording with no speech in it does not become a fabricated
+memory.
+
+**Not established: accuracy.** Only robotic TTS was available to test with. The
+model demonstrably hears the audio -- it transcribed digits and weekdays
+exactly, and misheard "four o'clock" as "Oracle", which is a phonetic error
+and therefore proof the acoustic signal is being decoded -- but it rewrites
+clauses it cannot make out rather than marking them uncertain. Treat a
+transcript as derived, best-effort content, which is exactly the tier
+`Attachment.extracted_text` already occupies in the authority hierarchy.
+
+**One accepted trade-off:** because libmagic reports WebM audio as
+`video/webm`, supporting WebM audio at all means a genuine *video* file is now
+stored and downloadable (never transcribed) rather than rejected. Consistent
+with "never lose the user's original", but it does mean the accepted-type set
+is slightly wider than "audio".

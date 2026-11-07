@@ -18,7 +18,7 @@ from app.models import EMBEDDING_DIM
 # its own response queue (see `clarification_response` below).
 _EMPTY_SEMANTIC_FIELDS = {
     "meaning": "", "aliases": [], "people": [], "organizations": [], "locations": [],
-    "topics": [], "definitions": [], "relations": [], "event_date": "",
+    "topics": [], "definitions": [], "relations": [], "visual_concepts": [], "event_date": "",
 }
 _DEFAULT_CLARIFICATION = {"clarification_question": "", "clarification_field": ""}
 _DEFAULT_IMAGE_STRUCTURED = {"has_structured_data": False, "fields": []}
@@ -32,6 +32,16 @@ _DEFAULT_CUES = {"cues": []}
 # single unit's verbatim "content" without a test needing to repeat it
 # in segmentation_response.
 _CAPTURE_TEXT_RE = re.compile(r"Text:\n(.*)\n\nSplit this into memory units\.", re.DOTALL)
+
+# Audio transcription and image captioning are BOTH plain generate() calls
+# carrying bytes in `images=` (that is the field Ollama reads audio from
+# too -- see TRANSCRIBABLE_AUDIO_MIMES in app/ingestion/pipeline.py), so
+# there is no schema to dispatch on the way generate_structured() does.
+# The prompt is the only distinguishing signal; this marker is the opening
+# of _AUDIO_TRANSCRIBE_PROMPT in app/ingestion/pipeline.py, hardcoded here
+# for the same reason _CAPTURE_TEXT_RE hardcodes segmentation's prompt
+# tail. Keep the two in sync.
+_AUDIO_PROMPT_MARKER = "Transcribe the speech in this audio recording"
 
 
 def _hash_vector(text: str, dim: int) -> list[float]:
@@ -140,6 +150,13 @@ class FakeLLMProvider(LLMProvider):
       - "grounded"                -> final answer generation
       - "cues"                   -> recall-session cue extraction
 
+    `generate()` (unstructured) has no schema to dispatch on, so its two
+    media call sites are told apart by prompt instead:
+      - audio transcription    -> `audio_transcript_response`, matched on
+                                  _AUDIO_PROMPT_MARKER
+      - anything else with      -> `image_caption_response`
+        `images=`
+
     Each `*_response` may be a single dict (returned every time) or a
     list (consumed in order).
     """
@@ -156,6 +173,7 @@ class FakeLLMProvider(LLMProvider):
         answer_response: Any = None,
         cue_response: Any = None,
         image_caption_response: Any = None,
+        audio_transcript_response: Any = None,
     ) -> None:
         self._dim = dim
         self.fail = fail
@@ -175,6 +193,14 @@ class FakeLLMProvider(LLMProvider):
         else:
             wrapped_caption_response = image_caption_response
         self._image_caption = _ResponseQueue(wrapped_caption_response, {"caption": "a fake image"})
+        # Same str | list[str] convenience as image_caption_response above.
+        if isinstance(audio_transcript_response, list):
+            wrapped_transcript_response = [{"transcript": t} for t in audio_transcript_response]
+        elif isinstance(audio_transcript_response, str):
+            wrapped_transcript_response = {"transcript": audio_transcript_response}
+        else:
+            wrapped_transcript_response = audio_transcript_response
+        self._audio_transcript = _ResponseQueue(wrapped_transcript_response, {"transcript": "a fake transcript"})
         self.calls: list[str] = []  # dispatch "kind" per generate_structured call, for tests that assert call counts
         self.images_received: list[list[bytes]] = []
         self.embed_calls: list[list[str]] = []  # texts passed per embed() call, for tests asserting dedup
@@ -203,7 +229,13 @@ class FakeLLMProvider(LLMProvider):
     ) -> str:
         self._maybe_fail_connectivity()
         if images:
+            # Audio bytes legitimately arrive in `images` too, so
+            # images_received covers both media kinds -- see
+            # _AUDIO_PROMPT_MARKER above.
             self.images_received.append(images)
+            if _AUDIO_PROMPT_MARKER in prompt:
+                self.calls.append("audio_transcript")
+                return self._audio_transcript.next()["transcript"]
             self.calls.append("image_caption")
             return self._image_caption.next()["caption"]
         return "ok"
@@ -252,6 +284,11 @@ class FakeLLMProvider(LLMProvider):
                 "locations": item.get("locations", []),
             }
         if "aliases" in props:
+            # Dispatch is unaffected by `visual_concepts` joining this
+            # schema: "related_indices" (the structurer's unified pass)
+            # is still matched earlier, and the retrieval-aids schema
+            # still has no "people"/"units"/"meaning" key to collide
+            # with a branch above.
             self.calls.append("retrieval_aids")
             item = self._enrichment.peek()
             self._enrichment.advance()
@@ -260,6 +297,7 @@ class FakeLLMProvider(LLMProvider):
                 "topics": item.get("topics", []),
                 "definitions": item.get("definitions", []),
                 "relations": item.get("relations", []),
+                "visual_concepts": item.get("visual_concepts", []),
             }
         if "meaning" in props:
             self.calls.append("narrative")

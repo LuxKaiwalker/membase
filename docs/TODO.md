@@ -1,5 +1,105 @@
 # TODO / open questions
 
+## This phase: the artificial memory engine (graph, episodes, evidence, benchmark)
+
+### Known gaps, flagged rather than silently left
+
+- **Entity resolution is exact-match plus conservative alias folding, not
+  fuzzy.** `is_alias_of` (`app/memory/entities.py`) folds an alias only when
+  one name's words contain the other's as a contiguous whole-word run, so
+  "ETH" merges into "ETH Zurich" but "ETH Zurich" and "Swiss Federal Institute
+  of Technology" stay two nodes, as do "Anna" and a misspelling of it. This is
+  a deliberate choice -- wrongly merging two entities is unrecoverable (there
+  is no un-merge) while failing to merge one only costs a missed association
+  -- but it is a real ceiling on recall. Embedding-based or LLM-assisted entity
+  resolution is the obvious next step and would need its own evaluation,
+  since a false merge is much more damaging than a miss.
+- **Association weights go stale as the corpus grows.** Specificity depends on
+  the ready-unit count at projection time, and nothing re-projects an untouched
+  memory when the corpus grows. An edge's weight is refreshed whenever either
+  endpoint is re-projected, and `scripts/rebuild_graph.py` recomputes
+  everything, but there is no automatic drift correction. Acceptable at this
+  scale; would need a periodic pass at a much larger one.
+- **The graph's noise thresholds are engineering defaults, not swept.**
+  `membase_graph_entity_df_ceiling` (0.5), `_df_min_units` (10),
+  `_df_min_mentions` (3), `membase_graph_min_association_weight` (0.15),
+  `membase_graph_max_associations_per_unit` (24), `HOP_DECAY` (0.55), and the
+  `ROLE_WEIGHTS`/`KIND_ASSOCIATION_WEIGHTS` tables were all chosen by
+  reasoning plus one real-model corpus, in the same spirit as
+  `AMBIGUITY_MIN_RUNNER_UP_SCORE` and the high-confidence shortcut's
+  thresholds. `eval/run_strategy_benchmark.py` is now the harness that could
+  sweep them; nothing has been swept yet, and a sweep on a ~40-memory
+  synthetic corpus would mostly overfit it.
+- **Episode titles are composed, not written.** See docs/DECISIONS.md
+  "Episodes: deterministic clustering, and no model-written titles" for the
+  cost reasoning. `Episode.title_source` exists so a model-written title can be
+  added later and distinguished; the field currently only ever holds
+  `"derived"`.
+- **Episode clustering is greedy and order-dependent.** A memory joins the
+  oldest compatible episode rather than the globally best one. Re-running
+  projection converges, but the grouping you get depends on ingestion order
+  until you do. No automatic re-clustering pass exists.
+- **Seasons are northern-hemisphere only.** `app/memory/temporal.py`'s
+  `_SEASONS` maps "summer" to a July anchor. Documented at the definition
+  rather than silently assumed; a southern-hemisphere user would need it
+  inverted. The 45-day season tolerance is wide enough that the anchor choice
+  does not drive a retrieval decision on its own.
+- **Day-first date convention.** "03.04.2024" is read as 3 April, not 4 March.
+  A documented convention (matching this deployment's user), not a per-input
+  guess -- but it is a convention, and a US-formatted date would be misread.
+- **`expected_gain_bits_approx` is an ordering signal, not a measurement.** The
+  candidate distribution comes from normalised fused retrieval scores, which
+  are not calibrated probabilities. The key name says `approx` for that reason.
+  Calibrating it would require knowing the true posterior, which this system
+  does not have.
+- **The information-gain question selector assumes a truthful user and correct
+  metadata.** A user who misremembers ("yes, Anna was there" when she was not)
+  is led away from the right memory. Mitigated by negative cues excluding
+  rather than permanently eliminating, and by the original query being
+  re-searched every round, but not solved.
+- **Visual concepts depend on caption quality, which is still not empirically
+  validated.** `semantic.visual_concepts` is extracted from the image caption
+  the vision pass produces, and the pre-existing gap below ("image captions are
+  not empirically quality-tested") now propagates into the graph: a caption
+  that misses the lake produces no lake entity. The demonstration dataset uses
+  generated illustrations rather than photographs, which exercises the path
+  but says nothing about caption quality on real photos.
+- **The demonstration dataset's images are synthetic illustrations.**
+  `scripts/seed_demo.py` draws flat-colour lake-and-mountain scenes with
+  Pillow. That exercises the full vision -> visual concepts -> entities ->
+  association -> retrieval path with no real personal data, but a real
+  photograph would produce a richer caption, and the demo's visual quality is
+  correspondingly modest.
+- **No UI for correcting a wrong association or episode assignment.** Both the
+  graph and episode APIs are deliberately read-only (see docs/DECISIONS.md),
+  so a user who sees a wrong edge can only fix it indirectly, by correcting the
+  underlying memory. Whether a user-visible "these are not related" signal
+  should exist -- and how it would survive a re-projection, which is the whole
+  reason the APIs are read-only -- is an open design question, not an
+  oversight.
+
+### Open questions this phase raises
+
+- **Should an association ever be promotable to an explicit relationship?** The
+  system can infer that two memories are related; the user cannot currently
+  confirm it. Confirming would mean storing something the user asserted, which
+  belongs in a capture, not in a projection -- so the mechanism would have to
+  be "record the confirmation as a memory", and it is not obvious that is what
+  a user would expect from clicking "yes, these are related".
+- **Should the graph inform ingestion, not just retrieval?** The pre-existing
+  gap "ingestion-time clarification/enrichment never checks what's already
+  stored" (below) now has a much better tool available than it did:
+  entity-based lookup instead of a regex `ILIKE`. Deliberately not attempted
+  this phase -- it changes what gets *stored*, which is a higher-stakes change
+  than anything retrieval-side, and the open questions listed in that item
+  (what counts as "the same term", how much context to inject) are unchanged.
+- **Should episodes be retrievable as first-class answers?** Today recall
+  returns memories, and episodes are a browsing surface. "What did I do in
+  Slovenia?" arguably wants an episode as the answer, not a list of memory
+  units. Not attempted; it would need an episode-level representation to search
+  against, which is a different indexing decision.
+
+
 ## Resolved this phase (restore the multi-call pipeline, instant save, image structured data, attachment access)
 
 Full reasoning for every item below is in docs/DECISIONS.md under

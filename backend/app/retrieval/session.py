@@ -23,6 +23,7 @@ Nothing in this module ever writes to Capture/MemoryUnit (spec section
 """
 
 import logging
+import time
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -31,13 +32,28 @@ from app.config import get_settings
 from app.llm.base import LLMError, LLMProvider
 from app.models import RecallSession
 from app.retrieval.agent import automatic_search
+from app.retrieval.associative import (
+    RetrievalBudget,
+    RetrievalTrace,
+    apply_budget,
+    build_direct_candidates,
+    collect_evidence,
+    expand_with_associations,
+    rerank,
+    should_expand,
+)
 from app.retrieval.cues import extract_cues
 from app.retrieval.discriminate import (
     apply_negative_cues,
     apply_positive_cue_boost,
-    generate_discriminating_question,
     is_ambiguous,
     narrow_to_dominant_group,
+    select_question,
+)
+from app.retrieval.evidence import (
+    ROUTE_ASSOCIATION,
+    format_evidence_block,
+    overall_confidence,
 )
 from app.retrieval.pipeline import ABSTENTION_MESSAGE, generate_answer, sibling_context
 
@@ -84,6 +100,15 @@ def _negative_cue_texts(session: RecallSession) -> list[str]:
     return [c["text"] for c in session.cues if c["polarity"] == "negative"]
 
 
+def _all_cue_texts(session: RecallSession) -> list[str]:
+    """Every value the user has spoken about this session, either polarity.
+
+    Used to stop the question selector asking about something the user just
+    told it -- a confirmation and a denial are equally "already answered".
+    """
+    return [c["text"] for c in session.cues if c.get("text")]
+
+
 def _snapshot_attachment(a) -> dict:
     return {
         "id": str(a.id),
@@ -128,10 +153,45 @@ def _snapshot_chunk_sources(ranked_chunks) -> list[dict]:
     ]
 
 
-def _finish(session: RecallSession, status: str, message: str) -> None:
+def _finish(session: RecallSession, status: str, message: str, *, reason: str | None = None) -> None:
     session.status = status
     session.current_question = None
+    if reason is not None:
+        session.abstention_reason = reason
     _append_message(session, "system", message)
+
+
+def _record_round(session: RecallSession, trace: RetrievalTrace, extra: dict | None = None) -> None:
+    """Append this round's retrieval trace to the session's inspectable trail.
+
+    Appended rather than replaced: the point of the trail is that a user can
+    see how the search narrowed across rounds, which a single
+    latest-round-only field could not show.
+    """
+    entry = {"round": session.round_count, **trace.as_dict(), **(extra or {})}
+    session.strategy_trail = [*session.strategy_trail, entry]
+
+
+def _ask(
+    session: RecallSession, choice, trace: RetrievalTrace, candidates: list | None = None
+) -> None:
+    """Put the session into needs_user_cue with one concrete question.
+
+    `candidates` is snapshotted into `final_evidence` even though no answer has
+    been produced yet. That is deliberate: while a question is pending, the
+    candidate set *is* the result so far, and a UI that cannot show "here are
+    the five memories I am choosing between" forces the user to answer a
+    question about candidates they cannot see. The snapshot is replaced when
+    the round that actually answers runs.
+    """
+    session.status = STATUS_NEEDS_USER_CUE
+    session.current_question = choice.question
+    session.asked_questions = [*session.asked_questions, choice.question]
+    if candidates is not None:
+        session.final_evidence = [c.as_dict() for c in candidates]
+        session.final_confidence = overall_confidence(candidates)
+    _append_message(session, "system", choice.question)
+    _record_round(session, trace, {"question": choice.as_dict()})
 
 
 async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> None:
@@ -140,9 +200,15 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
     to answer, ask a discriminating question, or give up (spec section
     21).
     """
+    round_started = time.monotonic()
     session.round_count += 1
     if session.round_count > MAX_SESSION_ROUNDS:
-        _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
+        _finish(
+            session,
+            STATUS_EXHAUSTED,
+            ABSTENTION_MESSAGE,
+            reason=f"Reached the {MAX_SESSION_ROUNDS}-round safeguard without resolving the memory.",
+        )
         db.commit()
         return
 
@@ -171,45 +237,144 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
     # against (see docs/DECISIONS.md). Degrading to STATUS_ERROR keeps
     # the session inspectable/retryable instead of a raw 500.
     try:
+        budget = RetrievalBudget()
+        trace = RetrievalTrace(
+            strategies=["hybrid_search", "evaluate_reformulate"],
+            hypotheses=list(result.hypotheses),
+            budget={
+                "max_association_hops": budget.max_association_hops,
+                "max_expanded_candidates": budget.max_expanded_candidates,
+                "max_total_candidates": budget.max_total_candidates,
+                "max_session_rounds": MAX_SESSION_ROUNDS,
+            },
+        )
+
         negatives = _negative_cue_texts(session)
+        before_negatives = {str(s.unit.id) for s in result.ranked}
         ranked = apply_negative_cues(result.ranked, negatives)
+        # Record what the user's own "no, it wasn't that" removed. Excluding
+        # silently would make a narrowing session look like it simply stopped
+        # finding things, when in fact the user ruled those candidates out.
+        removed = before_negatives - {str(s.unit.id) for s in ranked}
+        trace.ruled_out = [
+            {
+                "unit_id": str(s.unit.id),
+                "content": s.unit.authoritative_content[:200],
+                "reason": "you ruled this out",
+            }
+            for s in result.ranked
+            if str(s.unit.id) in removed
+        ]
+
         ranked = apply_positive_cue_boost(ranked, extra_queries)
         ranked = sorted(ranked, key=lambda s: s.fused_score, reverse=True)
-        session.last_candidate_count = len(ranked) + len(result.ranked_chunks)
 
         if not ranked and not result.ranked_chunks:
-            _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
+            trace.elapsed_ms = int((time.monotonic() - round_started) * 1000)
+            session.last_candidate_count = 0
+            # Say why association exploration did not run, rather than leaving
+            # the field null and making the reader guess whether it was skipped
+            # deliberately or forgotten. This branch returns before
+            # should_expand() is consulted, so record the same reason it would
+            # have given.
+            trace.expansion_skipped_reason = (
+                "nothing matched directly, so there was nothing to explore from"
+            )
+            _record_round(session, trace)
+            _finish(
+                session,
+                STATUS_EXHAUSTED,
+                ABSTENTION_MESSAGE,
+                reason=(
+                    "No stored memory cleared the relevance bar for this query or for any "
+                    "reformulation of it."
+                ),
+            )
             db.commit()
             return
 
-        if is_ambiguous(ranked):
-            question = generate_discriminating_question(ranked, already_asked=session.asked_questions)
-            if question is not None:
-                session.status = STATUS_NEEDS_USER_CUE
-                session.current_question = question
-                session.asked_questions = [*session.asked_questions, question]
-                _append_message(session, "system", question)
+        # --- Retrieval level 6: associative exploration. Adaptive -- a query
+        # already answered decisively by direct matching skips this entirely
+        # (see app/retrieval/associative.py::should_expand), so a clear query
+        # costs exactly what it did before this feature existed.
+        candidates = build_direct_candidates(ranked)
+        trace.direct_candidates = len(candidates)
+        expand, skip_reason = should_expand(candidates)
+        if expand:
+            trace.strategies.append("association_expansion")
+            expanded = expand_with_associations(db, candidates, budget, started_at=round_started)
+            candidates.extend(expanded)
+            trace.expanded_candidates = len(expanded)
+        else:
+            trace.expansion_skipped_reason = skip_reason
+
+        trace.strategies.append("evidence_collection")
+        collect_evidence(
+            db,
+            candidates,
+            query=session.original_query,
+            positive_cues=extra_queries,
+            chunks=result.ranked_chunks,
+        )
+        candidates = apply_budget(rerank(candidates), budget)
+        session.last_candidate_count = len(candidates) + len(result.ranked_chunks)
+
+        # Ambiguity detection and dominant-group narrowing still operate on
+        # the ScoredUnit view of *directly matched* candidates. Both are
+        # defined over things that actually matched the query: an associated
+        # lead is not a competing answer to disambiguate between, it is
+        # supporting context for whichever direct candidate wins.
+        direct_ranked = [c.direct for c in candidates if c.direct is not None]
+
+        if is_ambiguous(direct_ranked):
+            trace.strategies.append("ambiguity_narrowing")
+            choice = select_question(
+                direct_ranked,
+                already_asked=session.asked_questions,
+                known_values=_all_cue_texts(session),
+            )
+            if choice is not None:
+                trace.elapsed_ms = int((time.monotonic() - round_started) * 1000)
+                _ask(session, choice, trace, candidates)
                 db.commit()
                 return
-            # No remaining angle distinguishes the candidates -- fall
-            # through and answer with the best evidence available rather
-            # than loop.
-        else:
+            # No remaining attribute separates the candidates informatively --
+            # fall through and answer with the best evidence available rather
+            # than loop, or ask something that would gain nothing.
+        elif direct_ranked:
             # A clear winner exists: don't let an unrelated, lower-scoring
             # group that merely cleared the relevance bar keep cluttering
             # the answer-generation evidence (spec section 12 governs the
             # *ambiguous* case; once resolved, there's no decision left
-            # for the answering step to make between groups).
-            ranked = narrow_to_dominant_group(ranked)
+            # for the answering step to make between groups). Associated
+            # candidates survive this: they were reached FROM the winner, so
+            # they are its context rather than a rival group.
+            winners = {str(s.unit.id) for s in narrow_to_dominant_group(direct_ranked)}
+            candidates = [
+                c for c in candidates if c.route == ROUTE_ASSOCIATION or c.unit_id in winners
+            ]
+            direct_ranked = [c.direct for c in candidates if c.direct is not None]
 
-        context = sibling_context(db, ranked)
+        context = sibling_context(db, direct_ranked)
+        evidence_text = format_evidence_block(candidates, context, result.ranked_chunks)
         answer_text, grounded = await generate_answer(
-            llm, session.original_query, ranked, context, result.ranked_chunks
+            llm,
+            session.original_query,
+            direct_ranked,
+            context,
+            result.ranked_chunks,
+            evidence=evidence_text,
         )
+        trace.elapsed_ms = int((time.monotonic() - round_started) * 1000)
+
         if grounded:
             session.final_answer = answer_text
-            session.final_sources = _snapshot_sources(ranked)
+            session.final_sources = _snapshot_sources(direct_ranked)
             session.final_chunk_sources = _snapshot_chunk_sources(result.ranked_chunks)
+            session.final_evidence = [c.as_dict() for c in candidates]
+            session.final_confidence = overall_confidence(candidates)
+            session.abstention_reason = None
+            _record_round(session, trace)
             _finish(session, STATUS_SUCCESS, answer_text)
             db.commit()
             return
@@ -220,14 +385,26 @@ async def _run_round(db: Session, llm: LLMProvider, session: RecallSession) -> N
         # exists; otherwise this line of inquiry is genuinely exhausted
         # (spec section 11: a weak match is not proof retrieval is
         # impossible, but it isn't grounds to keep asking forever either).
-        question = generate_discriminating_question(ranked, already_asked=session.asked_questions)
-        if question is not None:
-            session.status = STATUS_NEEDS_USER_CUE
-            session.current_question = question
-            session.asked_questions = [*session.asked_questions, question]
-            _append_message(session, "system", question)
+        choice = select_question(
+                direct_ranked,
+                already_asked=session.asked_questions,
+                known_values=_all_cue_texts(session),
+            )
+        if choice is not None:
+            _ask(session, choice, trace, candidates)
         else:
-            _finish(session, STATUS_EXHAUSTED, ABSTENTION_MESSAGE)
+            session.final_evidence = [c.as_dict() for c in candidates]
+            session.final_confidence = overall_confidence(candidates)
+            _record_round(session, trace)
+            _finish(
+                session,
+                STATUS_EXHAUSTED,
+                ABSTENTION_MESSAGE,
+                reason=(
+                    "Memories were found, but none of them actually answers the question, and no "
+                    "remaining detail would separate them."
+                ),
+            )
         db.commit()
     except Exception:
         logger.exception("RecallSession %s: unexpected failure deciding round outcome", session.id)

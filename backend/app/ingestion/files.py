@@ -1,6 +1,7 @@
 import io
 import logging
 import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,22 @@ class UnsupportedFileError(ValueError):
 
 # MVP file support, per spec section 7. Anything else is rejected outright
 # rather than silently accepted-but-ignored.
+#
+# The audio entries carry BOTH the canonical IANA name and the spelling
+# libmagic actually emits, because they differ and libmagic is what this
+# module sniffs with: measured on this machine's libmagic, a PCM WAV comes
+# back as "audio/x-wav" (not "audio/wav") and an AAC/MP4 file as
+# "audio/x-m4a" (not "audio/mp4"). Keying only on the canonical names would
+# have rejected every real WAV upload. The canonical spellings are kept
+# alongside so a libmagic version that does report them keeps working.
+#
+# "video/webm" is here on purpose: a WebM file carrying only an Opus audio
+# track (exactly what a browser's MediaRecorder produces) is sniffed as
+# "video/webm", and there is no magic-level way to tell it from a WebM with
+# a video track. Accepting it is the only way "audio/webm" works at all;
+# the cost is that a genuine video file is stored and downloadable rather
+# than rejected. It is never transcribed either way -- see
+# TRANSCRIBABLE_AUDIO_MIMES in app/ingestion/pipeline.py.
 _ALLOWED_MIMES = {
     "application/pdf": "pdf",
     "text/plain": "text",
@@ -29,6 +46,16 @@ _ALLOWED_MIMES = {
     "image/jpeg": "image",
     "image/gif": "image",
     "image/webp": "image",
+    "audio/wav": "audio",
+    "audio/x-wav": "audio",
+    "audio/mpeg": "audio",
+    "audio/mp4": "audio",
+    "audio/x-m4a": "audio",
+    "audio/ogg": "audio",
+    "audio/flac": "audio",
+    "audio/x-flac": "audio",
+    "audio/webm": "audio",
+    "video/webm": "audio",
 }
 
 
@@ -64,6 +91,37 @@ def _validate_image(data: bytes) -> None:
         img.verify()
 
 
+def _validate_wav(data: bytes, filename: str) -> None:
+    """Reject a corrupt/truncated WAV the same way _validate_image()
+    rejects a corrupt image -- cleanly, at upload time, as a 400.
+
+    Only WAV gets a structural check, and deliberately so: `wave` is in
+    the standard library, while MP3/FLAC/OGG/M4A would each need a real
+    decoder, and adding an audio-decoding dependency to reject the rare
+    corrupt upload is not a trade worth making (a container we can't parse
+    here simply stays stored-but-untranscribed, which is the same outcome
+    the pipeline already degrades to).
+
+    The two-part check mirrors the truncated-PNG bug this module already
+    carries a comment about: `wave.open()` alone raises for a non-RIFF
+    file, a header-only file, or a mangled fmt chunk, but a WAV whose
+    *body* was cut off still opens happily and only reveals itself by
+    promising more audio in its header than the file actually contains --
+    verified directly against a truncated WAV, which opened fine and
+    reported 80016 frames with only 922 bytes of payload present. The
+    size comparison is arithmetic on the declared frame count rather than
+    a readframes() call, so a header claiming an absurd length can't make
+    this try to allocate it.
+    """
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            declared_bytes = w.getnframes() * w.getsampwidth() * w.getnchannels()
+    except (wave.Error, EOFError) as exc:
+        raise UnsupportedFileError(f"File claims to be a WAV but isn't: {filename}") from exc
+    if declared_bytes > len(data):
+        raise UnsupportedFileError(f"WAV file is truncated or corrupt: {filename}")
+
+
 def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> ProcessedFile:
     """Validate, persist, and best-effort extract text from an uploaded file.
 
@@ -96,6 +154,9 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
             # truncated image 500 instead of cleanly 400ing.
             raise UnsupportedFileError(f"File claims to be an image but isn't: {filename}") from exc
 
+    if kind == "audio" and mime in ("audio/wav", "audio/x-wav"):
+        _validate_wav(data, filename)
+
     dest_dir = settings.uploads_dir / str(memory_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_name = f"{uuid.uuid4().hex}_{Path(filename).name}"
@@ -119,9 +180,15 @@ def process_upload(filename: str, data: bytes, memory_id: uuid.UUID) -> Processe
             extraction_status = "ok"
         except UnicodeDecodeError:
             extraction_status = "failed"
-    elif kind == "image":
-        # No local vision/OCR model is wired in for the MVP -- documented
-        # limitation (spec section 7 explicitly allows this).
+    elif kind in ("image", "audio"):
+        # Nothing to extract *locally* for either: an image's caption and an
+        # audio file's transcript both come from the generation model, in the
+        # background, well after this function has returned (see
+        # _caption_one_image / _transcribe_one_audio in
+        # app/ingestion/pipeline.py). "unsupported" is the marker those
+        # passes look for, and the value that stays behind for good if the
+        # model can't handle the file -- the original is on disk and
+        # downloadable via GET /api/attachments/{id}/file either way.
         extraction_status = "unsupported"
 
     return ProcessedFile(

@@ -597,15 +597,30 @@ def test_a_structurer_link_to_a_unit_that_is_not_ready_is_not_projected(db):
 
 
 def test_entity_specificity_discounts_entities_that_appear_everywhere(db):
-    # df == total: the entity is in every memory, so sharing it says nothing.
-    assert entity_specificity(200, 200) == 0.0
     # One memory out of 200: sharing it is almost the whole story.
     assert entity_specificity(1, 200) > 0.95
+    # df == total on a large corpus: heavily discounted, but deliberately NOT
+    # zero. Plain IDF returns exactly 0 here, which on a SMALL corpus is the
+    # normal case rather than an edge case -- two memories that both mention
+    # the same person give df == total == 2, and a zero would mean the most
+    # informative connection in the store produces no edge at all. Entities
+    # that really are ubiquitous are excluded by the document-frequency
+    # ceiling (see _project_shared_entity_associations), not by collapsing
+    # their specificity to nothing.
+    assert 0.0 < entity_specificity(200, 200) < 0.2
+    # Monotonic: more common is always less specific.
+    assert entity_specificity(2, 100) > entity_specificity(20, 100) > entity_specificity(80, 100)
+    # The small-corpus case this smoothing exists for: two of two memories
+    # share the entity, and that still counts for something substantial.
+    assert entity_specificity(2, 2) > 0.5
     # A corpus of one (or an entity nobody links) has no frequency information
     # to discount by, so nothing is discounted.
     assert entity_specificity(1, 1) == 1.0
     assert entity_specificity(1, 0) == 1.0
     assert entity_specificity(0, 50) == 1.0
+    # df can exceed total transiently (a link row surviving a status flip);
+    # clamped rather than producing a negative or nonsensical value.
+    assert 0.0 < entity_specificity(5, 3) <= 1.0
 
 
 # --------------------------------------------------------------------------

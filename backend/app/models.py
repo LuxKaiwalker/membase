@@ -581,3 +581,127 @@ class UnitAssociation(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Episodic memory (see docs/ARCHITECTURE.md "Episodes")
+#
+# An episode is a collection of memories belonging to one experience, event, or
+# period -- a holiday, a semester, a meeting, a particular evening. It is the
+# unit people actually recall by ("that trip where..."), as distinct from the
+# `Capture` (one submission) and the `MemoryUnit` (one retrievable fact).
+#
+# Two things this schema is built to express honestly, because the proposal
+# requires both and they are easy to lose:
+#
+# **Uncertainty about dates and boundaries.** `started_on`/`ended_on` are
+# nullable and travel with a `date_precision` and a `boundary_confidence`. An
+# episode whose members carry no usable date has NULL dates and says so,
+# rather than being filed under whenever the memories happened to be typed.
+# Nothing here ever invents a date (see app/memory/temporal.py).
+#
+# **Overlap and multi-membership.** Membership is a separate table with no
+# uniqueness on `unit_id` alone, so one memory can belong to several episodes
+# (a conference talk belongs to both "the conference" and "the Berlin trip")
+# and two episodes can cover overlapping spans without contradiction.
+#
+# Like the graph, episodes are a rebuildable projection: `app/memory/episodes.py`
+# derives them deterministically from member dates and entity overlap, with no
+# LLM call, so they cost nothing per capture and can be regenerated after a
+# clustering change.
+
+
+class Episode(Base):
+    """One experience, event, or period that several memories belong to."""
+
+    __tablename__ = "episodes"
+    __table_args__ = (
+        CheckConstraint(
+            "boundary_confidence IN ('asserted', 'inferred', 'uncertain')",
+            name="ck_episodes_boundary_confidence",
+        ),
+        CheckConstraint("origin IN ('explicit', 'extracted', 'inferred')", name="ck_episodes_origin"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Deterministically composed from the episode's dominant entities and its
+    # date span ("Lake Bled, Markus - July 2023"). Not model-written: see
+    # app/memory/episodes.py for why a generated title was deliberately not
+    # worth an LLM call per episode.
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    # "derived" today. Reserved so a future model-written title can be
+    # distinguished from a composed one rather than silently replacing it.
+    title_source: Mapped[str] = mapped_column(Text, nullable=False, default="derived")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # NULL when no member memory carries a resolvable date. Never back-filled
+    # from created_at -- "I don't know when this was" and "this happened the
+    # day it was written down" are different claims.
+    started_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    ended_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # day | month | season | year | unknown -- the LOOSEST precision among
+    # members, since a span is only as precise as its vaguest endpoint.
+    date_precision: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    # asserted  -- every dated member's date came from the user directly
+    # inferred  -- derived from model-extracted event dates
+    # uncertain -- at least one member has no usable date at all, so the real
+    #              boundaries may extend beyond what is recorded here
+    boundary_confidence: Mapped[str] = mapped_column(Text, nullable=False, default="uncertain")
+
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default="inferred")
+    # {"seed_unit_id": str, "rule": str, ...} -- which memory started this
+    # episode and which clustering rule grouped it.
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    memberships: Mapped[list["EpisodeMembership"]] = relationship(
+        back_populates="episode", cascade="all, delete-orphan"
+    )
+
+
+class EpisodeMembership(Base):
+    """A memory belongs to an episode.
+
+    Deliberately NOT unique on `unit_id`: a memory can legitimately belong to
+    more than one episode, and forcing a single assignment would mean picking
+    one arbitrarily and discarding a real relationship.
+    """
+
+    __tablename__ = "episode_memberships"
+    __table_args__ = (
+        UniqueConstraint("episode_id", "unit_id", name="uq_episode_memberships_episode_unit"),
+        CheckConstraint(
+            "origin IN ('explicit', 'extracted', 'inferred')", name="ck_episode_memberships_origin"
+        ),
+        CheckConstraint(
+            "confidence IN ('certain', 'likely', 'uncertain')", name="ck_episode_memberships_confidence"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    unit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_units.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    origin: Mapped[str] = mapped_column(Text, nullable=False, default="inferred")
+    # How sure the grouping is: "certain" for memories the user submitted
+    # together, down to "uncertain" for an undated memory grouped purely on
+    # entity overlap.
+    confidence: Mapped[str] = mapped_column(Text, nullable=False, default="uncertain")
+    # {"rule": str, "shared_entity_ids": [...], "explanation": str} -- a
+    # deterministic, human-readable reason this memory is in this episode.
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    episode: Mapped[Episode] = relationship(back_populates="memberships")
+
+

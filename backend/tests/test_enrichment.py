@@ -65,6 +65,47 @@ async def test_structured_data_instruction_present_for_image_attachments():
     assert "relations" in _RETRIEVAL_AIDS_SYSTEM
 
 
+async def test_visual_concepts_extracted_from_an_image_caption():
+    """The product's headline demo ("that photo from the summer, there was
+    a lake and some mountains") depends on this field, which
+    app/memory/graph.py already projects as "object" entities but which
+    nothing used to write. It costs NO extra LLM call: the retrieval-aids
+    sub-call's prompt already carries the image caption."""
+    llm = FakeLLMProvider(enrichment_response={"visual_concepts": ["lake", "mountains", "snow"]})
+    semantic = await enrich_unit(
+        llm, "That hike last summer.", [],
+        "Image 1:\nA wide alpine lake with snow-capped mountains behind it.",
+    )
+    assert semantic["visual_concepts"] == ["lake", "mountains", "snow"]
+
+
+async def test_visual_concepts_empty_for_a_capture_with_no_image():
+    """Most memories have no image at all -- the field must stay [] rather
+    than being filled from the memory's prose, or every unit would start
+    emitting spurious "object" entities into the association graph."""
+    llm = FakeLLMProvider(enrichment_response={"topics": ["rent"]})
+    semantic = await enrich_unit(llm, "My rent went up to 1400.", [], "")
+    assert semantic["visual_concepts"] == []
+
+
+async def test_visual_concepts_instruction_and_schema_present():
+    """Both halves have to be there: the schema field alone gets an
+    unguided list, and the instruction alone gets a field the model is
+    not allowed to return."""
+    from app.ingestion.enrichment import _RETRIEVAL_AIDS_SCHEMA, _RETRIEVAL_AIDS_SYSTEM
+
+    assert "visual_concepts" in _RETRIEVAL_AIDS_SCHEMA["properties"]
+    assert "visual_concepts" in _RETRIEVAL_AIDS_SCHEMA["required"]
+    assert "visual_concepts" in _RETRIEVAL_AIDS_SYSTEM
+    assert "VISIBLE" in _RETRIEVAL_AIDS_SYSTEM
+
+
+async def test_visual_concepts_literal_null_strings_filtered():
+    llm = FakeLLMProvider(enrichment_response={"visual_concepts": ["null", "lake", "none"]})
+    semantic = await enrich_unit(llm, "A photo.", [], "Image 1:\nA lake.")
+    assert semantic["visual_concepts"] == ["lake"]
+
+
 class _PromptCapturingLLM(LLMProvider):
     def __init__(self, response: dict) -> None:
         self._response = response

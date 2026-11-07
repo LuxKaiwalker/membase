@@ -90,6 +90,16 @@ class Semantics(TypedDict):
     topics: list[str]
     definitions: list[Definition]
     relations: list[Relation]
+    # Concrete things *visible* in an attached image ("lake", "mountains",
+    # "whiteboard") -- the field app/memory/graph.py projects as "object"
+    # entities, which is what makes "that photo with a lake and mountains
+    # behind it" retrievable through the picture's contents rather than its
+    # filename. Populated with NO extra LLM call: the retrieval-aids
+    # enrichment sub-call (and the structurer's unified pass) already sees
+    # the attachment text, which for an image is the caption _describe_image
+    # produced -- so this is extracted from a prompt that was being sent
+    # anyway. Empty for any memory with no image.
+    visual_concepts: list[str]
     event_date: str
     enrichment_status: str  # "ok" | "unavailable", not part of the LLM schema
 
@@ -181,6 +191,7 @@ def _parse_semantics(raw: dict) -> Semantics:
         topics=_as_str_list(raw.get("topics")),
         definitions=_as_definitions(raw.get("definitions")),
         relations=_as_relations(raw.get("relations")),
+        visual_concepts=_as_str_list(raw.get("visual_concepts")),
         enrichment_status="ok",
     )
 
@@ -188,7 +199,7 @@ def _parse_semantics(raw: dict) -> Semantics:
 def empty_semantics(status: str = "unavailable") -> Semantics:
     return Semantics(
         meaning="", aliases=[], people=[], organizations=[], locations=[],
-        topics=[], definitions=[], relations=[], event_date="",
+        topics=[], definitions=[], relations=[], visual_concepts=[], event_date="",
         enrichment_status=status,
     )
 
@@ -262,7 +273,15 @@ def build_retrieval_text(authoritative_content: str, clarifications: list[dict],
         rels = "\n".join(f"{r['subject']} {r['predicate']} {r['object']}" for r in semantic["relations"])
         parts.append(f"Relations:\n{rels}")
 
-    for label, key in (("People", "people"), ("Organizations", "organizations"), ("Locations", "locations"), ("Topics", "topics")):
+    # "Visible in image" rides the same `label: a, b, c` loop as the other
+    # list fields so an image's contents are embedded AND full-text indexed
+    # exactly like its people/topics are -- without this line the concepts
+    # would only ever reach the association graph, and a plain semantic
+    # search for "lake and mountains" would still miss the photo.
+    for label, key in (
+        ("People", "people"), ("Organizations", "organizations"), ("Locations", "locations"),
+        ("Topics", "topics"), ("Visible in image", "visual_concepts"),
+    ):
         values = semantic.get(key)
         if values:
             parts.append(f"{label}: " + ", ".join(values))
