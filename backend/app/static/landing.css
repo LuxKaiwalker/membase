@@ -126,6 +126,14 @@ a:focus-visible, button:focus-visible, input:focus-visible {
   line-height: 1.6;
 }
 
+/* Second and later hero paragraphs: .bio itself stays margin-less so a
+   single-paragraph hero keeps its exact spacing against .hero-panel's
+   own padding. */
+.bio + .bio {
+  margin-top: 0.9rem;
+  font-size: 1rem;
+}
+
 .content-section {
   padding: 2.25rem 0 0.5rem;
 }
@@ -189,6 +197,60 @@ a:focus-visible, button:focus-visible, input:focus-visible {
   max-width: 46rem;
   color: var(--muted);
   font-size: 0.95rem;
+}
+
+/* The benchmark table. Wide for a 880px column, so it scrolls inside its
+   own wrapper rather than making the page scroll sideways on a phone. */
+.table-scroll {
+  margin: 0 0 1.25rem;
+  overflow-x: auto;
+}
+
+.results-table {
+  width: 100%;
+  min-width: 34rem;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.results-table th,
+.results-table td {
+  padding: 0.6rem 0.75rem 0.6rem 0;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  font-weight: 400;
+}
+
+.results-table thead th {
+  color: var(--label);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-bottom-color: var(--line-strong);
+}
+
+.results-table th[scope="row"] {
+  text-align: left;
+  color: var(--fg);
+  padding-right: 1.5rem;
+}
+
+.results-table tbody tr:last-child th,
+.results-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.results-table .is-highlight th[scope="row"] { font-weight: 500; }
+
+.results-table strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
 }
 
 .signin-section .signin-form {
