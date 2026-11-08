@@ -33,6 +33,13 @@ Usage (from the repo root, inside `nix develop`):
 
     python3 scripts/seed_demo.py --dry-run     # show what would be stored
     python3 scripts/seed_demo.py               # seed it
+    python3 scripts/seed_demo.py --resume      # continue an interrupted seed
+
+`--resume` matters more than it sounds: this is 30-60 minutes of real model
+time, so an interruption near the end must not mean starting over, and a
+plain rerun must not mean sixteen duplicate memories. With it, a memory
+already stored is skipped, and one stored but left mid-processing is
+finished.
 
 Ingestion runs the real pipeline against the real local model, so this takes a
 while: roughly 20-25s of model time per memory (see docs/DECISIONS.md
@@ -257,9 +264,27 @@ def _database_name(db) -> str:
     return db.execute(text("SELECT current_database()")).scalar_one()
 
 
-async def _seed(db, llm, *, uploads: Path) -> None:
+async def _seed(llm, *, uploads: Path, resume: bool) -> None:
+    """Create and fully process each demo memory in turn.
+
+    A SHORT-LIVED session per capture, closed before the processing call,
+    rather than one session held across the whole run. The long version
+    deadlocked itself in practice: create_capture() commits and then
+    returns, but a session kept alive afterwards can hold an open read
+    transaction, and process_capture_fully() then runs for minutes
+    (segmentation, analysis, enrichment, embedding, the structurer, plus
+    a vision call per image). app/db.py sets
+    idle_in_transaction_session_timeout=180000 on every connection, so
+    Postgres terminated this script's connection mid-seed and the next
+    capture's flush died with IdleInTransactionSessionTimeout -- after
+    minutes of model time had already been spent. The API never hits
+    this because its sessions are request-scoped and closed by the
+    get_db() dependency; a long-running script has to be explicit about
+    it. See docs/DECISIONS.md "One LLM call per open transaction".
+    """
     total = len(DEMO_MEMORIES)
     started = time.monotonic()
+    failed = 0
     for index, entry in enumerate(DEMO_MEMORIES, start=1):
         files = []
         for name in entry.get("images", []):
@@ -267,11 +292,49 @@ async def _seed(db, llm, *, uploads: Path) -> None:
             files.append((name, data))
         label = entry["text"][:58].replace("\n", " ")
         print(f"[{index}/{total}] {label}...", flush=True)
-        capture = await create_capture(db, text=entry["text"], uploads=files)
-        await process_capture_fully(capture.id, llm=llm)
-        db.expire_all()
+        db = get_sessionmaker()()
+        try:
+            # Resume support. This script is 30-60 minutes of real model
+            # time, so losing all of it to one failure near the end --
+            # or re-running it and getting sixteen duplicate memories --
+            # are both unacceptable. An entry already stored is matched
+            # on its exact raw_text (these are fixed literals in this
+            # file, so exact match is sound here in a way it would not
+            # be for user input) and is either skipped, or re-processed
+            # if its processing never completed.
+            existing = None
+            if resume:
+                existing = db.execute(
+                    select(Capture).where(Capture.raw_text == entry["text"])
+                ).scalars().first()
+            if existing is not None:
+                if existing.processing_status == "done":
+                    print("      already stored and processed -- skipping", flush=True)
+                    continue
+                capture_id = existing.id
+                print(
+                    f"      already stored ({existing.processing_status}) -- processing it",
+                    flush=True,
+                )
+            else:
+                capture = await create_capture(db, text=entry["text"], uploads=files)
+                capture_id = capture.id
+        finally:
+            db.close()
+        try:
+            await process_capture_fully(capture_id, llm=llm)
+        except Exception as exc:  # noqa: BLE001
+            # One memory failing must not cost the other fifteen: the
+            # capture is durably stored either way (create_capture
+            # committed above) and its processing_status is left
+            # retryable, so a rerun of this script's processing step can
+            # pick it up.
+            print(f"      FAILED processing {capture_id}: {exc}", flush=True)
+            failed += 1
     elapsed = time.monotonic() - started
-    print(f"\nSeeded {total} memories in {elapsed / 60:.1f} min.")
+    print(f"\nSeeded {total - failed}/{total} memories in {elapsed / 60:.1f} min.")
+    if failed:
+        print(f"{failed} capture(s) stored but not fully processed -- see the errors above.")
 
 
 def _report(db) -> None:
@@ -301,6 +364,11 @@ def main() -> int:
         "--allow-prod",
         action="store_true",
         help="permit seeding the protected production database (see CLAUDE.md footgun #10)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip memories already stored, and finish processing any left incomplete",
     )
     parser.add_argument(
         "--images-dir",
@@ -338,8 +406,13 @@ def main() -> int:
         print(f"Generated {len(IMAGES)} synthetic images in {uploads}")
 
         llm = get_llm_provider()
-        asyncio.run(_seed(db, llm, uploads=uploads))
-        db.expire_all()
+        # This session is only for the guard above and the report below;
+        # _seed opens (and closes) one of its own per capture. Closed
+        # here so it cannot sit idle-in-transaction for the duration of
+        # the run -- see _seed's docstring.
+        db.close()
+        asyncio.run(_seed(llm, uploads=uploads, resume=args.resume))
+        db = get_sessionmaker()()
         _report(db)
         return 0
     finally:

@@ -630,6 +630,15 @@ async def _caption_one_image(db: Session, llm: LLMProvider, attachment: Attachme
     """
     try:
         data = (get_settings().uploads_dir / attachment.stored_path).read_bytes()
+        # _caption_and_extract_image makes TWO generation calls (the
+        # caption, then the structured-data extraction), and loading
+        # this attachment opened a read transaction. Ending it here
+        # keeps to app/db.py's "at most one LLM call per open
+        # transaction" assumption -- with a vision call at tens of
+        # seconds each, two inside one transaction is already a third of
+        # the 180s budget. See docs/DECISIONS.md "One LLM call per open
+        # transaction".
+        db.commit()
         description = await _caption_and_extract_image(llm, data)
         if not description:
             return
@@ -975,6 +984,18 @@ async def _finalize_structuring(db: Session, llm: LLMProvider, unit: MemoryUnit,
             candidate_scored = []
         candidates = [(str(s.unit.id), s.unit.retrieval_text[:300]) for s in candidate_scored if s.unit.id != unit.id]
 
+        # End the read transaction hybrid_search's SELECTs opened before
+        # the structurer's own generation call. Otherwise one transaction
+        # spans the query embedding AND the structuring call(s) -- the
+        # same violation of app/db.py's "at most one LLM call per open
+        # transaction" assumption that cost a seed run three memories in
+        # process_capture_fully (see docs/DECISIONS.md "One LLM call per
+        # open transaction"). Nothing is pending: the lease was committed
+        # by _claim_structuring above, `candidates` is already
+        # materialized into plain strings, and the session is
+        # expire_on_commit=False so `unit`'s attributes survive this.
+        db.commit()
+
         result = await structurer.structure_unit(llm, unit.authoritative_content, unit.clarifications, attachment_text, candidates)
         if result.semantic.get("enrichment_status") == "unavailable":
             _commit_structuring_if_token_matches(db, unit.id, token, {"structure_status": "failed"})
@@ -1281,6 +1302,30 @@ async def process_capture_fully(
 
             attachment_text = _attachment_text_for_analysis(capture)
             prior_context = _find_related_context(db, capture.raw_text)
+
+            # End the read transaction those two lines opened before any
+            # of the generation calls below. app/db.py sets
+            # idle_in_transaction_session_timeout=180000 on every
+            # connection, on the stated assumption that this pipeline
+            # makes "at most one LLM call per open transaction" -- and
+            # everything above holds to that (each of
+            # _caption_one_image / _transcribe_one_audio /
+            # _index_attachment_chunks commits its own work), but this
+            # stretch did not: segmentation plus one analysis call per
+            # proposed unit all ran inside the transaction opened by the
+            # reads above, with the first commit only after db.add_all()
+            # below. Postgres then killed the connection mid-pipeline,
+            # which surfaced as an IdleInTransactionSessionTimeout out of
+            # the commit at the end of a capture that had already cost
+            # minutes of model time. Hit for real seeding a corpus of
+            # image-bearing captures (scripts/seed_demo.py): a vision
+            # caption makes attachment_text long, which makes every
+            # analysis prompt slower, which is exactly when the sum
+            # crosses 180s. Nothing between here and db.add_all() writes,
+            # so there is nothing to lose by committing now -- and the
+            # work already done (captions, transcripts, chunks) stays
+            # durable either way.
+            db.commit()
 
             proposed_contents = await segment_capture(llm, capture.raw_text)
             analyses: list[UnitAnalysis] = []
