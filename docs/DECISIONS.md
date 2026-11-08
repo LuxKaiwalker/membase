@@ -2915,6 +2915,15 @@ call. This is the part of the system most worth showing and the part
 that most needs protecting from anonymous traffic; replay is how both
 are true at once.
 
+**The landing page has to say so.** Making the app public changes
+nothing a visitor can see if the only route off the landing page is a
+sign-in form, which is what it was: credentials are provisioned by hand,
+not self-service, so the single call to action was the one thing most
+visitors could not do. The hero now leads with "Explore the demo", every
+section named under "Inside the app" links straight into its page, and
+the sign-in section says what signing in actually adds rather than
+standing as the only way in.
+
 **Write affordances are disabled, not removed.** The Library's
 clarification form, discard, retry-structuring and delete buttons stay
 visible and explain why they are off. Removing them would hide half of

@@ -14,6 +14,7 @@
       <a href="#how-it-works">How it works</a>
       <a href="#results">Results</a>
       <a href="https://github.com/LuxKaiwalker/membase" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <a href="/app/">Demo</a>
       <a href="#signin">Sign in</a>
     </nav>
   </header>
@@ -32,6 +33,24 @@
         retrieves by association and iteration rather than by matching
         alone — so a memory can be reached through what surrounds it, not
         only through what it says.
+      </p>
+      {#-
+        The way in. Before this existed the only route off this page was
+        the sign-in form at the bottom, so a visitor had no way to learn
+        the app is browsable without an account -- see docs/DECISIONS.md
+        "Public demo as a static snapshot".
+      -#}
+      <div class="hero-actions">
+        <a class="cta cta-primary" href="/app/">Explore the demo</a>
+        <a class="cta" href="#signin">Sign in</a>
+      </div>
+      <p class="muted small hero-note">
+        No account needed. The demo is a published snapshot of a
+        <strong>synthetic</strong> store — 16 memories, their entity graph,
+        their episodes, and four recorded recall sessions you can replay
+        with the evidence and reasoning intact. Nothing in it is a real
+        memory of a real person. Storing something, and running a new
+        recall against a live store, need a sign-in.
       </p>
     </section>
 
@@ -262,42 +281,47 @@
 
     <section id="app" class="content-section">
       <h2>Inside the app</h2>
+      <p>
+        Every section below is open in the demo, reading the published
+        snapshot of the synthetic store. Store is the exception: it exists
+        only to write, so it asks you to sign in.
+      </p>
       <ul class="feature-list">
         <li>
-          <span class="feature-title">Store</span>
+          <span class="feature-title"><a href="/app/store/">Store</a></span>
           <p>Write a memory, attach documents or images, answer a
           clarifying question if one is raised.</p>
         </li>
         <li>
-          <span class="feature-title">Recall</span>
+          <span class="feature-title"><a href="/app/recall/">Recall</a></span>
           <p>Start from whatever you remember. Candidate memories with the
           evidence for and against each, matching passages from attached
           documents, the cues you have given, and the guesses the system
           made while searching.</p>
         </li>
         <li>
-          <span class="feature-title">Explorer</span>
+          <span class="feature-title"><a href="/app/explorer/">Explorer</a></span>
           <p>The entity and association graph, with an inspector showing
           where each link came from.</p>
         </li>
         <li>
-          <span class="feature-title">Timeline</span>
+          <span class="feature-title"><a href="/app/timeline/">Timeline</a></span>
           <p>Episodes in chronological order, with undated memories kept
           visibly undated.</p>
         </li>
         <li>
-          <span class="feature-title">Library</span>
+          <span class="feature-title"><a href="/app/library/">Library</a></span>
           <p>Everything you've stored: review, correct, resolve
           clarifications, delete.</p>
         </li>
         <li>
-          <span class="feature-title">Evaluation</span>
+          <span class="feature-title"><a href="/app/evaluation/">Evaluation</a></span>
           <p>The benchmark above, read from a published results file. The
           one section with no backend behind it — it's meant to be a
           readable report, not something behind a login.</p>
         </li>
         <li>
-          <span class="feature-title">Overview</span>
+          <span class="feature-title"><a href="/app/">Overview</a></span>
           <p>The state of your memory: what's stored, what's waiting on
           you, what's still processing.</p>
         </li>
@@ -306,6 +330,13 @@
 
     <section id="signin" class="content-section signin-section">
       <h2>Sign in</h2>
+      <p>
+        Signing in points the same app at a live backend and your own
+        store: storing memories, answering clarifications, correcting and
+        deleting them, and running new recall rounds against the model.
+        Everything else is already open — <a href="/app/">browse the
+        demo</a> without one.
+      </p>
       <form id="landing-login-form" class="signin-form">
         <label>
           Username

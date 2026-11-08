@@ -134,6 +134,63 @@ a:focus-visible, button:focus-visible, input:focus-visible {
   font-size: 1rem;
 }
 
+/* Entry points out of the hero. The primary one goes to the public
+   demo; sign-in is deliberately the quieter of the two, because it is
+   the path most visitors cannot take (credentials are provisioned, not
+   self-service). Same flat, border-led vocabulary as .signin-form
+   button -- no new colour, no fill. */
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.75rem;
+}
+
+.cta {
+  padding: 0.6rem 1.5rem;
+  border: 1px solid var(--line-strong);
+  color: var(--fg);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.cta:hover,
+.cta:focus-visible {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+.cta-primary {
+  background: var(--fg);
+  color: var(--bg);
+}
+
+.cta-primary:hover,
+.cta-primary:focus-visible {
+  background: transparent;
+  color: var(--fg);
+}
+
+.hero-note {
+  margin-top: 1.25rem;
+  max-width: 38rem;
+}
+
+/* Section names in "Inside the app" link straight into the demo. */
+.feature-title a {
+  color: inherit;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 0.2em;
+}
+
+.feature-title a:hover,
+.feature-title a:focus-visible {
+  text-decoration-color: currentColor;
+}
+
 .content-section {
   padding: 2.25rem 0 0.5rem;
 }
