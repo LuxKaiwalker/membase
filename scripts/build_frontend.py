@@ -60,6 +60,13 @@ TEMPLATES_DIR = REPO_ROOT / "backend" / "app" / "templates"
 STATIC_DIR = REPO_ROOT / "backend" / "app" / "static"
 DIST_DIR = REPO_ROOT / "dist"
 BENCHMARK_RESULTS = REPO_ROOT / "eval" / "strategy_benchmark_results.json"
+# The published snapshot of the synthetic demo store, which is what the
+# app reads when nobody is signed in (see app/static/core.js's
+# "public (snapshot) mode" and scripts/export_demo.py). Committed to the
+# repo rather than generated during the build: the Pages workflow has no
+# database, no model and no GPU, so it cannot regenerate this -- it can
+# only copy it. Re-export and commit it when the demo corpus changes.
+PUBLIC_DEMO_DIR = REPO_ROOT / "public-demo"
 
 # template name -> output path (relative to DIST_DIR). The route registry:
 # a new app section needs an entry here, an entry in base.html's own
@@ -102,6 +109,20 @@ def main() -> None:
         print(f"copied {BENCHMARK_RESULTS} -> dist/static/evaluation-results.json")
     else:
         print(f"no {BENCHMARK_RESULTS} -- skipping (Evaluation page shows its empty state)")
+
+    # Published at /demo/, which is the one path app/static/core.js's
+    # SNAPSHOT_BASE points at. Optional in the same way and for the same
+    # reason as the benchmark results above: a build on a machine that
+    # has never seeded the demo store must still produce a working site
+    # (a signed-in user never reads these files at all), and a logged-out
+    # visitor gets core.js's explicit "not part of the public snapshot"
+    # message rather than a blank page.
+    if PUBLIC_DEMO_DIR.is_dir():
+        shutil.copytree(PUBLIC_DEMO_DIR, DIST_DIR / "demo")
+        files = sum(1 for _ in (DIST_DIR / "demo").rglob("*") if _.is_file())
+        print(f"copied {PUBLIC_DEMO_DIR} -> dist/demo ({files} files)")
+    else:
+        print(f"no {PUBLIC_DEMO_DIR} -- skipping (the public demo will be unavailable)")
 
     (DIST_DIR / ".nojekyll").touch()
 

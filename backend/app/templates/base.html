@@ -25,6 +25,15 @@
   credential overlay is not shown over it. Evaluation is the one such section:
   it reads a static results file published alongside the site and is meant to
   be a readable report, not something behind a login wall.
+
+  `requires_signin: true` marks a section that cannot work from the published
+  snapshot at all, so a visitor with no credentials gets the login overlay
+  rather than a page that looks functional and fails on submit. Store is the
+  one such section: it exists purely to write, and the public demo is a
+  directory of files (see docs/DECISIONS.md "Public demo as a static
+  snapshot"). Every other section browses, which the snapshot serves -- Recall
+  included, where public mode replays recorded sessions instead of running
+  new ones.
 -#}
 {%- set sections = [
   {"key": "overview",   "url": "/app/",            "label": "Overview",   "script": "overview",   "init": "initOverviewPage",   "stylesheet": true},
@@ -33,7 +42,7 @@
   {"key": "timeline",   "url": "/app/timeline/",   "label": "Timeline",   "script": "timeline",   "init": "initTimelinePage",   "stylesheet": true},
   {"key": "library",    "url": "/app/library/",    "label": "Library",    "script": "library",    "init": "initLibraryPage"},
   {"key": "evaluation", "url": "/app/evaluation/", "label": "Evaluation", "script": "evaluation", "init": "initEvaluationPage", "stylesheet": true, "needs_backend": false},
-  {"key": "store",      "url": "/app/store/",      "label": "Store",      "script": "store",      "init": "initStorePage"},
+  {"key": "store",      "url": "/app/store/",      "label": "Store",      "script": "store",      "init": "initStorePage", "requires_signin": true},
 ] -%}
 {%- set active_key = nav_active | default("", true) -%}
 {%- set current = sections | selectattr("key", "equalto", active_key) | list | first -%}
@@ -58,7 +67,7 @@
   {%- endif %}
   {% block extra_head %}{% endblock %}
 </head>
-<body{% if current and current.get("needs_backend") is false %} data-requires-backend="false"{% endif %}>
+<body{% if current and current.get("needs_backend") is false %} data-requires-backend="false"{% endif %}{% if current and current.get("requires_signin") %} data-requires-signin="true"{% endif %}>
   <header class="app-header">
     <a href="/" class="brand">membase</a>
     <nav class="app-nav" aria-label="Sections">

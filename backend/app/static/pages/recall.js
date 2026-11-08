@@ -43,6 +43,8 @@
     formatElapsed,
     describeError,
     buildAttachmentList,
+    isPublicMode,
+    SNAPSHOT_BASE,
   } = window.membase;
 
   // ------------------------------------------------------------------
@@ -1048,6 +1050,97 @@
 
     cancelButton.addEventListener("click", cancelSession);
     newButton.addEventListener("click", resetSession);
+
+    // ----------------------------------------------------------------
+    // Public mode: recorded recalls, replayed read-only
+    // ----------------------------------------------------------------
+    //
+    // A recall round costs tens of seconds of GPU time on one 11GB card
+    // (see CLAUDE.md), serialized, so running one is the single thing on
+    // this site that anonymous traffic must not be able to trigger. The
+    // reasoning itself is still worth showing -- arguably it is the most
+    // interesting thing here -- and a RecallSession is a persisted row,
+    // so sessions recorded against the synthetic demo store are exported
+    // with the rest of the snapshot and rendered here by exactly the same
+    // render() the live page uses. Same evidence, same confidence
+    // categories, same deterministic trail; no model call.
+    if (!isPublicMode()) return;
+
+    queryInput.disabled = true;
+    queryInput.placeholder = "Running a new recall needs a live backend — sign in to use one.";
+    submitButton.disabled = true;
+    hide(cancelButton);
+
+    const picker = document.createElement("div");
+    picker.className = "card recall-replays";
+    picker.innerHTML =
+      '<p class="eyebrow">Recorded recalls</p>' +
+      '<p class="muted">These ran for real against the synthetic demo store. Pick one to see what it ' +
+      "searched, what it found, how sure it was, and where it asked a question instead of guessing.</p>" +
+      '<div class="row recall-replay-buttons"></div>' +
+      '<div id="replay-status" class="status hidden"></div>';
+    askForm.parentNode.insertBefore(picker, askForm.nextSibling);
+    const buttonsEl = picker.querySelector(".recall-replay-buttons");
+    const replayStatus = picker.querySelector("#replay-status");
+
+    async function replay(sessionId, button) {
+      const gen = ++generation;
+      for (const other of buttonsEl.querySelectorAll("button")) other.disabled = true;
+      showStatus(replayStatus, "Loading the recorded session...");
+      try {
+        const resp = await fetchWithTimeout(`/api/recall/sessions/${sessionId}`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.detail || `Failed to load (${resp.status})`);
+        if (gen !== generation) return;
+        hide(replayStatus);
+        session = data;
+        trailEl.open = false;
+        render();
+        // render() reinstates the live affordances from the session's own
+        // status; a replay is a recording, so they go back off here. The
+        // question a session asked still shows (it is part of what
+        // happened), just not an input to answer it with.
+        hide(replyBlock);
+        hide(cancelButton);
+        hide(newButton);
+        submitButton.disabled = true;
+        submitButton.textContent = "Start recalling";
+        sessionEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (err) {
+        showStatus(replayStatus, err.message, true);
+      } finally {
+        for (const other of buttonsEl.querySelectorAll("button")) other.disabled = false;
+        if (button) button.setAttribute("aria-pressed", "true");
+      }
+    }
+
+    fetch(`${SNAPSHOT_BASE}/manifest.json`)
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((manifest) => {
+        const sessions = (manifest && manifest.recall_sessions) || [];
+        if (!sessions.length) {
+          buttonsEl.innerHTML =
+            '<p class="muted">This snapshot has no recorded recalls in it.</p>';
+          return;
+        }
+        for (const summary of sessions) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn btn-secondary recall-replay";
+          // The query itself is the only label that tells you what you
+          // are about to look at; status is the second most useful thing
+          // (an answered recall and one that stopped to ask a question
+          // are the two cases worth comparing).
+          button.textContent = summary.query;
+          button.title = `${summary.status} · ${summary.rounds} round${summary.rounds === 1 ? "" : "s"}`;
+          button.addEventListener("click", () => replay(summary.id, button));
+          buttonsEl.appendChild(button);
+        }
+      })
+      .catch(() => {
+        buttonsEl.innerHTML =
+          '<p class="muted">Could not load the list of recorded recalls.</p>';
+      });
   }
 
   window.membase.initRecallPage = initRecallPage;

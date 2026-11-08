@@ -27,7 +27,8 @@
 (function () {
   "use strict";
 
-  const { escapeHtml, fetchWithTimeout, describeError, showStatus, hide, show } = window.membase;
+  const { escapeHtml, fetchWithTimeout, describeError, showStatus, hide, show, isPublicMode } =
+    window.membase;
 
   const CANVAS_SRC = "/static/graph-canvas.js";
   const MAX_NODES = 400;
@@ -196,6 +197,26 @@
     }
 
     function buildFilters() {
+      // The public snapshot cannot serve these honestly. The server
+      // applies kind filters BEFORE the max_nodes cap, so filtering an
+      // already-capped snapshot in the browser would show a different
+      // graph than the live API returns for the same filter -- quietly,
+      // with nothing on screen to say so. Hiding the controls and saying
+      // why is the honest option; approximating them is not. The hop
+      // selector and centring still work, because the exporter writes a
+      // file per (hops, centre) pair (scripts/export_demo.py).
+      if (isPublicMode()) {
+        entityChipsEl.innerHTML = "";
+        assocChipsEl.innerHTML = "";
+        entityKindsNote.textContent =
+          "Kind filters need a live backend: the server applies them before capping the graph, " +
+          "so filtering the published snapshot here would show you something the real API would not. " +
+          "This is the full default graph.";
+        // Both sets stay empty on purpose -- query() only sends the
+        // entity_kinds/association_kinds parameters when they are
+        // non-empty, and the snapshot only has the unfiltered URLs.
+        return;
+      }
       const byKind = (state.stats && state.stats.entities_by_kind) || {};
       const entityAvailable = Object.keys(byKind)
         .sort((a, b) => byKind[b] - byKind[a])
@@ -476,6 +497,36 @@
 
     /* -- search ----------------------------------------------------------- */
 
+    // Entity search against the published snapshot. The live endpoint
+    // takes an arbitrary `q`, which a fixed set of files obviously
+    // cannot enumerate, so the exporter writes the whole entity list
+    // once (ordered exactly as the API orders it: mention_count desc,
+    // then display_name) and the match happens here.
+    //
+    // One deliberate difference, not a bug to be fixed silently: the
+    // backend normalizes `q` through app/memory/entities.py's
+    // normalize_name() before matching, which also strips possessives
+    // and collapses punctuation. Reimplementing that in JS would create
+    // a second copy of entity normalization -- the exact kind of
+    // duplicate rule that drifts -- so this does a plain
+    // case-insensitive substring match over both the display and
+    // normalized names instead. For ordinary words the two agree; for
+    // "Nadia's" the live backend still finds "Nadia" and this does not.
+    let snapshotEntities = null;
+    async function searchSnapshot(term) {
+      if (snapshotEntities === null) {
+        snapshotEntities = await getJSON("/api/graph/entities?limit=500");
+      }
+      const needle = term.toLowerCase();
+      return snapshotEntities
+        .filter(
+          (e) =>
+            (e.display_name || "").toLowerCase().includes(needle) ||
+            (e.normalized_name || "").toLowerCase().includes(needle)
+        )
+        .slice(0, SEARCH_LIMIT);
+    }
+
     searchForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const term = searchInput.value.trim();
@@ -483,9 +534,11 @@
       searchResults.innerHTML = '<li class="muted">Searching…</li>';
       show(searchResults);
       try {
-        const entities = await getJSON(
-          `/api/graph/entities?q=${encodeURIComponent(term)}&limit=${SEARCH_LIMIT}`
-        );
+        const entities = isPublicMode()
+          ? await searchSnapshot(term)
+          : await getJSON(
+              `/api/graph/entities?q=${encodeURIComponent(term)}&limit=${SEARCH_LIMIT}`
+            );
         if (!entities.length) {
           searchResults.innerHTML = `<li class="muted">Nothing matching “${escapeHtml(term)}”.</li>`;
           return;

@@ -92,6 +92,37 @@
   }
   const CREDENTIALS_KEY = "membase.basicAuth";
 
+  // --- public (snapshot) mode ------------------------------------------
+  //
+  // With no stored credentials the app does not talk to a backend at
+  // all. It reads a static export of the SYNTHETIC demonstration store
+  // (scripts/seed_demo.py -> scripts/export_demo.py), published next to
+  // these pages. Signing in switches every request back to the real
+  // backend above, unchanged.
+  //
+  // Why a snapshot rather than an unauthenticated read-only backend:
+  // the live backend is loopback-only and reachable from the internet
+  // through exactly one nginx location that checks Basic Auth before it
+  // proxies, so a public read surface would mean a second process and a
+  // new unauthenticated route into this machine -- and it would only be
+  // up while the machine is. A directory of files cannot be written to,
+  // cannot reach the GPU, and does not go down. See
+  // docs/DECISIONS.md "Public demo as a static snapshot".
+  const SNAPSHOT_BASE_DEFAULT = "/demo";
+  // Same escape hatch as BACKEND_URL_KEY above, for serving a freshly
+  // exported snapshot from somewhere else while testing.
+  const SNAPSHOT_BASE_KEY = "membase.snapshotBase";
+  let SNAPSHOT_BASE = SNAPSHOT_BASE_DEFAULT;
+  try {
+    const override = window.localStorage.getItem(SNAPSHOT_BASE_KEY);
+    if (override) {
+      SNAPSHOT_BASE = override.replace(/\/+$/, "");
+      console.info(`membase: using snapshot override ${SNAPSHOT_BASE}`);
+    }
+  } catch {
+    // localStorage unavailable: keep the default.
+  }
+
   function getCredentials() {
     try {
       return localStorage.getItem(CREDENTIALS_KEY);
@@ -115,6 +146,120 @@
       // Nothing to do -- if localStorage is unavailable, there was
       // nothing persisted to clear either.
     }
+  }
+
+  // Public mode is simply "no credentials in this browser". Computed per
+  // call rather than captured once: logging out does not reload the page
+  // (there is no server-side session to end), so a request issued after
+  // the logout button must already resolve against the snapshot.
+  function isPublicMode() {
+    return !getCredentials();
+  }
+
+  // Mirror of scripts/export_demo.py's snapshot_path(). These two MUST
+  // agree character-for-character -- the browser asking for a filename
+  // the exporter never wrote is the one way this whole mechanism breaks,
+  // which is why the rule is kept small enough to hold in your head:
+  //
+  //   sort the query parameters, join them with "&", replace every
+  //   character outside [A-Za-z0-9._-] with "_", append ".json"
+  //
+  // with one exception: an attachment's bytes are exported verbatim
+  // under their own API path, because they are not JSON and the <img>/
+  // download call sites hand them straight to the browser.
+  function snapshotKey(path) {
+    const [bare, query] = path.split("?");
+    const rel = bare.replace(/^\/api\//, "").replace(/^\/+|\/+$/g, "");
+    if (!query) {
+      if (/\/file$/.test(rel)) return `api/${rel}`;
+      return `api/${rel}.json`;
+    }
+    const canonical = query.split("&").sort().join("&");
+    return `api/${rel}~${canonical.replace(/[^A-Za-z0-9._-]/g, "_")}.json`;
+  }
+
+  // A Response built here rather than returned from the network, so
+  // every existing call site -- which all expect a fetch() Response and
+  // read .ok/.status/.json() off it -- needs no change at all.
+  function syntheticResponse(status, body) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  async function snapshotFetch(path, options) {
+    const method = (options.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") {
+      // Refused here, before any network call. The snapshot is a
+      // directory of files; there is nothing to write to even if this
+      // were sent. Pages still surface this as an ordinary API error
+      // message, and the login overlay appears so the action is one
+      // click from being possible.
+      showLoginOverlay();
+      return syntheticResponse(403, {
+        detail:
+          "This is the public demo: it reads a published snapshot of a synthetic store, " +
+          "so it cannot store, change or recall anything. Sign in to use a live store.",
+      });
+    }
+    const url = `${SNAPSHOT_BASE}/${snapshotKey(path)}`;
+    const resp = await fetch(url, { signal: options.signal });
+    if (resp.status === 404) {
+      // Explicit, never a blank page: a URL outside the exported set is
+      // a real limitation of the snapshot and says so. scripts/
+      // export_demo.py's declared_urls() is where it gets fixed.
+      return syntheticResponse(404, {
+        detail:
+          "Not part of the public snapshot. The demo publishes a fixed set of views of the " +
+          "synthetic store; this one needs a live backend.",
+      });
+    }
+    return resp;
+  }
+
+  // A standing, dismissable-by-signing-in notice that what you are
+  // looking at is invented. Built here rather than in base.html so it
+  // cannot appear for a signed-in user by accident, and so the counts
+  // come from the snapshot's own manifest instead of a number typed into
+  // a template that would go stale the next time the corpus is reseeded.
+  function showPublicBanner(requiresSignIn) {
+    const main = document.querySelector("main");
+    if (!main || document.getElementById("public-banner")) return;
+    const banner = document.createElement("div");
+    banner.id = "public-banner";
+    banner.className = "public-banner";
+    const text = document.createElement("p");
+    text.textContent = requiresSignIn
+      ? "Storing a memory needs a live backend — this section is read-only in the public demo."
+      : "Public demo: a published snapshot of a synthetic store. Nothing here is a real memory of a real person.";
+    const signIn = document.createElement("button");
+    signIn.type = "button";
+    signIn.className = "btn btn-secondary";
+    signIn.textContent = "Sign in";
+    signIn.addEventListener("click", showLoginOverlay);
+    banner.appendChild(text);
+    banner.appendChild(signIn);
+    main.insertBefore(banner, main.firstChild);
+
+    // Best-effort detail line. A missing/garbled manifest must not stop
+    // the banner itself from being shown -- the warning that this data
+    // is synthetic matters more than the counts.
+    fetch(`${SNAPSHOT_BASE}/manifest.json`)
+      .then((resp) => (resp.ok ? resp.json() : null))
+      .then((manifest) => {
+        if (!manifest || !manifest.counts) return;
+        const c = manifest.counts;
+        const detail = document.createElement("span");
+        detail.className = "muted public-banner-detail";
+        detail.textContent =
+          `${c.captures} captures · ${c.memory_units} memories · ${c.entities} entities · ` +
+          `${c.episodes} episodes · ${c.recall_sessions} recorded recalls` +
+          (manifest.generated_at ? ` · exported ${manifest.generated_at.slice(0, 10)}` : "");
+        text.appendChild(document.createElement("br"));
+        text.appendChild(detail);
+      })
+      .catch(() => {});
   }
 
   function showLoginOverlay() {
@@ -147,12 +292,23 @@
     // overlay still exists in the DOM and still appears the moment the user
     // navigates to a section that does need the backend.
     const needsBackend = document.body.dataset.requiresBackend !== "false";
+    // A section that cannot work from the snapshot at all -- Store,
+    // which exists only to write. Declared in base.html's registry next
+    // to the rest of the section's definition, same as needs_backend.
+    const requiresSignIn = document.body.dataset.requiresSignin === "true";
 
-    if (getCredentials() || !needsBackend) {
+    // Browsing is public now: with no credentials the app reads the
+    // published snapshot of the synthetic demo store, so a full-screen
+    // login form over a page that works perfectly well would be a wall
+    // in front of an open door. The overlay appears when a section
+    // genuinely needs a live backend, or the moment a visitor attempts
+    // something that writes (snapshotFetch above).
+    if (getCredentials() || !needsBackend || !requiresSignIn) {
       hideLoginOverlay();
     } else {
       showLoginOverlay();
     }
+    if (isPublicMode() && needsBackend) showPublicBanner(requiresSignIn);
 
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -223,6 +379,24 @@
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     const headers = { ...(options.headers || {}) };
     const credentials = getCredentials();
+    // The single place the two modes diverge. Everything downstream of
+    // here -- every page script, every error path, openAttachment() --
+    // is identical in both, because both hand back a Response.
+    if (!credentials && path.startsWith("/api/")) {
+      try {
+        return await snapshotFetch(path, { ...options, signal: controller.signal });
+      } catch (err) {
+        // Same translation the live path does below, for the same
+        // reason: a page's error handling must not have to know which
+        // mode produced the failure.
+        if (err.name === "AbortError") {
+          throw new Error("Request timed out. Please try again in a moment.");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     // nginx (not the app) checks this -- see docs/DECISIONS.md
     // "Retire app-level auth for nginx Basic Auth". Attached
     // explicitly by this JS rather than relying on the browser's own
@@ -376,6 +550,9 @@
   // else is ever attached to `window`.
   window.membase = {
     BACKEND_URL,
+    SNAPSHOT_BASE,
+    isPublicMode,
+    snapshotKey,
     showStatus,
     hide,
     show,

@@ -13,6 +13,22 @@ One architectural decision shapes most of the rest: the associative graph is a *
 The broader motivation is to make information safely offloadable to machines, allowing people to rely less on maintaining every detail in their own memory while retaining the ability to recover it when needed. The design principles investigated in membase may also inform memory architectures for AI agents, where reliably storing and retrieving information over long periods remains an open problem.
 
 
+## Looking at it
+
+**[membase.vxliu.com](https://membase.vxliu.com)** is browsable without an
+account. Logged out, the app reads a published snapshot of a *synthetic*
+demonstration store — the memory graph, the episode timeline, the stored
+memories, the evaluation report, and recordings of real recall sessions
+replayed with their evidence and confidence intact. Nothing in it is a
+real memory of a real person.
+
+That mode talks to no backend at all: it reads static files, so there is
+nothing to write to and no model call to trigger. A recall round costs
+tens of seconds of GPU time on one 11 GB card, so running a new one —
+and storing anything — needs a sign-in to a live store. See
+docs/DECISIONS.md "Public demo as a static snapshot" for why a snapshot
+rather than a public read-only API.
+
 ## Areas of investigation
 
 - **Information retrieval**: combine exact lexical matching with

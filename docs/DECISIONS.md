@@ -2829,3 +2829,121 @@ transcript as derived, best-effort content, which is exactly the tier
 stored and downloadable (never transcribed) rather than rejected. Consistent
 with "never lose the user's original", but it does mean the accepted-type set
 is slightly wider than "audio".
+
+## Public demo as a static snapshot
+
+**Goal:** let anyone look at a working membase -- the graph, the
+timeline, the library, a real recall trace -- without an account, while
+the owner's own store stays private and nothing public can write to it
+or reach the GPU.
+
+**What the public surface could have been.** The obvious design is a
+second, read-only backend against a synthetic store, exposed through an
+unauthenticated nginx location. It was rejected, and it is worth being
+precise about why, because the reasons are specific to this deployment
+rather than general principle:
+
+  - This machine has no inbound port (CGNAT). Cloudflare Tunnel is the
+    only entrance, and its ingress maps every hostname to nginx on
+    `127.0.0.1:8080`, which has exactly one membase location with
+    `auth_basic` above `proxy_pass`. A public backend therefore means a
+    new unauthenticated route into this machine and a `nixos-rebuild` to
+    create it -- a system-level change for a frontend feature.
+  - It is only up while this machine is. The frontend is published by
+    GitHub Pages and stays up regardless; a public demo that is dark
+    whenever the home machine is off is worse than no public demo, for
+    the one audience it exists for.
+  - Recall costs tens of seconds of GPU time per round on a single 11GB
+    card, serialized (see CLAUDE.md). Anonymous access to that endpoint
+    hands out the GPU, and no rate limit makes a 60-second serialized
+    operation safe to expose.
+  - A read-only *policy* is a thing that can be got wrong. A directory
+    of files has no write path to get wrong.
+
+**Decision:** publish the demo store as a static snapshot of API
+responses. `scripts/seed_demo.py` builds the synthetic store in its own
+database (`membase_demo`, a fourth database beside `membase`,
+`membase_prod` and `membase_eval`, with its own uploads directory so no
+demo attachment can reference a real one). `scripts/export_demo.py`
+writes every read-only response the browse pages need into
+`public-demo/`, which `scripts/build_frontend.py` copies to `dist/demo/`
+and the Pages workflow publishes. `app/static/core.js` resolves GETs
+against those files when no credentials are stored, and refuses anything
+that is not a GET before it leaves the browser. Signing in switches
+every request back to the private backend, unchanged.
+
+**The responses are produced by the real app, not reimplemented.** The
+exporter drives the actual FastAPI application in-process over ASGI and
+saves what it returns, so a snapshot file is byte-identical to what the
+live API would have sent for that URL -- including `response_model`
+field filtering. The alternative (hand-writing JSON for the public mode)
+would have been a second implementation of every endpoint, silently
+diverging from the first the moment a field was added.
+
+**A snapshot can only answer URLs it was asked for**, which is a real
+constraint and is handled explicitly rather than hidden:
+
+  - `scripts/export_demo.py`'s `declared_urls()` is the whole public
+    request space, in one place, built from the same constants the
+    frontend builds its URLs from (`test_export_demo.py` asserts they
+    still match -- a snapshot answering `max_nodes=400` while the page
+    asks for `500` would 404 every graph view, in public mode only).
+  - The URL -> filename rule exists twice, in `snapshot_path()` and
+    core.js's `snapshotKey()`. Deliberate duplication: sharing it would
+    need a build step this repo does not have. A test executes the real
+    shipped JS function (via node, skipped where absent) and compares it
+    to the Python, so the two cannot drift quietly.
+  - A URL outside the set becomes an explicit "not part of the public
+    snapshot" message, never a blank page.
+  - The explorer's entity-kind and association-kind filters are **hidden**
+    in public mode, not approximated. The server applies them before the
+    `max_nodes` cap, so filtering an already-capped snapshot in the
+    browser would show a different graph than the live API returns for
+    the same filter -- quietly. Hop depth and centring still work,
+    because the exporter writes a file per (hops, centre) pair.
+  - Entity search filters the exported list client-side with a plain
+    substring match, where the live endpoint normalizes the query
+    through `normalize_name()` first. Reimplementing that in JS would
+    create a second copy of entity normalization; the difference
+    (possessives, punctuation) is documented at the call site instead.
+
+**Recall is replayed, not run.** `RecallSession` is a persisted row, so
+sessions recorded against the demo store export with everything else and
+render through exactly the same `render()` the live page uses -- same
+evidence, same confidence categories, same deterministic trail, no model
+call. This is the part of the system most worth showing and the part
+that most needs protecting from anonymous traffic; replay is how both
+are true at once.
+
+**Write affordances are disabled, not removed.** The Library's
+clarification form, discard, retry-structuring and delete buttons stay
+visible and explain why they are off. Removing them would hide half of
+what the Library is; leaving them live would mean a click that can only
+fail. The attachment buttons stay *enabled*, because reading an
+attachment is something the snapshot genuinely supports.
+
+## One LLM call per open transaction, in process_capture_fully too
+
+`app/db.py` sets `idle_in_transaction_session_timeout=180000` on every
+connection, with a comment stating the pipeline "makes at most one LLM
+call per open transaction". That was true of every path except the one
+that matters most: `process_capture_fully()` opened a transaction with
+the reads before segmentation (`db.refresh`, `_find_related_context`)
+and did not commit until after `segment_capture()` plus one
+`_analyze_one_unit()` call per proposed unit -- several generation calls
+inside one transaction.
+
+Found for real seeding a corpus of image-bearing captures
+(`scripts/seed_demo.py`): a vision caption makes `attachment_text` long,
+which makes every analysis prompt slower, which is exactly when the sum
+crosses 180 seconds. Postgres then terminated the connection and the
+failure surfaced as `IdleInTransactionSessionTimeout` raised from the
+commit at the end of a capture that had already spent minutes of model
+time -- three memories into a sixteen-memory seed.
+
+Fixed by committing before the generation calls. Nothing between that
+point and the `db.add_all(units)` below it writes, so there is nothing
+to lose: captions, transcripts and chunks were already committed by
+their own helpers (`_caption_one_image`, `_transcribe_one_audio`,
+`_index_attachment_chunks` each commit), and the units do not exist yet.
+The invariant db.py assumes now actually holds end to end.

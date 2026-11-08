@@ -66,6 +66,7 @@ python3 scripts/reembed.py --dry-run   # report stale/missing embeddings; drop -
 python3 scripts/reprocess_memories.py --dry-run   # report units left behind by an older pipeline version; drop --dry-run to fix (low priority, run idle -- see docs/DECISIONS.md "Reprocessing pipeline")
 python3 scripts/rebuild_graph.py --dry-run   # report units missing from the associative graph; drop --dry-run to re-project them (no LLM calls, idempotent; --prune, --unit-id)
 python3 scripts/seed_demo.py --dry-run   # describe the SYNTHETIC demonstration dataset; drop --dry-run to ingest it (real pipeline, several minutes; refuses membase_prod without --allow-prod)
+python3 scripts/export_demo.py --dry-run # list the static public-demo snapshot this would write; drop --dry-run to write public-demo/ (refuses any database but membase_demo; no LLM calls) -- see docs/DEPLOYMENT.md "Refreshing the public demo"
 scripts/dev-db.sh stop
 ```
 
@@ -126,6 +127,19 @@ elsewhere.
     actively serving traffic. Never point `scripts/run-prod.sh` (or
     whatever ends up running the live backend) at the plain `membase`
     database again.
+11. **`membase_demo` is a fourth database on the same cluster, and the
+    only one whose contents are published to the internet.** It holds
+    the SYNTHETIC demonstration store (`scripts/seed_demo.py`), and
+    `scripts/export_demo.py` turns it into the static snapshot a
+    logged-out visitor to the public site reads (`public-demo/` ->
+    `dist/demo/`, see docs/DECISIONS.md "Public demo as a static
+    snapshot"). Two consequences: the exporter asks the live connection
+    for `current_database()` and refuses to run against anything but
+    `membase_demo` -- exporting `membase_prod` into a directory destined
+    for a public web server is the one unrecoverable mistake available
+    here -- and seeding uses its own `UPLOADS_DIR`
+    (`.data/uploads-demo`), so no demo attachment can ever reference a
+    file belonging to the owner's real store.
 
 ## Key architecture terms (see docs/ARCHITECTURE.md for the full picture)
 

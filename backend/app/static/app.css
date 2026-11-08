@@ -1117,6 +1117,35 @@ input[type="file"] {
 
 .login-form > .btn { align-self: stretch; }
 
+/* Public-mode banner (core.js's showPublicBanner). Built in JS rather
+   than in base.html so it cannot show for a signed-in user, and styled
+   with the warning edge rather than the accent: its job is to say "what
+   you are reading is invented", which is a caveat, not a feature
+   highlight. Composes existing tokens only -- no new colour. */
+.public-banner {
+  display: flex;
+  gap: var(--space-4);
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.public-banner p { margin: 0; }
+
+.public-banner .btn { flex: 0 0 auto; }
+
+.public-banner-detail {
+  display: inline-block;
+  margin-top: var(--space-1);
+  font-size: var(--text-sm);
+}
+
 /* ==========================================================================
    13. PAGE: STORE
    ========================================================================== */

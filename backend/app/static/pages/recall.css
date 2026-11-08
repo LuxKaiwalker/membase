@@ -591,3 +591,29 @@
     flex: 1 1 100%;
   }
 }
+
+/* Recorded-recall picker, public mode only (pages/recall.js). A row of
+   the actual queries that were run, because the query is the only label
+   that tells you what you are about to look at. Each button wraps: these
+   are sentences, not nouns, and truncating them to fit a chip would hide
+   exactly the vagueness that makes the example worth showing. */
+.recall-replays {
+  margin-top: var(--space-4);
+}
+
+.recall-replay-buttons {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.recall-replay {
+  flex: 1 1 18rem;
+  max-width: 32rem;
+  /* .btn centres its content; a wrapped sentence reads as a ragged
+     block when centred, so this one aligns left on both axes. */
+  justify-content: flex-start;
+  text-align: left;
+  white-space: normal;
+  line-height: 1.35;
+}

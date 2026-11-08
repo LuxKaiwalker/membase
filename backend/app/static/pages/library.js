@@ -12,8 +12,17 @@
 (() => {
   "use strict";
 
-  const { hide, show, showStatus, escapeHtml, fetchWithTimeout, postJSON, describeError, buildAttachmentList } =
-    window.membase;
+  const {
+    hide,
+    show,
+    showStatus,
+    escapeHtml,
+    fetchWithTimeout,
+    postJSON,
+    describeError,
+    buildAttachmentList,
+    isPublicMode,
+  } = window.membase;
 
   function renderCaptureList(listEl, captures, onClarificationResolved) {
     listEl.innerHTML = "";
@@ -189,6 +198,30 @@
           alert(err.message);
         }
       });
+      // Public mode: every control on this card that writes is disabled
+      // rather than removed. Removing them would hide half of what the
+      // Library actually is -- answering a clarification, discarding a
+      // unit, retrying the structurer, deleting a capture are the page's
+      // whole point -- but leaving them live would mean a click that can
+      // only ever fail. Disabled-with-a-reason shows the affordance and
+      // explains itself. (core.js refuses the request anyway, so this is
+      // UI honesty, not the security boundary.)
+      //
+      // Listed explicitly rather than disabling every button on the
+      // card: the attachment buttons buildAttachmentList() adds only
+      // READ an attachment's bytes, which the snapshot exports and the
+      // demo is specifically meant to show off. A blanket
+      // querySelectorAll("button") would have switched off viewing the
+      // demo's photographs.
+      if (isPublicMode()) {
+        const writeControls =
+          ".capture-delete, .capture-restructure, .capture-clarification-submit, " +
+          ".capture-clarification-discard, .capture-clarification-answer";
+        for (const control of card.querySelectorAll(writeControls)) {
+          control.disabled = true;
+          control.title = "Needs a live backend — sign in to use a store you can change.";
+        }
+      }
       listEl.appendChild(card);
     }
   }
@@ -202,6 +235,13 @@
       if (!skipAllButton) return;
       if (listEl.querySelector(".capture-clarification")) show(skipAllButton);
       else hide(skipAllButton);
+      // Same reasoning as the per-card write controls below: a bulk
+      // discard is the most destructive button on the page and cannot
+      // work against a published snapshot.
+      if (isPublicMode()) {
+        skipAllButton.disabled = true;
+        skipAllButton.title = "Needs a live backend — sign in to use a store you can change.";
+      }
     }
 
     if (skipAllButton) {

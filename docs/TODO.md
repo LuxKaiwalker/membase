@@ -429,6 +429,41 @@ Full reasoning for every item below is in docs/DECISIONS.md under
 
 ## Known technical gaps
 
+- **The public snapshot costs ~5 MB per export, mostly duplicated
+  graph.** 317 files, of which ~70 are `/api/graph` responses at ~110 KB
+  each: on a 17-memory corpus, every memory's 2-hop neighbourhood is
+  very nearly the whole graph, so the centred views are near-copies of
+  each other. Fine today (GitHub Pages gzips on the wire; the cost is
+  repo size on each refresh) and not worth content-addressing the files
+  for, but it grows with the corpus and is the first thing to look at if
+  the repo starts feeling heavy.
+- **The public snapshot is a snapshot, with three honest limits.** See
+  docs/DECISIONS.md "Public demo as a static snapshot" for the design.
+  (1) It goes stale: nothing regenerates it, so a change to the demo
+  corpus or a read endpoint's shape needs a re-export and a commit (the
+  procedure is in docs/DEPLOYMENT.md "Refreshing the public demo"). (2)
+  The explorer's entity-kind and association-kind filters are hidden in
+  public mode, because the server applies them before the `max_nodes`
+  cap and filtering an already-capped snapshot would silently show a
+  different graph than the live API does. Serving them properly would
+  mean exporting the subset cross-product, or moving the cap logic into
+  JS — neither is worth it for a demo, but the controls are the most
+  visible thing public mode loses. (3) Entity search matches substrings
+  client-side where the live endpoint normalizes the query first, so
+  "Nadia's" finds nothing in public mode and does find "Nadia" live.
+- **The demo corpus loses one or two LLM calls per full seed.** Observed
+  while seeding `membase_demo`: `Segmentation LLM call failed; falling
+  back to a deterministic sentence split` and `Structuring call failed`
+  on image-bearing captures, with ollama reporting a generation that
+  filled the 4096-token context (`n_tokens = 4095, truncated = 1`). Both
+  degrade gracefully by design, so the store is usable, but a
+  deterministic sentence split is not the segmentation the demo is
+  meant to show. Same root family as "Chunk long captures before
+  analysis" in docs/DECISIONS.md — a long vision caption inflates the
+  prompt — and it is the second symptom of the attachment-text budget
+  gap below. Re-running `scripts/reprocess_memories.py` (or
+  `/restructure` for the specific units) after a seed recovers the
+  affected units.
 - **`MAX_ATTACHMENT_TEXT_FOR_ANALYSIS_CHARS` (1500) is too small for a
   multi-photo capture, and the right number is unmeasured.** The
   reported two-photo prescription capture (docs/user-todo.md) wants

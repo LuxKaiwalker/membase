@@ -289,6 +289,52 @@ that nginx config file's `Access-Control-Allow-Origin` -- it must match
 your frontend's real domain exactly (this project's live deployment uses
 `https://membase.vxliu.com`).
 
+## Refreshing the public demo
+
+The published site is usable with no credentials: logged out, it reads a
+static snapshot of a SYNTHETIC store instead of talking to a backend
+(see docs/DECISIONS.md "Public demo as a static snapshot" for why it is
+a snapshot and not a public read-only API). Nothing about this touches
+the private backend, nginx, or the tunnel -- the public demo is data in
+the Pages artifact.
+
+The snapshot is committed to the repo, because the Pages workflow has no
+database, no model and no GPU and so cannot regenerate it. Refresh it
+whenever the demo corpus or a read endpoint's shape changes:
+
+```
+# 1. (re)seed the synthetic store -- its own database, its own uploads dir.
+#    Real pipeline against the real local model: ~20-25s per memory, plus a
+#    vision call per image. Expect 10-20 minutes for the 16-memory corpus.
+createdb -h "$PGHOST_DIR" -p "$PGPORT" membase_demo        # first time only
+DATABASE_URL="postgresql+psycopg://$PGUSER@/membase_demo?host=$PGHOST_DIR&port=$PGPORT" \
+  UPLOADS_DIR="$MEMBASE_ROOT/.data/uploads-demo" \
+  sh -c 'cd backend && alembic upgrade head && cd .. && python3 scripts/seed_demo.py'
+
+# 2. record the recall sessions the public Recall page replays (GPU time:
+#    tens of seconds per round). Skip to leave the replay list empty.
+DATABASE_URL=...membase_demo python3 scripts/seed_demo_sessions.py
+
+# 3. export. No LLM calls; refuses any database but membase_demo.
+DATABASE_URL=...membase_demo python3 scripts/export_demo.py
+
+# 4. publish. The snapshot is a frontend input, so committing it is what
+#    triggers the Pages workflow (see .github/workflows/pages.yml's paths).
+git add public-demo && git commit -m "Refresh the public demo snapshot" && git push
+```
+
+`scripts/build_frontend.py` copies `public-demo/` to `dist/demo/`, which
+is the one path `app/static/core.js` looks for it at (`SNAPSHOT_BASE`).
+Both the copy and the export are optional to a working build: a machine
+that has never seeded the demo store still produces a site that works
+for a signed-in user, and a logged-out visitor gets an explicit "not
+part of the public snapshot" message rather than a blank page.
+
+To check the public mode locally, serve `dist/` and visit it with no
+credentials in `localStorage` (a fresh browser profile, or
+`localStorage.removeItem("membase.basicAuth")`). Signing in on the same
+page switches every request back to the private backend.
+
 ## Auth system ideas (alternatives considered)
 
 The options below were evaluated before picking the token-based login

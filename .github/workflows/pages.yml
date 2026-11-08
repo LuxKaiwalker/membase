@@ -16,6 +16,11 @@ on:
       - "backend/app/templates/**"
       - "backend/app/static/**"
       - "scripts/build_frontend.py"
+      # The published snapshot of the synthetic demo store, which is the
+      # data a logged-out visitor sees (scripts/export_demo.py). A
+      # re-export is a frontend change: it changes what the public site
+      # shows and nothing else.
+      - "public-demo/**"
       - "CNAME"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
